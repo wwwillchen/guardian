@@ -806,7 +806,24 @@ describe('B1 built app — StatePanel states, run quarantine banner, model pool 
           await page.getByRole('heading', { name: 'Projects', level: 1 }).waitFor({ state: 'visible', timeout: 10_000 })
         }
 
-        await gotoApp(page, '/projects/not-a-valid-project-id', () => page.getByRole('heading', { name: 'Kovo couldn’t open this view' }).waitFor({ state: 'visible', timeout: 15_000 }))
+        // Trigger a real child-route loader failure inside AppShell (invalid project IDs now map to
+        // ProjectNotFound 404 via params.parse, tested in tests/ui-polish-projects.test.ts).
+        let failedFnPath: string | null = null
+        await page.route('**/_serverFn/**', async route => {
+          const pathname = new URL(route.request().url()).pathname
+          if (failedFnPath === null) failedFnPath = pathname
+          if (pathname === failedFnPath) {
+            await route.fulfill({
+              status: 500,
+              contentType: 'application/json',
+              body: JSON.stringify({ error: '[{"code":"invalid_string","message":"Simulated ZodError loader failure"}]' }),
+            })
+            return
+          }
+          await route.continue()
+        })
+        await page.getByRole('navigation', { name: 'Workspace' }).getByRole('link', { name: 'Settings' }).click()
+        await page.getByRole('heading', { name: 'Kovo couldn’t open this view' }).waitFor({ state: 'visible', timeout: 15_000 })
         const error = page.getByTestId('state-route-error')
         assert.equal(await error.getAttribute('data-kind'), 'error')
         await page.getByRole('navigation', { name: 'Workspace' }).waitFor({ state: 'visible' })

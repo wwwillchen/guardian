@@ -472,7 +472,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onNewRun }: Props) {
                       {' '}· {formatCount(run.turnsUsed)} turns · {formatCount(run.spentRequests)} reqs · {formatUsd(run.spentUsd)}
                     </span>
                   </span>
-                  <span className="flex flex-none items-center gap-2.5 max-[480px]:basis-full max-[480px]:flex-wrap max-[480px]:gap-y-1 max-[480px]:pl-[19px]">
+                  <span className="flex flex-none items-center gap-2.5 max-[480px]:min-w-0 max-[480px]:max-w-full max-[480px]:basis-full max-[480px]:flex-wrap max-[480px]:gap-y-1 max-[480px]:pl-[19px]">
                     <RunLifecycleBadge status={run.status} dot={false} />
                     <time
                       className="text-[12px] tabular-nums text-fg-subtle"

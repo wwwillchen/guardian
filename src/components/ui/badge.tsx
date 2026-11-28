@@ -8,13 +8,26 @@ export type { BadgeVariantProps }
 
 export type BadgeProps = ComponentProps<'span'> & BadgeVariantProps
 
-/** Wrap bare text in a shrinkable span so a long label ends in an ellipsis. */
+/** Wrap bare text runs in a shrinkable span so a long label ends in an ellipsis without splitting adjacent text nodes. */
 function wrapTextChildren(children: ReactNode): ReactNode {
-  return Children.map(children, child =>
-    typeof child === 'string' || typeof child === 'number'
-      ? <span data-slot="badge-label" className="min-w-0 truncate">{child}</span>
-      : child,
-  )
+  const out: ReactNode[] = []
+  let text = ''
+  let key = 0
+  const flush = () => {
+    if (text.length === 0) return
+    out.push(<span key={`badge-label-${key++}`} data-slot="badge-label" className="min-w-0 truncate">{text}</span>)
+    text = ''
+  }
+  for (const child of Children.toArray(children)) {
+    if (typeof child === 'string' || typeof child === 'number') {
+      text += String(child)
+    } else {
+      flush()
+      out.push(child)
+    }
+  }
+  flush()
+  return out
 }
 
 /** Plain-text label of a badge, used as its tooltip when the caller gave none. */

@@ -465,7 +465,7 @@ function ProjectRow({ project, now, active, disambiguator, onOpen, onFocusRow }:
         data-slot="seed-host-cell"
       >
         <span className={cn('min-w-0 truncate text-[12px]', seedHosts.length > 0 && 'font-mono')}>{hostSummary}</span>
-        {extraHosts > 0 && <Badge className="bg-sunk tabular-nums">+{fmtN(extraHosts)}</Badge>}
+        {extraHosts > 0 && <Badge className="bg-sunk tabular-nums">{`+${fmtN(extraHosts)}`}</Badge>}
       </div>
 
       <div className="flex min-w-0 items-center gap-[7px] text-[12.5px] text-fg-muted max-[720px]:hidden">

@@ -332,10 +332,11 @@ export function ProjectPersonasTab({ data, assets, personaTests, onTestPersona, 
                       Allowlist: {persona.originAllowlist.map(safeHost).join(', ')}
                     </div>
                   </div>
-                  <div className="flex flex-none items-center gap-2 max-[720px]:basis-full max-[720px]:flex-wrap max-[720px]:gap-1" data-slot="persona-row-actions">
+                  <div className="flex flex-none items-center gap-2 max-[720px]:min-w-0 max-[720px]:max-w-full max-[720px]:basis-full max-[720px]:flex-wrap max-[720px]:gap-1" data-slot="persona-row-actions">
                     <Button
                       type="button"
                       variant="ghost"
+                      className="pointer-coarse:after:inset-x-0"
                       disabled={test?.status === 'testing'}
                       onClick={() => handleRetryPersona(persona)}
                     >
@@ -344,6 +345,7 @@ export function ProjectPersonasTab({ data, assets, personaTests, onTestPersona, 
                     <Button
                       type="button"
                       variant="ghost"
+                      className="pointer-coarse:after:inset-x-0"
                       disabled={personaAction.pending}
                       onClick={() => openEditModal(persona)}
                     >

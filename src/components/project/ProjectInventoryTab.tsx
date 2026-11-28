@@ -342,7 +342,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
         aria-selected={isSelected}
         className={cn(
           TABLE_GRID,
-          'group/row min-h-[38px] border-b border-line px-2 py-1 transition-colors hover:bg-hover',
+          'group/row min-h-[38px] border-b border-line px-2.5 py-1 transition-colors hover:bg-hover',
           isSelected && 'bg-accent-soft/35 hover:bg-accent-soft/50',
         )}
       >
@@ -483,7 +483,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
       <div role="rowgroup" aria-label={title} data-slot={`inventory-group-${key}`}>
         <div
           role="row"
-          className="sticky top-0 z-10 flex min-h-[34px] flex-wrap items-center justify-between gap-x-2.5 gap-y-1 border-b border-line bg-panel/95 px-2 py-1 backdrop-blur-sm"
+          className="sticky top-0 z-10 flex min-h-[34px] flex-wrap items-center justify-between gap-x-2.5 gap-y-1 border-b border-line bg-panel/95 px-2.5 py-1 backdrop-blur-sm"
           data-slot="inventory-group-header"
         >
           <div role="cell" className="flex min-w-0 flex-wrap items-baseline gap-2">
@@ -534,6 +534,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           <Button
             type="button"
             variant="outline"
+            className="pointer-coarse:after:inset-x-0"
             onClick={() => togglePanel('access')}
             aria-expanded={panel === 'access'}
           >
@@ -665,7 +666,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           <div role="rowgroup">
             <div
               role="row"
-              className={cn(TABLE_GRID, 'min-h-[30px] border-b border-line px-2 text-[11px] font-medium uppercase tracking-[0.04em] text-fg-subtle')}
+              className={cn(TABLE_GRID, 'min-h-[30px] border-b border-line px-2.5 text-[11px] font-medium uppercase tracking-[0.04em] text-fg-subtle')}
               data-slot="inventory-column-headers"
             >
               <div role="columnheader" className="flex items-center">
@@ -697,11 +698,11 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
             'Approve hosts before they enter scan scope',
             needsApprovalAssets,
             unapprovedFirstPartyAssets.length > 0 ? (
-              <div role="cell">
+              <div role="cell" className="min-w-0 max-w-full">
                 <Button
                   type="button"
                   variant="outline"
-                  className="h-auto min-h-[24px] max-w-full whitespace-normal py-0.5 text-left text-[12px]"
+                  className="h-auto min-h-[24px] max-w-full whitespace-normal py-0.5 text-left text-[12px] pointer-coarse:after:inset-x-0"
                   data-testid="approve-all-first-party"
                   disabled={inventoryAction.pending}
                   onClick={handleApproveAllFirstParty}

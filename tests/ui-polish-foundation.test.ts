@@ -773,6 +773,9 @@ describe('UI polish foundation — tokens, overlays, shell, sign-in & settings (
       await trigger.click()
       const menu = page.locator('[data-slot=dropdown-menu-content]')
       await menu.waitFor({ state: 'visible' })
+      // Base UI applies inline `transition: none` during its single `data-starting-style` paint frame
+      // before releasing the element to interpolate scale/opacity; wait for that frame to clear.
+      await page.locator('[data-slot=dropdown-menu-content]:not([data-starting-style])').waitFor({ state: 'visible' })
       const motion = await menu.evaluate(el => {
         const cs = getComputedStyle(el)
         const origin = cs.getPropertyValue('--transform-origin').trim()
@@ -1201,7 +1204,24 @@ describe('UI polish foundation — tokens, overlays, shell, sign-in & settings (
       assert.ok(centred < 2, 'empty state centred in the content column')
       await shot(page, tag(DESKTOP, theme, 'not-found'))
 
-      await gotoApp(page, '/projects/not-a-valid-project-id', () => page.getByRole('heading', { name: 'Kovo couldn’t open this view' }).waitFor({ state: 'visible', timeout: 15_000 }))
+      // Trigger a real child-route loader failure inside AppShell (invalid project IDs now map to
+      // ProjectNotFound 404 via params.parse, tested in tests/ui-polish-projects.test.ts).
+      let failedFnPath: string | null = null
+      await page.route('**/_serverFn/**', async route => {
+        const pathname = new URL(route.request().url()).pathname
+        if (failedFnPath === null) failedFnPath = pathname
+        if (pathname === failedFnPath) {
+          await route.fulfill({
+            status: 500,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: '[{"code":"invalid_string","message":"Simulated ZodError loader failure"}]' }),
+          })
+          return
+        }
+        await route.continue()
+      })
+      await page.getByRole('navigation', { name: 'Workspace' }).getByRole('link', { name: 'Settings' }).click()
+      await page.getByRole('heading', { name: 'Kovo couldn’t open this view' }).waitFor({ state: 'visible', timeout: 15_000 })
       await page.getByRole('navigation', { name: 'Workspace' }).waitFor({ state: 'visible' })
       const errorView = page.getByRole('alert').filter({ hasText: 'Kovo couldn’t open this view' })
       const visibleCopy = await errorView.evaluate(el => {
