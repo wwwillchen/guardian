@@ -1,19 +1,24 @@
-// Overview: written verdict, severity tally, confidence meter, key stats,
-// queue summary, top findings, workflow summary, traffic histogram, coverage.
+// Overview: state-aware run hero, written verdict, severity tally, confidence meter, key stats,
+// queue summary, top findings, workflow summary, requests/min traffic sparkline, coverage.
 // Waiting runs render the consent sheet.
-import { useMemo, useState } from 'react'
-import { capabilityTierMeta } from '../../run-state.ts'
+import { useEffect, useMemo, useState } from 'react'
+import type { KeyboardEvent, PointerEvent as ReactPointerEvent } from 'react'
+import { runLifecycleMeta, runLifecycleOf, runModeMeta, runModeOf } from '../../run-state.ts'
+import type { LifecycleTone } from '../../run-state.ts'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
 import { useDecisions } from '../decisions.tsx'
 import { FindingTitle, HostLabel } from '../display.tsx'
-import { fmtDate, fmtN, fmtTime, fmtTok, host, plural } from '../format.ts'
+import { fmtDate, fmtN, fmtTime, host, plural } from '../format.ts'
 import { CovSwatch, LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { openBudgetPopover } from '../header.tsx'
 import { Icon } from '../icons.tsx'
-import { normFStatus, PHASE_LABEL, runStatusLabel, SEV, SEV_COL, SEV_LABEL, stLabel } from '../meta.ts'
+import { normFStatus, PHASE_LABEL, SEV, SEV_COL, SEV_LABEL, stLabel } from '../meta.ts'
 import type { ViewId } from '../meta.ts'
-import { bySeriousness, coverageCounts, trafficHistogram } from '../model.ts'
+import { buildTrafficSparkline, bySeriousness, coverageCounts, deriveRunHero } from '../model.ts'
+import type { HeroActionId, RunHeroModel, TrafficSparkline } from '../model.ts'
 import { AnimatedNumber, Meter } from '../motion.tsx'
-import { useLinks, useNav } from '../nav.tsx'
+import { useLinks, useNav, useViewState } from '../nav.tsx'
+import { Num } from '../num.tsx'
 import { cn, covBarBgClass, runBtn } from '../tw.ts'
 import { ConsentView } from './consent.tsx'
 import { LabPanel } from './lab.tsx'
@@ -71,8 +76,54 @@ export function liveOverviewSummary(input: {
   return `${PHASE_LABEL[input.phase] ?? (input.phase || 'Running')} · Round ${input.roundNo ?? 0}`
 }
 
+const HERO_TONE: Record<LifecycleTone, string> = {
+  accent: 'bg-accent-soft shadow-[inset_0_0_0_1px_var(--accent-line)]',
+  warn: 'bg-warn-soft shadow-[inset_0_0_0_1px_var(--warn-line)]',
+  danger: 'bg-danger-soft shadow-[inset_0_0_0_1px_color-mix(in_oklch,var(--danger)_35%,transparent)]',
+  ok: 'bg-sunk shadow-[inset_0_0_0_1px_var(--line)]',
+  neutral: 'bg-sunk shadow-[inset_0_0_0_1px_var(--line)]',
+}
+const HERO_ICON_TONE: Record<LifecycleTone, string> = { accent: 'text-accent', warn: 'text-warn', danger: 'text-danger', ok: 'text-ok', neutral: 'text-fg-subtle' }
+
+/** The run's one state-aware hero: what state it is in, why, and the single next step. */
+export function RunHero({ hero, onAction, busy }: { hero: RunHeroModel; onAction: (id: HeroActionId) => void; busy?: boolean }) {
+  const meta = runLifecycleMeta[hero.lifecycle]
+  return <section
+    data-testid="run-hero"
+    data-lifecycle={hero.lifecycle}
+    aria-label={`Run state: ${meta.label}`}
+    className={cn('mb-4 flex min-h-[52px] min-w-0 items-center gap-3 rounded-lg px-3.5 py-2.5', HERO_TONE[hero.tone])}
+  >
+    <span className={cn('inline-flex size-4 flex-none items-center justify-center', HERO_ICON_TONE[hero.tone])} aria-hidden="true">
+      {hero.lifecycle === 'running' ? <LiveDot /> : <Icon name={meta.icon} />}
+    </span>
+    <div className="min-w-0 flex-1" role="status" aria-live="polite">
+      <div className="num truncate text-[13.5px] font-medium leading-5 text-fg" data-slot="hero-title" title={hero.title}>{hero.title}</div>
+      {hero.detail && <div className="num truncate text-[12.5px] leading-[18px] text-fg-muted" data-slot="hero-detail" title={hero.detail}>{hero.detail}</div>}
+    </div>
+    {hero.secondary && <button
+      type="button"
+      className={cn(runBtn({ variant: 'link', size: 'none' }), 'flex-none font-medium text-fg-muted hover:text-fg')}
+      data-hero-action={hero.secondary.id}
+      onClick={() => onAction(hero.secondary!.id)}
+    >
+      {hero.secondary.label}<Icon name="arrowR" />
+    </button>}
+    {hero.primary && <button
+      type="button"
+      className={cn(runBtn({ variant: 'primary' }), 'flex-none')}
+      data-hero-primary=""
+      data-hero-action={hero.primary.id}
+      disabled={busy}
+      onClick={() => onAction(hero.primary!.id)}
+    >
+      {hero.primary.label}
+    </button>}
+  </section>
+}
+
 function RunOverview() {
-  const { detail, counts, events } = useRun()
+  const { detail, counts, events, send, pending } = useRun()
   const model = useRunModel()
   const v = useVerdict()
   const q = useDecisions()
@@ -93,8 +144,6 @@ function RunOverview() {
   const done = detail.assignments.filter(a => a.status === 'complete').length
   const runningWorkers = useMemo(() => detail.assignments.filter(a => a.status === 'running'), [detail.assignments])
   const top = useMemo(() => model.findings.filter(f => f.status !== 'dismissed').slice().sort(bySeriousness).slice(0, 7), [model])
-  const hist = useMemo(() => trafficHistogram(model, events), [model, events])
-  const axisFmt = hist.t1 - hist.t0 > 86_400_000 ? fmtDate : fmtTime
   const cov = coverageCounts(detail.coverageEntries)
   const s = q.sections
   const needsAny = s.decide.length + s.review.length + s.follow.length > 0
@@ -106,10 +155,9 @@ function RunOverview() {
   }
 
   const phases = model.workflow.phases
-  const failed = detail.assignments.filter(a => a.status === 'failed').length
-  const eyebrow = rep && !live
-    ? `Report v${rep.version} · ${fmtDate(rep.createdAt)}`
-    : r.status === 'running' ? `As of ${fmtDate(model.end)}` : `${runStatusLabel(r.status)} ${fmtDate(hist.t1)}`
+  const failedWorkers = detail.assignments.filter(a => a.status === 'failed')
+  const failed = failedWorkers.length
+  const [, setWfFilter] = useViewState('wf.filter', 'all')
   const maxP = Math.max(1, ...phases.map(p => model.workflow.byPhase.get(p)?.length ?? 0))
   const liveSummary = liveOverviewSummary({
     phase: r.phase,
@@ -120,32 +168,37 @@ function RunOverview() {
     events,
     hasThreatModel: Boolean(detail.threatModel),
   })
+  const hero = deriveRunHero({
+    status: detail.activity?.lifecycle ?? r.status,
+    phase: r.phase,
+    roundNo: r.roundNo,
+    spentUsd: r.spentUsd,
+    budgetUsd: r.budgetUsd,
+    spentRequests: r.spentRequests,
+    budgetRequests: r.budgetRequests,
+    workers: detail.assignments,
+    endedAt: model.end,
+    liveSummary: (runningWorkers.length > 0 ? plural(runningWorkers.length, 'active worker') + ' · ' : '') + liveSummary,
+    reportLabel: rep ? `Report v${rep.version}${rep.partial ? ' (partial)' : ''} · ${fmtDate(rep.createdAt)}` : null,
+    context: [runModeMeta[runModeOf(r)].label, model.scopeOrigins.length > 0 && plural(model.scopeOrigins.length, 'host')],
+    fmtWhen: fmtDate,
+  })
+  const onHeroAction = (id: HeroActionId) => {
+    if (id === 'raise_budget') openBudgetPopover()
+    else if (id === 'resume') void send({ action: 'resume' }).catch(() => {})
+    else if (id === 'show_failed') {
+      setWfFilter('failed')
+      if (failedWorkers[0]) links.worker(failedWorkers[0].id)
+      else nav.setView('workflow')
+    } else if (id === 'inspect') {
+      if (runningWorkers[0]) links.worker(runningWorkers[0].id)
+      else nav.setView('workflow')
+    }
+  }
 
   return <div className="min-h-0 flex-1 overflow-auto">
     <div className="max-w-[980px] px-6 pb-14 pt-[22px]">
-      {r.status === 'running' && <div className="mb-3.5 flex min-h-9 min-w-0 items-center gap-2.5 rounded-lg bg-accent-soft px-3 py-1.5 text-[12.5px] shadow-[inset_0_0_0_1px_var(--accent-line)]" role="status" aria-live="polite">
-        <LiveDot />
-        <span className="flex-none whitespace-nowrap font-medium text-fg">What Kovo is doing now</span>
-        <span className="min-w-0 flex-1 truncate text-fg-muted" title={liveSummary}>
-          {runningWorkers.length > 0 && <b className="num font-medium text-fg">{plural(runningWorkers.length, 'active worker')} · </b>}
-          {liveSummary}
-        </span>
-        <button
-          type="button"
-          className={cn(runBtn({ variant: 'link', size: 'none' }), 'flex-none font-medium text-accent hover:text-fg')}
-          onClick={() => runningWorkers[0] ? links.worker(runningWorkers[0].id) : nav.setView('workflow')}
-        >
-          {runningWorkers.length > 0 ? 'Inspect' : 'Workflow'}<Icon name="arrowR" />
-        </button>
-      </div>}
-
-      <div className="num mb-2 flex items-center gap-2 overflow-hidden whitespace-nowrap text-[12px] text-fg-subtle">
-        <span className="font-medium text-fg-muted">{r.status === 'complete' ? 'Run summary' : 'Provisional summary'}</span>
-        <span className="text-fg-faint">·</span>
-        <span>{eyebrow}</span>
-        <span className="text-fg-faint">·</span>
-        <span title={capabilityTierMeta[r.capabilityTier].name}>{capabilityTierMeta[r.capabilityTier].short}</span>
-      </div>
+      <RunHero hero={hero} onAction={onHeroAction} busy={pending > 0} />
 
       <h1 className="m-0 max-w-[820px] text-pretty text-[18px] font-semibold leading-[26px] tracking-[-0.017em] text-fg">{v.hed}</h1>
       {worst && <p data-ov-worst="" className="m-0 mt-1.5 flex min-w-0 items-center gap-2 text-[13px] leading-5 text-fg-muted">
@@ -197,21 +250,21 @@ function RunOverview() {
         <div className="min-w-0 pb-[11px] pr-3.5 pt-2.5">
           <div className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle">Tokens</div>
           <div className="whitespace-nowrap text-[15px] font-medium leading-[22px] tracking-[-0.01em] text-fg">
-            <AnimatedNumber id="ov.tok" value={r.spentTokens} format={x => fmtTok(Math.round(x))} />
-            <small className="ml-[3px] text-[12px] font-normal text-fg-subtle">{fmtN(r.turnsUsed)} turns</small>
+            <Num value={r.spentTokens} kind="tokens" />
+            <small className="ml-[3px] text-[12px] font-normal text-fg-subtle"><Num value={r.turnsUsed} kind="turns" compact unit="turns" /></small>
           </div>
         </div>
         <div className="min-w-0 border-l border-line px-3.5 pb-[11px] pt-2.5">
           <div className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle">Workers</div>
           <div className="whitespace-nowrap text-[15px] font-medium leading-[22px] tracking-[-0.01em] text-fg">
-            <AnimatedNumber id="ov.wk" value={detail.assignments.length} />
+            <Num value={detail.assignments.length} kind="count" compact />
             <small className="ml-[3px] text-[12px] font-normal text-fg-subtle">{runningWorkers.length ? `${fmtN(runningWorkers.length)} running · ` : ''}{fmtN(done)} complete{failed > 0 && <> · <span className="text-danger">{fmtN(failed)} failed</span></>}</small>
           </div>
         </div>
         <div className="min-w-0 border-l border-line pb-[11px] pl-3.5 pt-2.5">
           <div className="flex items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle">Facts · evidence</div>
           <div className="whitespace-nowrap text-[15px] font-medium leading-[22px] tracking-[-0.01em] text-fg">
-            <AnimatedNumber id="ov.fa" value={detail.facts.length} />
+            <Num value={detail.facts.length} kind="count" compact />
             <small className="ml-[3px] text-[12px] font-normal text-fg-subtle">· {fmtN(detail.evidence.length)}</small>
           </div>
         </div>
@@ -323,28 +376,7 @@ function RunOverview() {
           </div>
 
           <div className="pt-4">
-            <h4 className="m-0 mb-1.5 flex items-center gap-2 text-[12px] font-medium text-fg-muted">
-              Traffic
-              <span className="num font-normal text-fg-subtle">{fmtN(counts.exchanges)} exchanges</span>
-              <Go to="exchanges">Exchanges</Go>
-            </h4>
-            {counts.exchanges === 0
-              ? <p data-ov-traffic-empty="" className="m-0 text-[12.5px] text-fg-subtle">No traffic recorded.</p>
-              : <><div className="flex h-11 items-end gap-0.5 overflow-hidden border-b border-line" title="HTTP exchanges over time; red marks requests blocked by scope or rate limits">
-              {hist.bins.map((b, i) => <i
-                key={i}
-                className="relative min-h-px flex-1 overflow-hidden rounded-t-[1px] bg-fg-faint"
-                style={{ height: Math.max(1.5, (b[0] + b[1]) / hist.max * 40).toFixed(1) + 'px' }}
-                title={`${b[0]} exchanges${b[1] ? ', ' + b[1] + ' denied' : ''}`}
-              >
-                {b[1] > 0 && <em className="absolute inset-x-0 top-0 bg-danger" style={{ height: Math.max(2, b[1] / (b[0] + b[1]) * 100) + '%' }} />}
-              </i>)}
-            </div>
-            <div data-ov-traffic-axis="" className="num mt-[3px] flex justify-between gap-2 whitespace-nowrap text-[11px] text-fg-subtle">
-              <span>{axisFmt(hist.t0)}</span>
-              <span>{axisFmt(hist.t0 + (hist.t1 - hist.t0) / 2)}</span>
-              <span>{axisFmt(hist.t1)}</span>
-            </div></>}
+            <TrafficPanel exchanges={counts.exchanges} />
           </div>
 
           <div className="pt-4">
@@ -368,6 +400,131 @@ function RunOverview() {
           </div>
         </div>
       </div>
+    </div>
+  </div>
+}
+
+/** Traffic: requests/min sparkline with the per-origin cap line, denied ticks and a hover readout. */
+function TrafficPanel({ exchanges }: { exchanges: number }) {
+  const { detail, events } = useRun()
+  const r = detail.run
+  const live = runLifecycleMeta[runLifecycleOf(detail.activity?.lifecycle ?? r.status)].live
+  const [win, setWin] = useViewState<'auto' | 'full'>('ov.trafficWindow', 'auto')
+  const model = useRunModel()
+  // Wall-clock "now" only after mount: SSR and the hydrating render share the run's own end time,
+  // so the live window's axis and buckets never mismatch between server and client.
+  const [clock, setClock] = useState<number | null>(null)
+  useEffect(() => {
+    if (!live) return
+    setClock(Date.now())
+    const id = window.setInterval(() => setClock(Date.now()), 30_000)
+    return () => window.clearInterval(id)
+  }, [live])
+  const now = clock ?? model.end
+  const spark = useMemo(() => buildTrafficSparkline({
+    status: detail.activity?.lifecycle ?? r.status,
+    createdAt: r.createdAt,
+    now,
+    maxRpsPerOrigin: r.maxRpsPerOrigin,
+    exchanges: detail.exchangesSummary,
+    events,
+    window: live && win === 'full' ? 'full' : undefined,
+  }), [detail, r, events, now, live, win])
+  const winBtn = (on: boolean) => cn(runBtn({ variant: on ? 'ghostOn' : 'ghost', size: 'xs' }), 'h-5 px-1.5 text-[11px]')
+  return <>
+    <h4 className="m-0 mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] font-medium text-fg-muted">
+      Traffic
+      <span className="num whitespace-nowrap font-normal text-fg-subtle"><Num value={exchanges} kind="count" compact unit={exchanges === 1 ? 'exchange' : 'exchanges'} /></span>
+      {live && !spark.empty && <span className="inline-flex flex-none items-center gap-0.5" role="group" aria-label="Traffic window">
+        <button type="button" className={winBtn(win !== 'full')} aria-pressed={win !== 'full'} onClick={() => setWin('auto')}>Last 60 min</button>
+        <button type="button" className={winBtn(win === 'full')} aria-pressed={win === 'full'} onClick={() => setWin('full')}>Full run</button>
+      </span>}
+      <Go to="exchanges">Exchanges</Go>
+    </h4>
+    {spark.empty && exchanges === 0
+      ? <p data-ov-traffic-empty="" className="m-0 text-[12.5px] text-fg-subtle">No traffic recorded.</p>
+      : <TrafficSparklineChart spark={spark} />}
+    {spark.quiet && <p data-testid="traffic-quiet" className="num m-0 mt-1.5 flex items-center gap-1.5 text-[12px] text-warn">
+      <Icon name="alert" size={12} />No traffic in the last 10 min{spark.lastAt != null ? ` · last request ${fmtTime(spark.lastAt)}` : ''}
+    </p>}
+  </>
+}
+
+/** Requests/min with one decimal below 10 (long full-run buckets average to fractions). */
+const fmtRate = (v: number) => (v >= 10 || Number.isInteger(v) ? fmtN(Math.round(v)) : v.toFixed(1))
+
+/** SVG sparkline; the readout is tabular and follows the pointer (or ←/→ when focused). */
+export function TrafficSparklineChart({ spark }: { spark: TrafficSparkline }) {
+  const [hover, setHover] = useState<number | null>(null)
+  const n = spark.buckets.length
+  const H = 40
+  const y = (v: number) => H - Math.min(1, v / spark.yMax) * (H - 2)
+  const line = spark.buckets.map((b, i) => `${i === 0 ? 'M' : 'L'}${(i + 0.5).toFixed(2)},${y(b.perMin).toFixed(2)}`).join(' ')
+  const area = `M0.5,${H} ${line.replace(/^M/, 'L')} L${(n - 0.5).toFixed(2)},${H} Z`
+  const capY = spark.capInScale ? y(spark.capPerMin) : null
+  const axisFmt = spark.t1 - spark.t0 > 86_400_000 ? fmtDate : fmtTime
+  const pick = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const box = e.currentTarget.getBoundingClientRect()
+    if (box.width <= 0) return
+    setHover(Math.max(0, Math.min(n - 1, Math.floor((e.clientX - box.left) / box.width * n))))
+  }
+  const key = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+    e.preventDefault()
+    setHover(h => Math.max(0, Math.min(n - 1, (h ?? n - 1) + (e.key === 'ArrowLeft' ? -1 : 1))))
+  }
+  const b = hover != null ? spark.buckets[hover] : null
+  const winLabel = spark.window === 'live' ? 'last 60 min' : 'full run'
+  return <div data-testid="traffic-sparkline" data-window={spark.window}>
+    <div
+      className="relative h-11 cursor-crosshair border-b border-line outline-none focus-visible:shadow-[0_0_0_2px_var(--accent-line)]"
+      tabIndex={0}
+      role="img"
+      aria-label={`Requests per minute, ${winLabel}: peak ${fmtRate(spark.peakPerMin)} req/min, ${fmtN(spark.denied)} denied or error responses`}
+      onPointerMove={pick}
+      onPointerLeave={() => setHover(null)}
+      onKeyDown={key}
+      onBlur={() => setHover(null)}
+    >
+      <svg className="absolute inset-0 size-full overflow-visible" viewBox={`0 0 ${n} ${H}`} preserveAspectRatio="none" aria-hidden="true">
+        <path d={area} className="fill-[var(--accent-soft)]" />
+        <path d={line} fill="none" className="stroke-[var(--accent)]" strokeWidth={1.5} vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
+        {capY != null && <line data-testid="traffic-cap-line" x1={0} x2={n} y1={capY} y2={capY} className="stroke-[var(--fg-3)]" strokeWidth={1} strokeDasharray="4 3" vectorEffect="non-scaling-stroke" />}
+        {spark.buckets.map((bk, i) => bk.denied > 0 && <rect key={i} data-traffic-denied="" x={i + 0.15} y={H - 6} width={0.7} height={6} className="fill-[var(--danger)]" />)}
+        {hover != null && <line x1={hover + 0.5} x2={hover + 0.5} y1={0} y2={H} className="stroke-[var(--fg-3)]" strokeWidth={1} vectorEffect="non-scaling-stroke" />}
+      </svg>
+      {spark.capPerMin > 0 && <span
+        className="num pointer-events-none absolute right-0 rounded-[3px] bg-panel/90 px-1 text-[10.5px] leading-[13px] text-fg-subtle"
+        style={{ top: capY != null ? `max(0px, calc(${(capY / H * 100).toFixed(1)}% - 14px))` : 0 }}
+        data-testid="traffic-cap-label"
+      >
+        Cap <Num value={spark.capPerMin} kind="count" compact />/min{capY == null ? ' · off scale' : ''}
+      </span>}
+    </div>
+    <div data-ov-traffic-axis="" className="num mt-[3px] flex justify-between gap-2 whitespace-nowrap text-[11px] text-fg-subtle">
+      <span>{axisFmt(spark.t0)}</span>
+      <span>{axisFmt(spark.t0 + (spark.t1 - spark.t0) / 2)}</span>
+      <span>{spark.window === 'live' ? 'now' : axisFmt(spark.t1)}</span>
+    </div>
+    <div className="num mt-1 flex min-h-4 items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-muted" data-testid="traffic-readout" aria-live="off">
+      {b
+        ? <>
+          <span className="text-fg-subtle">{axisFmt(b.t)}</span>
+          <span className="text-fg-faint">·</span>
+          <span className="text-fg tabular-nums">{fmtRate(b.perMin)} req/min</span>
+          <span className="text-fg-faint">·</span>
+          <Num value={b.count} kind="count" unit="req" />
+          <span className="text-fg-faint">·</span>
+          <span className={b.denied > 0 ? 'text-danger' : 'text-fg-subtle'}><Num value={b.denied} kind="count" unit="denied" /></span>
+        </>
+        : <>
+          <span className="text-fg-subtle">Peak</span>
+          <span className="text-fg tabular-nums">{fmtRate(spark.peakPerMin)} req/min</span>
+          <span className="text-fg-faint">·</span>
+          <span className={spark.denied > 0 ? 'text-danger' : 'text-fg-subtle'}><Num value={spark.denied} kind="count" compact unit="denied" /></span>
+          <span className="text-fg-faint">·</span>
+          <span className="text-fg-subtle">{winLabel}</span>
+        </>}
     </div>
   </div>
 }

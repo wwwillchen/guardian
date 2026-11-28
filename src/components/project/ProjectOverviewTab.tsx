@@ -6,7 +6,7 @@ import { cn } from '../../lib/cn.ts'
 import { isRunDeleteBlocked, isRunInProgress } from '../../server/run-status.ts'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
-import { capabilityTierMeta, formatCount, formatUsd, phaseNames } from '../run-state.ts'
+import { formatCount, formatUsd, lifecycleBreakdown, phaseNames, runLifecycleMeta, runLifecycleOf, runModeMeta, runModeOf } from '../run-state.ts'
 import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
 import { Badge } from '../ui/badge.tsx'
 import { Button } from '../ui/button.tsx'
@@ -20,6 +20,7 @@ import {
   DialogTitle,
 } from '../ui/dialog.tsx'
 import { EmptyState } from '../ui/empty-state.tsx'
+import { RunLifecycleBadge } from './ProjectRunsTab.tsx'
 import type { ProjectLoaderData, ProjectTabId } from './types.ts'
 import { formatGithubPatBadge } from './types.ts'
 
@@ -32,29 +33,16 @@ interface Props {
 type ProjectRun = ProjectLoaderData['runs'][number]
 
 /**
- * Posture title built from lifecycle buckets so "in progress" never hides that
- * runs are actually paused or awaiting approval. `needsAttention` drives the
- * amber dot (only when a human has to act).
+ * Posture title built from the canonical lifecycle buckets so "in progress" never hides that runs
+ * are actually paused or awaiting approval ("1 running · 1 paused · 1 awaiting approval").
+ * `needsAttention` drives the amber dot (only when a human has to act).
  */
 function describeRunLifecycle(runs: readonly Pick<ProjectRun, 'status'>[]): {
   title: string
   needsAttention: boolean
 } {
-  let running = 0
-  let paused = 0
-  let awaiting = 0
-  for (const run of runs) {
-    // Canonical RunStatus only: `waiting` is the approval/consent wait; anything else in progress is running.
-    if (run.status === 'paused' || run.status === 'budget_paused') paused += 1
-    else if (run.status === 'waiting') awaiting += 1
-    else running += 1
-  }
-  const title = [
-    running > 0 ? `${formatCount(running)} running` : '',
-    paused > 0 ? `${formatCount(paused)} paused` : '',
-    awaiting > 0 ? `${formatCount(awaiting)} awaiting approval` : '',
-  ].filter(Boolean).join(' · ')
-  return { title, needsAttention: paused > 0 || awaiting > 0 }
+  const { counts, text } = lifecycleBreakdown(runs, { liveOnly: true })
+  return { title: text, needsAttention: counts.paused > 0 || counts.awaiting_approval > 0 }
 }
 
 /** Posture headline that reads as a sentence. */
@@ -88,24 +76,9 @@ function plural(count: number, singular: string, pluralWord = `${singular}s`): s
   return `${formatCount(count)} ${count === 1 ? singular : pluralWord}`
 }
 
+/** Status dot from the canonical lifecycle (no status → quiet neutral dot). */
 function statusDotClass(status: string | undefined): string {
-  switch (status) {
-    case 'complete':
-    case 'approved':
-    case 'confirmed':
-      return 'bg-ok'
-    case 'running':
-      return 'bg-accent'
-    case 'waiting':
-    case 'paused':
-    case 'budget_paused':
-    case 'waiting_approval':
-      return 'bg-warn'
-    case 'failed':
-      return 'bg-danger'
-    default:
-      return 'bg-fg-faint'
-  }
+  return status ? runLifecycleMeta[runLifecycleOf(status)].dot : 'bg-fg-faint'
 }
 
 function RunsEmptySvg() {
@@ -314,12 +287,12 @@ export function ProjectOverviewTab({ data, onSelectTab, onNewRun }: Props) {
   const posture = describePosture({ runs, inProgress: inProgressRuns, hostCount: assets.length })
   const postureSub = latestRun
     ? [
-      capabilityTierMeta[latestRun.capabilityTier]?.name ?? 'Standard',
+      runModeMeta[runModeOf(latestRun)].label,
       phaseNames[latestRun.phase],
       plural(completedRuns, 'completed run'),
       formatRelativeTime(latestRun.createdAt, { compact: false, now }),
     ].join(' · ')
-    : `No scans yet — start with a ${capabilityTierMeta[1].name} to map the surface.`
+    : `No scans yet — start with a ${runModeMeta.passive.scanLabel} to map the surface.`
 
   async function confirmDeleteRun() {
     if (!runToDelete || deletingRun) return
@@ -493,14 +466,14 @@ export function ProjectOverviewTab({ data, onSelectTab, onNewRun }: Props) {
                       <span className="truncate" title={runTitle !== run.goal ? run.goal : undefined}>{runTitle}</span>
                     </span>
                     <span className="text-[12px] tabular-nums text-fg-subtle" data-slot="overview-run-meta">
-                      {capabilityTierMeta[run.capabilityTier]?.name ?? 'Standard'} · {phaseNames[run.phase]}
+                      {runModeMeta[runModeOf(run)].label} · {phaseNames[run.phase]}
                       {run.findingCount > 0 ? ` · ${plural(run.findingCount, 'finding')}` : ''}
                       {run.confirmedCount > 0 ? ` (${formatCount(run.confirmedCount)} confirmed)` : ''}
                       {' '}· {formatCount(run.turnsUsed)} turns · {formatCount(run.spentRequests)} reqs · {formatUsd(run.spentUsd)}
                     </span>
                   </span>
                   <span className="flex flex-none items-center gap-2.5 max-[480px]:basis-full max-[480px]:flex-wrap max-[480px]:gap-y-1 max-[480px]:pl-[19px]">
-                    <Badge variant="neutral" className="bg-sunk">{runStatusLabel(run.status)}</Badge>
+                    <RunLifecycleBadge status={run.status} dot={false} />
                     <time
                       className="text-[12px] tabular-nums text-fg-subtle"
                       dateTime={new Date(run.createdAt).toISOString()}
@@ -547,7 +520,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onNewRun }: Props) {
             <EmptyState
               icon={<RunsEmptySvg />}
               title="No runs yet"
-              description={`Start a ${capabilityTierMeta[1].name} to map your surface, or run ${capabilityTierMeta[2].name} with test accounts to verify access controls across ${project.name}.`}
+              description={`Start a ${runModeMeta.passive.scanLabel} to map your surface, then add test accounts to verify access controls across ${project.name}.`}
               action={onNewRun ? (
                 // Distinct name from the header's "New run" so the two controls are distinguishable.
                 <Button type="button" variant="default" onClick={onNewRun}>
@@ -606,13 +579,7 @@ export function ProjectOverviewTab({ data, onSelectTab, onNewRun }: Props) {
                     {displayRunLabel(runToDelete)}
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
-                    <Badge variant="neutral" className="bg-panel capitalize">
-                      <span
-                        className={cn('inline-block size-[7px] flex-none rounded-full', statusDotClass(runToDelete.status))}
-                        aria-hidden="true"
-                      />
-                      {runStatusLabel(runToDelete.status)}
-                    </Badge>
+                    <RunLifecycleBadge status={runToDelete.status} />
                     <Badge variant="neutral" className="bg-panel">
                       {plural(runToDelete.findingCount, 'finding')}
                       {runToDelete.confirmedCount > 0 ? ` (${formatCount(runToDelete.confirmedCount)} confirmed)` : ''}

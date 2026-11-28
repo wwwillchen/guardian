@@ -10,7 +10,7 @@ import { fmtDur } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
-import { capabilityTierMeta, formatCount, formatUsd, phaseNames } from '../run-state.ts'
+import { formatCount, formatUsd, lifecycleBreakdown, phaseNames, runLifecycleMeta, runLifecycleOf, runModeMeta, runModeOf } from '../run-state.ts'
 import { formatFullDateTime, formatRelativeTime, useNow } from '../shell/AppShell.tsx'
 import { Badge } from '../ui/badge.tsx'
 import { Button } from '../ui/button.tsx'
@@ -60,6 +60,11 @@ export function matchesRunStatusFilter(
   }
 }
 
+/**
+ * Mode badge tone + long label for a run. Self-contained (evaluated in isolation by
+ * `tests/ux-rail-opt1.test.ts`); mirrors `runModeMeta[runModeOf(run)]` `scanLabel` / `tone`,
+ * which `tests/ui-bucket-b2-telemetry-workers.test.ts` checks for parity.
+ */
 export function scanModeBadgeInfo(
   run: { capabilityTier: CapabilityTier; approvalPolicy: ApprovalPolicy },
 ): { label: string; variant: 'neutral' | 'accent' | 'warn' } {
@@ -104,24 +109,15 @@ function plural(count: number, singular: string, pluralWord = `${singular}s`): s
   return `${formatCount(count)} ${count === 1 ? singular : pluralWord}`
 }
 
-function statusDotClass(status: string | undefined): string {
-  switch (status) {
-    case 'complete':
-    case 'approved':
-    case 'confirmed':
-      return 'bg-ok'
-    case 'running':
-      return 'bg-accent'
-    case 'waiting':
-    case 'paused':
-    case 'budget_paused':
-    case 'waiting_approval':
-      return 'bg-warn'
-    case 'failed':
-      return 'bg-danger'
-    default:
-      return 'bg-fg-faint'
-  }
+/** Canonical lifecycle badge (label, tone and dot from `runLifecycleMeta`) shared by both project tabs. */
+export function RunLifecycleBadge({ status, className, dot = true }: { status: string; className?: string; dot?: boolean }) {
+  const meta = runLifecycleMeta[runLifecycleOf(status)]
+  return (
+    <Badge variant={meta.tone} className={className} data-lifecycle={runLifecycleOf(status)}>
+      {dot && <span className={cn('inline-block size-[7px] flex-none rounded-full', meta.dot)} aria-hidden="true" />}
+      {meta.label}
+    </Badge>
+  )
 }
 
 interface Props {
@@ -195,6 +191,8 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
     return counts
   }, [runs])
 
+  const breakdown = useMemo(() => lifecycleBreakdown(runs), [runs])
+  const liveBreakdown = useMemo(() => lifecycleBreakdown(runs.filter(run => matchesRunStatusFilter(run, 'running')), { liveOnly: true }), [runs])
   const filteredRuns = useMemo(
     () => filterProjectRuns(runs, { statusFilter, query, labels: runLabels }),
     [runs, statusFilter, query, runLabels],
@@ -246,6 +244,11 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
           <span className="text-[12px] tabular-nums text-fg-subtle">
             {hasFilters ? `${filteredRuns.length} of ${runs.length}` : runs.length}
           </span>
+          {breakdown.text && (
+            <span className="min-w-0 truncate text-[12px] tabular-nums text-fg-subtle" data-slot="runs-lifecycle-breakdown" title={breakdown.text}>
+              · {breakdown.text}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-3">
           {/* The page header owns the single filled "New run"; the empty state below offers its own. */}
@@ -264,6 +267,7 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                   key={filter.id}
                   type="button"
                   aria-pressed={active}
+                  title={filter.id === 'running' && liveBreakdown.text ? liveBreakdown.text : undefined}
                   onClick={() => setStatusFilter(filter.id)}
                   className={cn(
                     'inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-full border px-2.5 text-[12px] font-medium shadow-none transition-colors',
@@ -304,7 +308,7 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
           <EmptyState
             icon={<Icon name="play" size={20} />}
             title="No runs yet"
-            description={`Start a ${capabilityTierMeta[1].name} to map your surface, or run ${capabilityTierMeta[2].name} with test accounts across ${project.name}.`}
+            description={`Start a ${runModeMeta.passive.scanLabel} to map your surface (add test accounts to check access controls), or a ${runModeMeta.supervised.scanLabel} for approval-gated active checks across ${project.name}.`}
             action={
               <Button type="button" variant="default" onClick={handleNewRun}>
                 <Icon name="plus" size={13} />
@@ -354,14 +358,14 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                   className="flex min-h-[48px] min-w-0 flex-1 items-center gap-3 px-2 py-2 text-inherit no-underline"
                 >
                   <span className="inline-flex size-3.5 flex-none items-center justify-center">
-                    <StatusGlyph status={run.status} />
+                    <StatusGlyph status={runLifecycleMeta[runLifecycleOf(run.status)].glyph} />
                   </span>
                   <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                     <span className="flex min-w-0 flex-wrap items-center gap-2">
                       <span className="truncate font-medium text-fg" title={runTitle !== run.goal ? run.goal : undefined}>
                         {runTitle}
                       </span>
-                      <Badge variant={modeBadge.variant}>{modeBadge.label}</Badge>
+                      <Badge variant={modeBadge.variant} title={modeBadge.label}>{runModeMeta[runModeOf(run)].label}</Badge>
                     </span>
                     <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[12px] tabular-nums text-fg-subtle">
                       <span>{phaseNames[run.phase]}</span>
@@ -385,7 +389,7 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                     </span>
                   </span>
                   <span className="flex flex-none items-center gap-2.5">
-                    <Badge variant="neutral" className="bg-sunk">{runStatusLabel(run.status)}</Badge>
+                    <RunLifecycleBadge status={run.status} dot={false} />
                     <time
                       className="text-[12px] tabular-nums text-fg-subtle"
                       dateTime={new Date(run.createdAt).toISOString()}
@@ -474,13 +478,7 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                     {displayRunLabel(runToDelete)}
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
-                    <Badge variant="neutral" className="bg-panel capitalize">
-                      <span
-                        className={cn('inline-block size-[7px] flex-none rounded-full', statusDotClass(runToDelete.status))}
-                        aria-hidden="true"
-                      />
-                      {runStatusLabel(runToDelete.status)}
-                    </Badge>
+                    <RunLifecycleBadge status={runToDelete.status} />
                     <Badge variant="neutral" className="bg-panel">
                       {plural(runToDelete.findingCount, 'finding')}
                       {runToDelete.confirmedCount > 0 ? ` (${formatCount(runToDelete.confirmedCount)} confirmed)` : ''}
