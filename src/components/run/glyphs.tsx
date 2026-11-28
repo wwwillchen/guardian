@@ -1,8 +1,11 @@
 // Status and severity glyphs. Shape always doubles colour (colour-blind safe).
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { assertNever } from '../../server/run-status.ts'
+import type { FindingFixState } from '../../findings-view.ts'
 import { getStepStatusMeta, STEP_STATUS, type ChainStepStatus } from '../../step-status.ts'
-import { RISKL, SEV_COL, stLabel } from './meta.ts'
+import { Icon } from './icons.tsx'
+import { RISKL, SEV_COL, SEV_LABEL, stLabel } from './meta.ts'
 import type { CoverageStatus, RiskTier } from './meta.ts'
 import { cn, covTileClass } from './tw.ts'
 
@@ -23,6 +26,56 @@ export function SevGlyph({ sev }: { sev: string | null | undefined }) {
       ? <rect key={i} x={b[0]} y="6" width="2.5" height="2" rx="1" fill="var(--fg-3)" />
       : <rect key={i} x={b[0]} y={b[1]} width="2.5" height={b[2]} rx="1" fill={i < n ? col : 'var(--fg-4)'} />)}
   </svg>
+}
+
+const SEV_SHORT: Record<string, string> = { critical: 'Crit', high: 'High', medium: 'Med', low: 'Low', informational: 'Info' }
+const SEV_TEXT: Record<string, string> = { critical: 'text-crit', high: 'text-high', medium: 'text-med' }
+
+/**
+ * Fixed 72px leading severity column for finding rows: bar glyph + short label, coloured
+ * crit/high/med and muted below. `machine` (when it differs) lands in the title so an operator
+ * override never hides the original machine severity.
+ */
+export function SevCell({ sev, machine }: { sev: string; machine?: string | null }) {
+  const label = SEV_LABEL[sev] ?? sev
+  const overridden = Boolean(machine && machine !== sev)
+  return <span
+    data-slot="sev-cell"
+    data-sev={sev}
+    className={cn('inline-flex w-[72px] flex-none items-center gap-1.5 text-[12px] font-medium', SEV_TEXT[sev] ?? 'text-fg-subtle')}
+    title={overridden ? `${label} (operator override; machine severity ${SEV_LABEL[machine!] ?? machine})` : label}
+  >
+    <SevGlyph sev={sev} />{SEV_SHORT[sev] ?? label}{overridden && <span className="text-fg-faint" aria-hidden="true">*</span>}
+  </span>
+}
+
+export const FIX_STATE_LABEL: Record<FindingFixState, string> = {
+  none: 'Not retested', verifying: 'Verifying fix…', verified_fixed: 'Verified fixed', still_reproducible: 'Still reproducible',
+}
+const FIX_STATE_TONE: Record<FindingFixState, string> = {
+  none: 'text-fg-subtle', verifying: 'text-fg-muted', verified_fixed: 'text-ok', still_reproducible: 'text-danger',
+}
+
+/**
+ * Verify Fix lifecycle pill. State changes crossfade colour/opacity over 150ms with a reserved
+ * slot (callers size it) so the swap never shifts the row; `none` keeps the element but renders no copy.
+ */
+export function FixStatePill({ state, className }: { state: FindingFixState; className?: string }) {
+  return <span
+    data-slot="fix-state"
+    data-fix-state={state}
+    aria-hidden={state === 'none' || undefined}
+    className={cn(
+      'inline-flex h-5 flex-none items-center gap-1 whitespace-nowrap text-[11.5px] font-medium transition-[color,background-color,border-color,opacity] duration-150 ease-out motion-reduce:transition-none',
+      FIX_STATE_TONE[state], state === 'none' && 'opacity-0',
+      className,
+    )}
+  >
+    {state !== 'none' && <>
+      <StatusGlyph status={state === 'verified_fixed' ? 'fixed' : state === 'still_reproducible' ? 'failed' : 'running'} />
+      {FIX_STATE_LABEL[state]}
+    </>}
+  </span>
 }
 
 function Ring({ stroke, dash, glyph, children }: { stroke: string; dash?: boolean; glyph?: string; children?: ReactNode }) {
@@ -224,4 +277,29 @@ export function LiveGlyph({ status, pulse, dotClassName }: { status: string; pul
       ? <LiveDot paused={paused} className={dotClassName} />
       : <span className={cn('inline-block size-2 flex-none rounded-full', paused ? 'bg-warn' : 'bg-accent', dotClassName)} aria-hidden="true" />}
   </span>
+}
+
+/**
+ * In-button copy feedback: the copy icon morphs into a check (opacity + scale .9→1, 150ms ease-out;
+ * opacity only under reduced motion). Both icons stay stacked in one grid cell so nothing shifts.
+ */
+export function CopyMorphIcon({ copied, size }: { copied: boolean; size?: number }) {
+  const cls = 'col-start-1 row-start-1 transition-[opacity,scale] duration-150 ease-out motion-reduce:scale-100! motion-reduce:transition-[opacity]'
+  return <span className="inline-grid flex-none place-items-center" data-slot="copy-morph" data-copied={copied || undefined} aria-hidden="true">
+    <Icon name="copy" size={size} className={cn(cls, copied ? 'scale-90 opacity-0' : 'scale-100 opacity-100')} />
+    <Icon name="check" size={size} className={cn(cls, 'text-ok', copied ? 'scale-100 opacity-100' : 'scale-90 opacity-0')} />
+  </span>
+}
+
+/** Copy-feedback state for `CopyMorphIcon`: `flash()` shows the check for 1.4s (timer cleared on unmount). */
+export function useCopyFlash(): [boolean, () => void] {
+  const [copied, setCopied] = useState(false)
+  const timer = useRef<number | undefined>(undefined)
+  useEffect(() => () => window.clearTimeout(timer.current), [])
+  const flash = () => {
+    setCopied(true)
+    window.clearTimeout(timer.current)
+    timer.current = window.setTimeout(() => setCopied(false), 1400)
+  }
+  return [copied, flash]
 }

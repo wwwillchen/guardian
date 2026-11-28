@@ -3,16 +3,17 @@
 // event log for anything older (so the list covers the whole run), plus
 // `broker.denied` events. Text search also runs server-side
 // (`searchRunExchanges`: path, body and headers) and merges the hits.
-// The inspector loads headers and body with `readExchange` on demand.
-import { useEffect, useMemo, useState } from 'react'
+// The inspector loads headers and body with `readExchange` on demand and hands them to the
+// lazily loaded Request / Response / Timing / Raw tabs (sensitive headers redacted until revealed,
+// plus a "Compare with…" control vs. variant diff). Rows carry a log-scale duration waterfall.
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { searchRunExchanges } from '../../../actions.ts'
-import { formatExchangeAsCurl } from '../../curl-parser.ts'
 import { Dropdown, FilterBox, matchQ, Tabs, useDebounced, VList } from '../controls.tsx'
 import { useFullExchange, useRun, useRunModel } from '../data.tsx'
 import { EmptyState, FindingTitle, InlineError, KbdGroup, LinkRow, Props, Section, Seg, Skeleton, Tag } from '../display.tsx'
-import { fmtAgo, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host, plural, prettyBody } from '../format.ts'
-import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { fmtAgo, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host, plural } from '../format.ts'
+import { CopyMorphIcon, SevGlyph, StatusGlyph, useCopyFlash } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
 import { CHECK_HEADERS, normFStatus, PHASE_LABEL, stLabel } from '../meta.ts'
@@ -22,6 +23,9 @@ import { PaneBody, PaneHeader } from '../pane.tsx'
 import type { InspectorMap, InspectorProps } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, httpCodeClass, runBtn, runDdItem, runIconBtn, RW } from '../tw.ts'
+import { redactedCurlFor } from './queue-read.tsx'
+
+const ExchangeDetailTabs = lazy(() => import('./proof-viewers.tsx').then(m => ({ default: m.ExchangeDetailTabs })))
 
 type SearchHit = Awaited<ReturnType<typeof searchRunExchanges>>[number]
 
@@ -47,6 +51,8 @@ type Tab = 'all' | '2xx' | '3xx' | '4xx' | '5xx' | 'denied'
 type Group = 'none' | 'origin' | 'persona'
 const bucket = (r: XRow): Tab => r.denied ? 'denied' : r.status >= 500 ? '5xx' : r.status >= 400 ? '4xx' : r.status >= 300 ? '3xx' : '2xx'
 const str = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : null)
+/** Log-scale waterfall width (0–1) so a 40 ms and a 4 s exchange both stay legible in one column. */
+const logFraction = (ms: number, max: number) => (max > 0 ? Math.min(1, Math.log1p(Math.max(0, ms)) / Math.log1p(max)) : 0)
 
 /** Convert a `broker.denied` / `broker.circuit_open` event into an Exchanges row, surfacing structured detail fields when present. */
 export function deniedEventToRow(ev: RunEvent): XRow {
@@ -193,6 +199,7 @@ export function ExchangesView() {
     ...(persona ? [['Test account', persona === '-' ? 'Anonymous' : persona, () => setPersona('')] as [string, string, () => void]] : []),
   ]
   const allowedCount = rows.filter(r => !r.denied).length
+  const maxDur = useMemo(() => shown.reduce((m, r) => Math.max(m, r.dur ?? 0), 0), [shown])
   const height = (it: Item) => (it.type === 'head' ? 32 : 36)
 
   if (!rows.length && eventsReady && !counts.exchanges) {
@@ -278,6 +285,10 @@ export function ExchangesView() {
             </span>
             {r.persona && group !== 'persona' && <span className="min-w-0 max-w-[160px] shrink"><Tag icon="lock" title={r.persona}>{r.persona}</Tag></span>}
             {hitIds.has(r.id) && <span className="inline-flex flex-none text-fg-subtle" title="Matched in the body or headers by server search"><Icon name="search" size={12} /></span>}
+            <span data-slot="waterfall" aria-hidden="true" className="relative h-1.5 w-[56px] flex-none overflow-hidden rounded-full bg-sunk max-[1180px]:hidden"
+              title={r.dur != null ? fmtN(r.dur) + ' ms (log scale)' : undefined}>
+              {r.dur != null && <i className="absolute inset-y-0 left-0 rounded-full bg-fg-faint" style={{ width: `${Math.max(4, logFraction(r.dur, maxDur) * 100)}%` }} />}
+            </span>
             <span className="w-[56px] flex-none text-right font-mono text-[12px] tabular-nums text-fg-subtle">{r.dur != null ? fmtN(r.dur) + 'ms' : ''}</span>
           </div>
         }} />}
@@ -285,41 +296,6 @@ export function ExchangesView() {
 }
 
 // ---------------------------------------------------------------- inspector
-
-/** Response headers that matter for security review (highlighted in the table). */
-const SECURITY_HEADERS = new Set([
-  'strict-transport-security', 'content-security-policy', 'content-security-policy-report-only', 'x-content-type-options',
-  'x-frame-options', 'referrer-policy', 'permissions-policy', 'cross-origin-opener-policy', 'cross-origin-embedder-policy',
-  'cross-origin-resource-policy', 'access-control-allow-origin', 'access-control-allow-credentials', 'access-control-allow-methods',
-  'access-control-allow-headers', 'set-cookie', 'server', 'x-powered-by', 'via', 'www-authenticate',
-])
-const BASELINE: [string, string][] = [
-  ['strict-transport-security', 'HSTS'], ['content-security-policy', 'CSP'], ['x-content-type-options', 'nosniff'],
-  ['x-frame-options', 'Frame options'], ['referrer-policy', 'Referrer policy'],
-]
-
-function HeaderTable({ headers, flagged }: { headers: Record<string, string> | undefined; flagged: Set<string> }) {
-  const ks = Object.keys(headers ?? {})
-  if (!ks.length) return <p className="text-fg-subtle!">None recorded</p>
-  return <table className={cn(RW.hdrs, 'font-mono text-[12px]')}><tbody>{ks.map(k => {
-    const lk = k.toLowerCase()
-    const isFlag = flagged.has(lk)
-    const isSec = !isFlag && SECURITY_HEADERS.has(lk)
-    return <tr key={k}>
-      <td className={cn(
-        'w-[44%] min-w-[172px] break-normal border-b border-line py-[3px] pr-2.5 align-top text-[11.5px] leading-[17px] [overflow-wrap:anywhere]',
-        isFlag
-          ? 'bg-warn-soft font-medium text-warn before:mb-px before:mr-1.5 before:inline-block before:size-[5px] before:rounded-full before:bg-warn before:align-middle before:content-[""]'
-          : isSec
-            ? 'text-fg before:mb-px before:mr-1.5 before:inline-block before:size-[5px] before:rounded-full before:bg-fg-subtle before:align-middle before:content-[""]'
-            : 'text-fg-subtle',
-      )}>{k}</td>
-      <td className={cn('border-b border-line py-[3px] align-top text-[11.5px] leading-[17px] text-fg-muted [overflow-wrap:anywhere]', !/\s/.test(String(headers![k])) && 'break-all', isFlag && 'bg-warn-soft')}>
-        {String(headers![k])}
-      </td>
-    </tr>
-  })}</tbody></table>
-}
 
 /** Remount key: a failed full-exchange read is not cached, so bumping it re-runs loadExchange. */
 function ExchangeInspector(props: InspectorProps) {
@@ -332,6 +308,7 @@ function ExchangeInspectorBody({ sel, onRetry }: InspectorProps & { onRetry: () 
   const model = useRunModel()
   const links = useLinks()
   const toast = useToast()
+  const [copied, flash] = useCopyFlash()
   const id = sel.id
   const denied = id.startsWith('ev:')
   const ev: RunEvent | undefined = useMemo(() => denied ? events.find(e => e.id === Number(id.slice(3))) : undefined, [denied, events, id])
@@ -339,7 +316,6 @@ function ExchangeInspectorBody({ sel, onRetry }: InspectorProps & { onRetry: () 
   const loaded = useFullExchange(id, !denied)
   const full = loaded ?? undefined
   const err = loaded === null
-  const [bodyAll, setBodyAll] = useState(false)
 
   if (denied) {
     const row = ev ? deniedEventToRow(ev) : null
@@ -396,14 +372,20 @@ function ExchangeInspectorBody({ sel, onRetry }: InspectorProps & { onRetry: () 
   const iast = (detail.labTelemetry ?? []).filter(x => x.exchangeId === id)
   // headers a citing finding's check inspects
   const flagged = new Set(fs.flatMap(f => CHECK_HEADERS[f.check?.id ?? ''] ?? []))
-  const resp = full?.respHeaders ?? {}
-  const respKeys = new Set(Object.keys(resp).map(k => k.toLowerCase()))
-  const body = full ? prettyBody(full.body, mediaType) : sum ? prettyBody(sum.bodyPreview, mediaType) : ''
-  const CAP = 12000
-  const copyCurl = () => {
-    const cmd = formatExchangeAsCurl({ method, origin, pathAndQuery: path, reqHeaders: full?.reqHeaders, personaHandle: persona })
-    void navigator.clipboard?.writeText(cmd).then(() => toast.show('Copied as cURL', { icon: 'check', sub: full ? 'Sanitized request headers included' : 'Headers still loading; URL only' }),
-      () => toast.show('Could not copy to the clipboard', { tone: 'error' }))
+  const x = full ?? sum
+  // Compare candidates: same origin + path first (control vs. variant pairs), newest first, bounded.
+  const candidates = useMemo(() => detail.exchangesSummary.filter(e => e.id !== id)
+    .sort((a, b) => Number(b.origin === origin && b.pathAndQuery.split('?')[0] === path.split('?')[0]) - Number(a.origin === origin && a.pathAndQuery.split('?')[0] === path.split('?')[0]) || b.createdAt - a.createdAt)
+    .slice(0, 200), [detail.exchangesSummary, id, origin, path])
+  const copyCurl = async () => {
+    try {
+      const cmd = await redactedCurlFor(detail.run.id, id, sum)
+      if (!cmd) { toast.show('Exchange details unavailable', { tone: 'error' }); return }
+      await navigator.clipboard?.writeText(cmd)
+      flash()
+    } catch {
+      toast.show('Could not copy to the clipboard', { tone: 'error' })
+    }
   }
   return <>
     <PaneHeader
@@ -416,7 +398,7 @@ function ExchangeInspectorBody({ sel, onRetry }: InspectorProps & { onRetry: () 
           {[method || null, status || null, t ? fmtAgo(t) : null].filter(Boolean).join(' · ') || 'Details'}
         </span>
       }
-      extra={<button type="button" className={runIconBtn()} title="Copy as cURL" aria-label="Copy as cURL" onClick={copyCurl}><Icon name="copy" />cURL</button>}
+      extra={<button type="button" className={runIconBtn()} title="Copy as cURL (sensitive headers redacted)" aria-label="Copy as cURL" onClick={() => void copyCurl()}><CopyMorphIcon copied={copied} />cURL</button>}
     />
     <PaneBody><div className={RW.detail}>
       <div className="mb-2.5 flex min-w-0 flex-wrap gap-1.5">
@@ -443,38 +425,17 @@ function ExchangeInspectorBody({ sel, onRetry }: InspectorProps & { onRetry: () 
           return <LinkRow key={e} icon="fact" right={evd.kind} trailing="chevR" onClick={() => links.evidence(e)}>{evd.title}</LinkRow>
         })}
       </Section>}
-      {err ? <InlineError className="my-2" title="Couldn’t load the full request and response for this exchange." onRetry={onRetry} /> : !full ? <Section title="Headers"><Skeleton rows={5} /></Section> : <>
-        <Section title="Security headers" right={BASELINE.filter(([h]) => respKeys.has(h)).length + ' of ' + BASELINE.length}>
-          <div className="mb-2.5 flex flex-wrap gap-[5px]">{BASELINE.map(([h, l]) => {
-            const has = respKeys.has(h)
-            return <span
-              key={h}
-              className={cn(
-                'inline-flex h-[22px] items-center gap-1 rounded-[5px] pl-1.5 pr-2 text-[12px]',
-                has
-                  ? 'text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)]'
-                  : 'bg-warn-soft text-warn shadow-[inset_0_0_0_1px_var(--warn-line)]',
-                flagged.has(h) && 'font-medium',
-              )}
-              title={has ? h + ': ' + resp[Object.keys(resp).find(k => k.toLowerCase() === h)!] : h + ' is absent'}
-            >
-              <Icon name={has ? 'check' : 'x'} size={12} className={has ? 'text-fg-subtle' : 'text-warn'} />{l}
-            </span>
-          })}</div>
-        </Section>
-        <Section title="Request headers" right={Object.keys(full.reqHeaders ?? {}).length || undefined}><HeaderTable headers={full.reqHeaders} flagged={new Set()} /></Section>
-        <Section title="Response headers" right={Object.keys(resp).length || undefined}><HeaderTable headers={resp} flagged={flagged} /></Section>
-      </>}
+      {err ? <InlineError className="my-2" title="Couldn’t load the full request and response for this exchange." onRetry={onRetry} />
+        : !x ? <Section title="Headers"><Skeleton rows={5} /></Section>
+          : <Suspense fallback={<Section title="Headers"><Skeleton rows={5} /></Section>}>
+            <ExchangeDetailTabs x={x} full={full} flagged={flagged} candidates={candidates} />
+          </Suspense>}
       {iast.length > 0 && <Section title="Runtime traces" right={iast.length}>
         {iast.map(x => <LinkRow key={x.id} icon="node" title={`Trace ${x.traceId}`} trailing={model.evidenceById.has(x.artifactId) ? 'chevR' : null}
           sub={x.routesHit.join(', ') || undefined} right={`${x.newLinesCovered} lines · ${x.sinkEventsCount} sinks`}
           onClick={() => model.evidenceById.has(x.artifactId) && links.evidence(x.artifactId)}>
           {x.hasUnhandledException ? 'Unhandled exception' : 'Runtime trace'}
         </LinkRow>)}
-      </Section>}
-      {body && <Section title={full && full.body.length > (sum?.bodyPreview.length ?? 0) ? 'Response body' : 'Body preview'} right={full ? fmtN(full.body.length) + ' chars' : undefined}>
-        <pre className={cn(RW.pre, 'max-h-[420px]')}>{bodyAll ? body : body.slice(0, CAP)}</pre>
-        {body.length > CAP && !bodyAll && <button type="button" className={cn(runBtn({ variant: 'link', size: 'none' }), 'mt-1')} onClick={() => setBodyAll(true)}>Show all {fmtN(body.length)} characters</button>}
       </Section>}
       {w && <Section title="Related">
         <LinkRow glyph={<StatusGlyph status={w.status} />} right={PHASE_LABEL[w.phase] ?? w.phase} trailing="workflow" onClick={() => links.worker(w.id)}>{w.title}</LinkRow>

@@ -1,44 +1,56 @@
 // Findings view (A's list inside F's frame), owned by Agent Q.
 //
 // The collapsible verdict strip (B's headline) sits above a toolbar with
-// status tabs (low-priority tabs fold into "More · n"), a `/` filter and a
-// display menu (group by severity / origin / status / none, ordering).
-// Group headers collapse and carry status tallies. Confirmed is the quiet
-// outlined check; accent means selection only. Long lists are windowed.
+// status tabs, a quiet low-priority fold (Out of scope · Suppressed), a `/` filter and a
+// display menu (group by severity / fix status / category / origin / status / none,
+// ordering, Comfortable / Compact density). Tabs, group tallies and rows all come from the
+// single triage-aware projection (`projectTriagedFindings`), so tab totals equal the headline's
+// counts; suppressed findings never land in an active severity group. Every row leads with a
+// fixed 72px severity column. Confirmed is the quiet outlined check; accent means selection only.
+// Long lists are windowed.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode, RefObject } from 'react'
 import type { OperatorTriage, OperatorTriageStatus } from '../../../actions-triage.ts'
+import { ACTIVE_TRIAGE_BUCKETS, indexFindingFixStates, projectTriagedFindings, runFindingsScopeContext } from '../../../findings-view.ts'
+import type { FindingFixState, FindingTriageBucket, TriagedFindingRow } from '../../../findings-view.ts'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
 import { canOfferResumeButton } from '../../../server/run-status.ts'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
 import { EmptyState, FindingTitle, KbdGroup, Seg, Tag } from '../display.tsx'
 import { host } from '../format.ts'
-import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { FIX_STATE_LABEL, FixStatePill, SevCell, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
-import { FSTAT_ORDER, normFStatus, prettyCat, SEV_LABEL, SEV_ORDER, stLabel } from '../meta.ts'
-import type { FindingDisplayStatus } from '../meta.ts'
+import { prettyCat, SEV_LABEL, SEV_ORDER } from '../meta.ts'
 import type { FindingRow } from '../model.ts'
 import { useListNav, useNav, useViewState } from '../nav.tsx'
 import type { InspectorMap } from '../pane.tsx'
 import { usePaletteCommands } from '../palette.tsx'
 import { useToast } from '../toast.tsx'
-import { cn, runBtn, RW } from '../tw.ts'
+import { cn, runBtn, runDdItem, RW } from '../tw.ts'
 import { FindingInspector } from './findings-inspector.tsx'
 
-type Group = 'severity' | 'origin' | 'status' | 'none'
+type Group = 'severity' | 'fix' | 'category' | 'origin' | 'status' | 'none'
 type Sort = 'severity' | 'status' | 'title'
-type Tab = 'all' | FindingDisplayStatus
-const GROUPS: [Group, string][] = [['severity', 'Severity'], ['origin', 'Origin'], ['status', 'Status'], ['none', 'None']]
+type Tab = 'all' | FindingTriageBucket
+type Density = 'comfortable' | 'compact'
+const GROUPS: [Group, string][] = [['severity', 'Severity'], ['fix', 'Fix status'], ['category', 'Category'], ['origin', 'Origin'], ['status', 'Status'], ['none', 'None']]
 const SORTS: [Sort, string][] = [['severity', 'Severity'], ['status', 'Status'], ['title', 'Title']]
-const TABS: [Tab, string][] = [['all', 'All'], ['confirmed', 'Confirmed'], ['static_verified', 'Static advisory'], ['needs_review', 'Needs review'], ['pending', 'Awaiting'], ['inconclusive', 'Inconclusive'], ['dismissed', 'Dismissed']]
-const STATUS_KEYS: FindingDisplayStatus[] = ['confirmed', 'static_verified', 'needs_review', 'pending', 'inconclusive', 'dismissed']
-/** Above this many rows the list is windowed (rows stay 36px, heads 32px). */
+const TABS: [Tab, string][] = [['all', 'All'], ['confirmed', 'Confirmed'], ['static_verified', 'Static advisory'], ['needs_review', 'Needs review'], ['pending', 'Awaiting'], ['inconclusive', 'Inconclusive'], ['dismissed', 'Dismissed'], ['excluded', 'Out of scope'], ['suppressed', 'Suppressed']]
+/** Tabs that live in the quiet low-priority fold unless they are the current tab. */
+const LOW_PRIORITY: ReadonlySet<Tab> = new Set<Tab>(['excluded', 'suppressed'])
+const TAB_LABEL = Object.fromEntries(TABS) as Record<Tab, string>
+const BUCKET_ORDER = Object.fromEntries([...ACTIVE_TRIAGE_BUCKETS, 'suppressed'].map((b, i) => [b, i])) as Record<FindingTriageBucket, number>
+const FIX_ORDER: Record<FindingFixState, number> = { still_reproducible: 0, verifying: 1, verified_fixed: 2, none: 3 }
+const BUCKET_GLYPH: Partial<Record<FindingTriageBucket, string>> = { excluded: 'not_applicable', suppressed: 'stopped' }
+const DENSITY: [Density, string][] = [['comfortable', 'Comfortable'], ['compact', 'Compact']]
+/** Above this many rows the list is windowed (heads 32px, rows 36px comfortable / 30px compact). */
 const VIRTUAL_AT = 300
-const ROW_H = 36
 const HEAD_H = 32
+const ROW_HEIGHT: Record<Density, number> = { comfortable: 36, compact: 30 }
 
-interface G { key: string; label: string; glyph: ReactNode; items: FindingRow[] }
+type Row = TriagedFindingRow<FindingRow> & { fix: FindingFixState }
+interface G { key: string; label: string; glyph: ReactNode; items: Row[] }
 
 export type FindingWithTriage = FindingRow & { operatorTriage?: OperatorTriage | null }
 
@@ -75,19 +87,35 @@ function matches(f: FindingRow, q: string) {
   return q.toLowerCase().split(/\s+/).filter(Boolean).every(t => text.includes(t))
 }
 
-function groupOf(items: FindingRow[], g: Group): G[] | null {
-  if (g === 'none') return null
-  const m = new Map<string, FindingRow[]>()
-  const key = (f: FindingRow) => g === 'severity' ? (f.severity || 'informational') : g === 'origin' ? (host(f.origin) || '—') : normFStatus(f.status)
-  for (const f of items) { const k = key(f); m.set(k, [...(m.get(k) ?? []), f]) }
-  const order = (a: string, b: string) => g === 'severity' ? (SEV_ORDER[a] ?? 9) - (SEV_ORDER[b] ?? 9)
-    : g === 'status' ? (FSTAT_ORDER[a] ?? 9) - (FSTAT_ORDER[b] ?? 9) : a.localeCompare(b)
-  return [...m.entries()].sort((a, b) => order(a[0], b[0])).map(([k, list]) => ({
-    key: k,
-    label: g === 'severity' ? (SEV_LABEL[k] ?? k) : g === 'status' ? stLabel(k) : k,
-    glyph: g === 'severity' ? <SevGlyph sev={k} /> : g === 'status' ? <StatusGlyph status={k} /> : <span className="inline-flex text-fg-subtle"><Icon name="globe" /></span>,
-    items: list,
-  }))
+const bucketGlyph = (b: FindingTriageBucket) => <StatusGlyph status={BUCKET_GLYPH[b] ?? b} />
+
+/** Group key/label/glyph per grouping; the Suppressed tab always groups by suppression reason. */
+function groupKey(r: Row, g: Group, suppressedTab: boolean): [string, string, ReactNode, number | string] {
+  if (suppressedTab) {
+    const by = r.item.suppressedBy ?? 'false_positive'
+    return [by, by === 'accepted_risk' ? 'Accepted risk' : 'False positive', bucketGlyph('suppressed'), by]
+  }
+  switch (g) {
+    case 'severity': return [r.effectiveSeverity, SEV_LABEL[r.effectiveSeverity] ?? r.effectiveSeverity, <SevGlyph sev={r.effectiveSeverity} />, SEV_ORDER[r.effectiveSeverity] ?? 9]
+    case 'fix': return [r.fix, FIX_STATE_LABEL[r.fix], <StatusGlyph status={r.fix === 'verified_fixed' ? 'fixed' : r.fix === 'still_reproducible' ? 'failed' : r.fix === 'verifying' ? 'running' : 'pending'} />, FIX_ORDER[r.fix]]
+    case 'category': { const c = prettyCat(r.finding.category); return [c, c, <span className="inline-flex text-fg-subtle"><Icon name="grid" /></span>, c] }
+    case 'status': return [r.bucket, TAB_LABEL[r.bucket], bucketGlyph(r.bucket), BUCKET_ORDER[r.bucket]]
+    default: { const h = host(r.finding.origin) || '—'; return [h, h, <span className="inline-flex text-fg-subtle"><Icon name="globe" /></span>, h] }
+  }
+}
+
+function groupOf(items: Row[], g: Group, suppressedTab: boolean): G[] | null {
+  if (g === 'none' && !suppressedTab) return null
+  const m = new Map<string, { label: string; glyph: ReactNode; order: number | string; items: Row[] }>()
+  for (const r of items) {
+    const [k, label, glyph, order] = groupKey(r, g, suppressedTab)
+    const e = m.get(k)
+    if (e) e.items.push(r)
+    else m.set(k, { label, glyph, order, items: [r] })
+  }
+  return [...m.entries()]
+    .sort((a, b) => (typeof a[1].order === 'number' && typeof b[1].order === 'number' ? a[1].order - b[1].order : String(a[1].order).localeCompare(String(b[1].order))))
+    .map(([key, e]) => ({ key, label: e.label, glyph: e.glyph, items: e.items }))
 }
 
 // ---------------------------------------------------------------- verdict strip
@@ -127,8 +155,26 @@ function VerdictStrip() {
 
 // ---------------------------------------------------------------- toolbar
 
-function Toolbar({ tabs, tab, setTab, filter, setFilter, filterRef, onFilterEnter, group, setGroup, sort, setSort }: {
+/** Quiet fold for low-priority tabs (Out of scope, Suppressed); hidden when empty. */
+function LowPriorityFold({ tabs, onPick }: { tabs: [Tab, string, number][]; onPick: (t: Tab) => void }) {
+  if (!tabs.length) return null
+  return <Dropdown
+    className="flex-none"
+    btnClassName="inline-flex h-[26px] flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-control border-0 bg-transparent px-[9px] text-[12.5px] font-normal tabular-nums text-fg-subtle shadow-none transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg"
+    title={'Low priority: ' + tabs.map(t => `${t[1]} ${t[2]}`).join(' · ')}
+    label={<span data-slot="low-priority-fold" className="inline-flex items-center gap-1"><Icon name="archive" /><span className="sr-only">Low priority</span>{tabs.reduce((n, t) => n + t[2], 0)}</span>}
+    menuClassName="top-[30px] w-[200px] p-1.5"
+    align="left"
+  >
+    {close => tabs.map(([k, l, n]) => <button key={k} type="button" role="menuitem" data-tab={k} className={runDdItem()} onClick={() => { onPick(k); close() }}>
+      {l}<span className="num ml-auto text-fg-subtle">{n}</span>
+    </button>)}
+  </Dropdown>
+}
+
+function Toolbar({ tabs, folded, tab, setTab, filter, setFilter, filterRef, onFilterEnter, group, setGroup, sort, setSort, density, setDensity }: {
   tabs: [Tab, string, number][]
+  folded: [Tab, string, number][]
   tab: Tab
   setTab: (t: Tab) => void
   filter: string
@@ -139,16 +185,22 @@ function Toolbar({ tabs, tab, setTab, filter, setFilter, filterRef, onFilterEnte
   setGroup: (g: Group) => void
   sort: Sort
   setSort: (s: Sort) => void
+  density: Density
+  setDensity: (d: Density) => void
 }) {
   return <div className={RW.toolbar}>
     <Tabs tabs={tabs} value={tab} onChange={setTab} label="Filter findings by status" />
+    <LowPriorityFold tabs={folded} onPick={setTab} />
     <FilterBox ref={filterRef} value={filter} onChange={setFilter} onEnter={onFilterEnter} label="Filter findings" />
     <Dropdown icon="sliders" title="Display options (⇧G cycles grouping)"
       label={<><span className="text-fg-subtle">Group</span><span>{GROUPS.find(g => g[0] === group)?.[1]}</span></>}>
       <div className={RW.ddSec}>Grouping<KbdGroup keys={['⇧', 'G']} className="ml-auto" /></div>
-      <Seg<Group> value={group} onChange={setGroup} options={GROUPS.map(([value, label]) => ({ value, label }))} fullWidth />
+      <Seg<Group> value={group} onChange={setGroup} options={GROUPS.slice(0, 3).map(([value, label]) => ({ value, label }))} fullWidth />
+      <Seg<Group> value={group} onChange={setGroup} options={GROUPS.slice(3).map(([value, label]) => ({ value, label }))} fullWidth className="mt-1" />
       <div className={RW.ddSec}>Ordering</div>
       <Seg<Sort> value={sort} onChange={setSort} options={SORTS.map(([value, label]) => ({ value, label }))} fullWidth />
+      <div className={RW.ddSec}>Density</div>
+      <Seg<Density> value={density} onChange={setDensity} options={DENSITY.map(([value, label]) => ({ value, label }))} fullWidth label="Row density" />
     </Dropdown>
   </div>
 }
@@ -173,31 +225,38 @@ function FindingTriageBadges({ triage }: { triage: OperatorTriage | null | undef
   </span>
 }
 
-function FindingRowView({ f, group, cur, onClick, style }: {
-  f: FindingRow
+function FindingRowView({ r, group, showFix, density, cur, onClick, style }: {
+  r: Row
   group: Group
+  showFix: boolean
+  density: Density
   cur: boolean
   onClick: () => void
   style?: CSSProperties
 }) {
-  const st = normFStatus(f.status)
+  const f = r.finding
   const triage = (f as FindingWithTriage).operatorTriage
   const badges = hasTriageBadges(triage)
+  const machine = r.severityOverridden ? `Severity overridden to ${SEV_LABEL[r.effectiveSeverity]}; machine severity ${SEV_LABEL[r.machineSeverity]}` : undefined
   return <div
-    className={cn(RW.row, 'cursor-pointer', cur && RW.rowCur)}
+    className={cn(RW.row, 'cursor-pointer', density === 'compact' && 'h-[30px] [contain-intrinsic-size:auto_30px]', cur && RW.rowCur)}
     data-id={f.id}
+    data-bucket={r.bucket}
     onClick={onClick}
     style={style}
+    title={machine}
     aria-selected={cur}
   >
-    {group !== 'severity' && <span className="inline-flex size-3.5 flex-none items-center justify-center" title={SEV_LABEL[f.severity] ?? f.severity}><SevGlyph sev={f.severity} /></span>}
-    <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(st)}><StatusGlyph status={st} /></span>
+    <SevCell sev={r.effectiveSeverity} machine={r.severityOverridden ? r.machineSeverity : null} />
+    <span className="inline-flex size-3.5 flex-none items-center justify-center" title={TAB_LABEL[r.bucket]}>{bucketGlyph(r.bucket)}</span>
     <span data-slot="finding-title" className="min-w-[38%] flex-1 truncate text-fg" title={f.title || undefined}>
       <FindingTitle title={f.title} />
     </span>
+    {r.bucket === 'needs_review' && <Tag tone="warn" className="flex-none">Needs review</Tag>}
     <FindingTriageBadges triage={triage} />
-    {f.category && <span className={cn('min-w-0 max-w-[155px] shrink truncate text-[12px] text-fg-subtle', badges && 'max-[1440px]:hidden')} title={prettyCat(f.category)}>{prettyCat(f.category)}</span>}
-    {group !== 'origin' && <span className="w-[150px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1320px]:w-[120px] max-[1180px]:hidden">{host(f.origin)}</span>}
+    {showFix && <span className="flex w-[124px] flex-none"><FixStatePill state={r.fix} /></span>}
+    {f.category && group !== 'category' && <span className={cn('min-w-0 max-w-[155px] shrink truncate text-[12px] text-fg-subtle max-[1360px]:hidden', (badges || showFix) && 'max-[1440px]:hidden')} title={prettyCat(f.category)}>{prettyCat(f.category)}</span>}
+    {group !== 'origin' && <span className="w-[150px] min-w-0 shrink truncate text-right font-mono text-[12px] text-fg-subtle max-[1320px]:w-[120px] max-[1180px]:hidden" title={host(f.origin) || undefined}>{host(f.origin)}</span>}
   </div>
 }
 
@@ -209,13 +268,14 @@ function GroupHead({ g, group, collapsed, onToggle, style, className }: {
   style?: CSSProperties
   className?: string
 }) {
-  const t: Partial<Record<FindingDisplayStatus, number>> = {}
-  for (const f of g.items) { const s = normFStatus(f.status); t[s] = (t[s] ?? 0) + 1 }
+  const t: Partial<Record<FindingTriageBucket, number>> = {}
+  for (const r of g.items) t[r.bucket] = (t[r.bucket] ?? 0) + 1
   return <div
     className={cn(RW.ghead, className)}
     role="button"
     tabIndex={0}
     aria-expanded={!collapsed}
+    data-group={g.key}
     style={style}
     onClick={onToggle}
     onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle() } }}
@@ -223,14 +283,37 @@ function GroupHead({ g, group, collapsed, onToggle, style, className }: {
     <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', collapsed && '-rotate-90')} />
     <span className="inline-flex size-3.5 flex-none items-center justify-center">{g.glyph}</span>
     <span>{g.label}</span>
-    <span className="font-normal tabular-nums text-fg-subtle">{g.items.length}</span>
+    <span className="font-normal tabular-nums text-fg-subtle" data-slot="group-count">{g.items.length}</span>
     {group !== 'status' && <span className="ml-auto flex items-center gap-2 font-normal tabular-nums text-fg-subtle">
-      {STATUS_KEYS.filter(k => t[k]).map(k => <span key={k} className="inline-flex items-center gap-[5px]" title={stLabel(k)}><StatusGlyph status={k} />{t[k]}</span>)}
+      {[...ACTIVE_TRIAGE_BUCKETS, 'suppressed' as const].filter(k => t[k]).map(k => <span key={k} className="inline-flex items-center gap-[5px]" title={TAB_LABEL[k]}>{bucketGlyph(k)}{t[k]}</span>)}
     </span>}
   </div>
 }
 
 // ---------------------------------------------------------------- view
+
+/** The single triage-aware projection for this run (same scope context as the headline verdict) + fix states. */
+function useFindingRows() {
+  const model = useRunModel()
+  return useMemo(() => {
+    const p = projectTriagedFindings(model.findings, runFindingsScopeContext(model.run, model.detail.facts))
+    const fix = indexFindingFixStates(p.rows.map(r => r.finding), model.detail)
+    const rows: Row[] = p.rows.map(r => ({ ...r, fix: fix.get(r.finding.id)?.state ?? 'none' }))
+    return { rows, counts: p.counts, showFix: rows.some(r => r.fix !== 'none') }
+  }, [model])
+}
+
+/** Tabs with items: primary tabs inline, low-priority ones folded unless current. */
+function useTabs(counts: ReturnType<typeof useFindingRows>['counts'], tab: Tab) {
+  return useMemo(() => {
+    const withN = TABS.filter(([k]) => counts[k] > 0).map(([k, l]) => [k, l, counts[k]] as [Tab, string, number])
+    return {
+      inline: withN.filter(t => !LOW_PRIORITY.has(t[0]) || t[0] === tab),
+      folded: withN.filter(t => LOW_PRIORITY.has(t[0]) && t[0] !== tab),
+      has: (t: Tab) => withN.some(x => x[0] === t),
+    }
+  }, [counts, tab])
+}
 
 export function FindingsView() {
   const model = useRunModel()
@@ -240,29 +323,31 @@ export function FindingsView() {
   const [filter, setFilter] = useViewState('findings.filter', '')
   const [group, setGroup] = useViewState<Group>('findings.group', 'severity')
   const [sort, setSort] = useViewState<Sort>('findings.sort', 'severity')
+  const [density, setDensity] = useViewState<Density>('findings.density', 'comfortable')
   const [collapsed, setCollapsed] = useViewState<Record<string, boolean>>('findings.collapsed', {})
   const filterRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  const ROW_H = ROW_HEIGHT[density]
 
-  const tabs = useMemo(() => {
-    const t: Record<string, number> = { all: model.findings.length }
-    for (const f of model.findings) { const s = normFStatus(f.status); t[s] = (t[s] ?? 0) + 1 }
-    return TABS.filter(([k]) => t[k]).map(([k, l]) => [k, l, t[k]] as [Tab, string, number])
-  }, [model])
-  const activeTab: Tab = tabs.some(t => t[0] === tab) ? tab : 'all'
+  const projected = useFindingRows()
+  const tabSet = useTabs(projected.counts, tab)
+  const activeTab: Tab = tabSet.has(tab) ? tab : 'all'
+  const suppressedTab = activeTab === 'suppressed'
 
   const items = useMemo(() => {
-    const list = model.findings.filter(f => (activeTab === 'all' || normFStatus(f.status) === activeTab) && matches(f, filter))
-    const sev = (a: FindingRow, b: FindingRow) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9)
-    const st = (a: FindingRow, b: FindingRow) => (FSTAT_ORDER[a.status] ?? 9) - (FSTAT_ORDER[b.status] ?? 9)
-    return list.sort((a, b) => sort === 'title' ? a.title.localeCompare(b.title)
-      : sort === 'status' ? st(a, b) || sev(a, b) || a.title.localeCompare(b.title)
-        : sev(a, b) || st(a, b) || a.title.localeCompare(b.title))
-  }, [model, activeTab, filter, sort])
-  const groups = useMemo(() => groupOf(items, group), [items, group])
-  const ck = (g: G) => group + ':' + g.key
-  const flatIds = useMemo(() => groups ? groups.flatMap(g => (collapsed[group + ':' + g.key] ? [] : g.items.map(f => f.id))) : items.map(f => f.id),
-    [groups, items, collapsed, group])
+    const list = projected.rows.filter(r => (activeTab === 'all' ? r.bucket !== 'suppressed' : r.bucket === activeTab) && matches(r.finding, filter))
+    const sev = (a: Row, b: Row) => (SEV_ORDER[a.effectiveSeverity] ?? 9) - (SEV_ORDER[b.effectiveSeverity] ?? 9)
+    const st = (a: Row, b: Row) => BUCKET_ORDER[a.bucket] - BUCKET_ORDER[b.bucket]
+    const ti = (a: Row, b: Row) => a.finding.title.localeCompare(b.finding.title)
+    return list.sort((a, b) => sort === 'title' ? ti(a, b)
+      : sort === 'status' ? st(a, b) || sev(a, b) || ti(a, b)
+        : sev(a, b) || st(a, b) || ti(a, b))
+  }, [projected, activeTab, filter, sort])
+  const groups = useMemo(() => groupOf(items, group, suppressedTab), [items, group, suppressedTab])
+  const gk = suppressedTab ? 'suppressed' : group
+  const ck = (g: G) => gk + ':' + g.key
+  const flatIds = useMemo(() => groups ? groups.flatMap(g => (collapsed[gk + ':' + g.key] ? [] : g.items.map(r => r.finding.id))) : items.map(r => r.finding.id),
+    [groups, items, collapsed, gk])
 
   const { index } = useListNav({ ids: flatIds, kind: 'finding' })
   const cycleGroup = () => {
@@ -274,6 +359,7 @@ export function FindingsView() {
   useShortcuts([{ key: 'G', run: cycleGroup }])
   usePaletteCommands([
     ...GROUPS.map(([k, l]) => ({ id: 'f.group.' + k, section: 'Actions', label: k === 'none' ? 'Findings: no grouping' : 'Findings: group by ' + l.toLowerCase(), icon: 'sliders' as const, run: () => setGroup(k) })),
+    { id: 'f.density', section: 'Actions', label: density === 'compact' ? 'Findings: comfortable rows' : 'Findings: compact rows', icon: 'list', run: () => setDensity(density === 'compact' ? 'comfortable' : 'compact') },
     { id: 'f.filter', section: 'Actions', label: 'Filter findings', icon: 'search', keys: ['/'], run: () => setTimeout(() => filterRef.current?.focus(), 0) },
   ])
 
@@ -282,12 +368,12 @@ export function FindingsView() {
 
   // Windowed rendering for long lists.
   const flatEntries = useMemo(() => {
-    const out: ({ t: 'h'; g: G } | { t: 'r'; f: FindingRow })[] = []
-    if (groups) for (const g of groups) { out.push({ t: 'h', g }); if (!collapsed[ck(g)]) g.items.forEach(f => out.push({ t: 'r', f })) }
-    else items.forEach(f => out.push({ t: 'r', f }))
+    const out: ({ t: 'h'; g: G } | { t: 'r'; r: Row })[] = []
+    if (groups) for (const g of groups) { out.push({ t: 'h', g }); if (!collapsed[ck(g)]) g.items.forEach(r => out.push({ t: 'r', r })) }
+    else items.forEach(r => out.push({ t: 'r', r }))
     return out
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groups, items, collapsed])
+  }, [groups, items, collapsed, gk])
   const virtualAt = useVirtualThreshold()
   const virtual = items.length > virtualAt
   const offsets = useMemo(() => {
@@ -296,7 +382,7 @@ export function FindingsView() {
     for (const e of flatEntries) { o.push(y); y += e.t === 'h' ? HEAD_H : ROW_H }
     o.push(y)
     return o
-  }, [flatEntries])
+  }, [flatEntries, ROW_H])
   const [win, setWin] = useState<[number, number]>([0, 80])
   useLayoutEffect(() => {
     const el = listRef.current
@@ -324,7 +410,7 @@ export function FindingsView() {
     const el = listRef.current
     if (!el) return
     if (virtual) {
-      const i = flatEntries.findIndex(e => e.t === 'r' && e.f.id === selId)
+      const i = flatEntries.findIndex(e => e.t === 'r' && e.r.finding.id === selId)
       if (i < 0) return
       const top = offsets[i]
       const head = groups ? HEAD_H : 0
@@ -333,12 +419,13 @@ export function FindingsView() {
       return
     }
     el.querySelector<HTMLElement>(`[data-id="${CSS.escape(selId)}"]`)?.scrollIntoView({ block: 'nearest' })
-  }, [selId, index, virtual, flatEntries, offsets, groups])
+  }, [selId, index, virtual, flatEntries, offsets, groups, ROW_H])
 
   const toggle = (g: G) => setCollapsed(c => ({ ...c, [ck(g)]: !c[ck(g)] }))
-  const toolbar = <Toolbar tabs={tabs} tab={activeTab} setTab={setTab} filter={filter} setFilter={setFilter} filterRef={filterRef}
+  const toolbar = <Toolbar tabs={tabSet.inline} folded={tabSet.folded} tab={activeTab} setTab={setTab} filter={filter} setFilter={setFilter} filterRef={filterRef}
     onFilterEnter={() => { if (flatIds[0]) { select(flatIds[0]); filterRef.current?.blur() } }}
-    group={group} setGroup={setGroup} sort={sort} setSort={setSort} />
+    group={group} setGroup={setGroup} sort={sort} setSort={setSort} density={density} setDensity={setDensity} />
+  const rowProps = { group: suppressedTab ? 'none' as const : group, showFix: projected.showFix, density }
 
   if (!model.findings.length) {
     // No filter / display controls: there is nothing to filter or group yet.
@@ -366,7 +453,7 @@ export function FindingsView() {
           const style: CSSProperties = { position: 'absolute', top: offsets[i], left: 0, right: 0, height: e.t === 'h' ? HEAD_H : ROW_H }
           return e.t === 'h'
             ? <GroupHead key={'h:' + e.g.key} g={e.g} group={group} collapsed={!!collapsed[ck(e.g)]} onToggle={() => toggle(e.g)} className="absolute" style={style} />
-            : <FindingRowView key={e.f.id} f={e.f} group={group} cur={e.f.id === selId} onClick={() => select(e.f.id)} style={style} />
+            : <FindingRowView key={e.r.finding.id} r={e.r} {...rowProps} cur={e.r.finding.id === selId} onClick={() => select(e.r.finding.id)} style={style} />
         })}
       </div>
     </>
@@ -374,14 +461,14 @@ export function FindingsView() {
     body = groups
       ? groups.map(g => <div key={g.key} className="relative">
         <GroupHead g={g} group={group} collapsed={!!collapsed[ck(g)]} onToggle={() => toggle(g)} />
-        {!collapsed[ck(g)] && g.items.map(f => <FindingRowView key={f.id} f={f} group={group} cur={f.id === selId} onClick={() => select(f.id)} />)}
+        {!collapsed[ck(g)] && g.items.map(r => <FindingRowView key={r.finding.id} r={r} {...rowProps} cur={r.finding.id === selId} onClick={() => select(r.finding.id)} />)}
       </div>)
-      : items.map(f => <FindingRowView key={f.id} f={f} group={group} cur={f.id === selId} onClick={() => select(f.id)} />)
+      : items.map(r => <FindingRowView key={r.finding.id} r={r} {...rowProps} cur={r.finding.id === selId} onClick={() => select(r.finding.id)} />)
   }
   return <>
     <VerdictStrip />
     {toolbar}
-    <div className={RW.list} ref={listRef} tabIndex={-1}>{body}</div>
+    <div className={RW.list} ref={listRef} tabIndex={-1} data-density={density}>{body}</div>
   </>
 }
 
