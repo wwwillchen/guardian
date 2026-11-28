@@ -15,6 +15,7 @@
 import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
+import { isRecipeAllowedForSpecKind } from '../replay-spec.ts'
 import {
   HOST_DISCLOSURE_SECRET_PATTERNS,
   constructHostEvidence,
@@ -4287,17 +4288,6 @@ export function safeRegexTest(
   try { return new RegExp(pattern).test(capped) } catch { return false }
 }
 
-const ALLOWED_RECIPES_BY_SPEC_KIND: Readonly<Record<string, ReadonlySet<string>>> = {
-  browser_chain: new Set(['browser_sink']),
-  sql_boolean_diff: new Set(['boolean_or_timing']),
-  sql_time_diff: new Set(['boolean_or_timing']),
-  race_burst: new Set(['conserved_balance', 'race_burst']),
-  http_chain: new Set([
-    'access_boundary', 'persisted_mutation', 'boolean_or_timing', 'oob_callback',
-    'race_burst', 'disclosure', 'redirect', 'injection_fingerprint', 'conserved_balance',
-  ]),
-}
-
 /**
  * H-5: Strict provenance, scope, Tier-0, denylist, and allowlist gate for `recipe` envelopes.
  */
@@ -4322,8 +4312,7 @@ export function validateReplayRecipeEnvelope(input: {
   if (input.tier === 0) {
     return { ok: false, reason: 'Live recipe execution is disabled in Tier 0.' }
   }
-  const allowed = ALLOWED_RECIPES_BY_SPEC_KIND[input.specKind]
-  if (!allowed || !allowed.has(input.recipeId)) {
+  if (!isRecipeAllowedForSpecKind(input.specKind, input.recipeId)) {
     return { ok: false, reason: `Recipe "${input.recipeId}" is not allowlisted for spec kind "${input.specKind}".` }
   }
   if (input.hasDestructive(JSON.stringify({ recipeId: input.recipeId, args: input.recipeArgs }))) {

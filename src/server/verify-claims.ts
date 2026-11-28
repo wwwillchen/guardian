@@ -1749,9 +1749,9 @@ export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyCl
     const hasAuthzShape = ctrls.length > 0 && prbs.length > 0 && (
       ctrls.some(c => prbs.some(p => (c.actor.handle ?? null) !== (p.actor.handle ?? null) || (c.actor.tenant ?? null) !== (p.actor.tenant ?? null))) ||
       ctrls.some(c => c.status === 401 || c.status === 403))
-    if (injectionFamily) effectiveClaimed = 'injection'
+    const hasBaselineFpNoise = ctrls.length > 0 && prbs.some(p => { const fp = matchStrippedInjectionFingerprint(p, null); return Boolean(fp && ctrls.some(c => c.route === p.route && matchStrippedInjectionFingerprint(c, fp.family) !== null)) })
+    if (injectionFamily || hasSelfEchoClaim || hasBaselineFpNoise) effectiveClaimed = 'injection'
     else if (hasActiveMarkupClaim) effectiveClaimed = 'markup'
-    else if (hasSelfEchoClaim) effectiveClaimed = 'injection'
     else if (hasAuthzShape) effectiveClaimed = 'authorization'
   }
   const boundaryClaimPassed = checks.some(c => c.passed && c.claim.kind === 'boundary' && (c.observed as { arm?: unknown } | undefined)?.arm === 'control_denied')

@@ -1022,7 +1022,7 @@ test('parity corpus: covers both TP and FP sides including anon-control authz an
 // 2. Entry point 1: verifyReplaySpec (strict receipt default) + label permutations
 // ============================================================================
 
-test('path parity [verifyReplaySpec]: enforces TP/FP verdicts and fail-closed label permutation invariance', async (t) => {
+test('path parity [verifyReplaySpec]: retired declarative jq VM fails closed and never confirms TP or FP corpus specs under any label permutation', async (t) => {
   const corpus = loadCorpus().filter(c => c.paths.replay)
   assert.ok(corpus.length >= 10)
 
@@ -1070,29 +1070,22 @@ test('path parity [verifyReplaySpec]: enforces TP/FP verdicts and fail-closed la
         grant,
         signal: AbortSignal.timeout(15_000),
       })
-      const wantConfirmed = expectedVerdictFor('verifyReplaySpec', c, perm)
-      if (wantConfirmed) {
-        assert.equal(
-          res.verdict,
-          'confirmed',
-          `TP case ${c.id} MUST confirm in verifyReplaySpec under permutation "${perm}" (got ${res.verdict}: ${res.outcome.reason ?? 'none'})`,
-        )
-        assert.equal(res.receipt?.mode, 'strict')
-        assert.equal(res.receipt?.verification.confirmed, true)
+      // Track D Cut 2: the declarative jq VM is deleted. A raw `http_chain` spec is either
+      // schema-invalid or retired, so it fails closed under every label permutation and can never
+      // promote a TP or an FP.
+      assert.notEqual(res.verdict, 'confirmed', `retired spec ${c.id} must fail closed under "${perm}" (got ${res.verdict}: ${res.outcome.reason ?? 'none'})`)
+      assert.equal(res.outcome.confirmed, false)
+      assert.equal(res.receipt, undefined, 'retired specs never build a receipt')
+      const reason = String(res.outcome.reason ?? '')
+      if (res.evidencePayload.retired === true) {
+        assert.ok(reason.includes('retired_legacy_spec_kind'), `missing retirement reason for ${c.id} under "${perm}"`)
       } else {
-        assert.notEqual(
-          res.verdict,
-          'confirmed',
-          `${c.side.toUpperCase()} case ${c.id} MUST NOT confirm in verifyReplaySpec under permutation "${perm}" (reason=${res.outcome.reason ?? 'none'})`,
-        )
-        // Pin the closed replay-verifier.ts:508 gap: error-status-only-injection must fail proofStrength even under 'other'/'cwe_20'!
-        if (c.id === 'error-status-only-injection-fp') {
-          const ps = res.evidencePayload.proofStrength as { satisfied?: boolean } | undefined
-          assert.equal(ps?.satisfied, false, `proofStrength must reject error-status-only under "${perm}"`)
-        }
+        assert.ok(reason.includes('Invalid DeclarativeReplaySpec'), `unexpected non-retired failure for ${c.id} under "${perm}"`)
       }
     }
   }
+  // TP/FP verdict parity for the same corpus is enforced through the typed floor-recipe receipt
+  // path (below) and `evaluateClaims`, which remain the live confirmation entry points.
 })
 
 // ============================================================================
@@ -1609,14 +1602,14 @@ test('proofReceiptMode: rejects off/shadow outside NODE_ENV=test and defaults st
 test('receipt-exempt host spec kinds: explicit allowlist only for host_persisted envelopes, never untrusted', () => {
   assert.deepEqual(
     [...RECEIPT_EXEMPT_HOST_SPEC_KINDS].sort(),
-    ['auth_protocol_proof', 'cache_differential', 'upload_probe', 'ws_chain'],
+    ['auth_protocol_proof', 'cache_differential'],
   )
   for (const kind of RECEIPT_EXEMPT_HOST_SPEC_KINDS) {
     assert.equal(isReceiptExemptHostSpec({ kind }, 'host_persisted'), true)
     assert.equal(isReceiptExemptHostSpec({ kind }, 'untrusted'), false)
     assert.equal(isReceiptExemptHostSpec({ kind }, undefined), false)
   }
-  for (const nonExempt of ['http_chain', 'static_ast_proof', 'dns_takeover', 'sql_boolean_diff', 'sql_time_diff', 'browser_chain', 'race_burst', 'rce_proof'] as const) {
+  for (const nonExempt of ['http_chain', 'static_ast_proof', 'dns_takeover', 'sql_boolean_diff', 'sql_time_diff', 'browser_chain', 'race_burst', 'rce_proof', 'upload_probe', 'ws_chain'] as const) {
     assert.equal(isReceiptExemptHostSpec({ kind: nonExempt }, 'host_persisted'), false)
     assert.equal(isReceiptExemptHostSpec({ kind: nonExempt }, 'untrusted'), false)
   }
@@ -1639,19 +1632,23 @@ test('isPureJobOrHandleStubChain: rejects pure job/handle stubs while preserving
   assert.equal(isPureJobOrHandleStubChain(persistedWithAck), false)
 })
 
-test('static hygiene guards: LOC caps, single impactGate veto, unconditional proofStrength, and zero unstripped matchInjectionFingerprint', () => {
+test('static hygiene guards: thin verifier LOC, typed Tier-1 recipe gate, and zero unstripped matchInjectionFingerprint', () => {
   const replayVerifier = readFileSync(join(REPO_ROOT, 'src/server/replay-verifier.ts'), 'utf8')
   const verifyClaims = readFileSync(join(REPO_ROOT, 'src/server/verify-claims.ts'), 'utf8')
   const floorRecipes = readFileSync(join(REPO_ROOT, 'src/server/floor-recipes.ts'), 'utf8')
+  const floorRecipeEngine = readFileSync(join(REPO_ROOT, 'src/server/floor-recipe-engine.ts'), 'utf8')
 
   const replayLines = replayVerifier.split('\n').length
   const verifyClaimsLines = verifyClaims.split('\n').length
-  assert.ok(replayLines <= 1000, `replay-verifier.ts must stay <= 1000 LOC (got ${replayLines})`)
+  // Track D Cut 2 deleted the in-verifier jq VM; the verifier is a thin dispatch module now, so the
+  // cap ratchets down from 1000 to 400.
+  assert.ok(replayLines <= 400, `replay-verifier.ts must stay <= 400 LOC (got ${replayLines})`)
   assert.ok(verifyClaimsLines <= 2300, `verify-claims.ts must stay <= 2300 LOC (got ${verifyClaimsLines})`)
 
-  assert.doesNotMatch(replayVerifier, /proofStrength\.claim\s*===\s*['"]authorization['"]/, 'proofStrength must be enforced for every claim class')
-  const impactGateVetos = replayVerifier.match(/impactGate\?\.required\s*&&\s*!impactGate\.satisfied\s*&&\s*!proofGuardFailure/g) ?? []
-  assert.equal(impactGateVetos.length, 1, `expected exactly 1 impactGate veto in replay-verifier.ts, found ${impactGateVetos.length}`)
+  // The retired jq VM must not return: no jq diff import, no assertion-outcome schema eval.
+  assert.doesNotMatch(replayVerifier, /diffResponse|replayAssertionOutcomeSchema/, 'replay-verifier.ts must not regrow a jq assertion VM')
+  // Every typed floor recipe confirmation is gated by the Track A2 Tier-1 universal primitive.
+  assert.ok(floorRecipeEngine.includes('export function applyTier1Gate('), 'floor-recipe-engine.ts must own the Tier-1 recipe gate')
 
   assert.doesNotMatch(verifyClaims, /\bmatchInjectionFingerprint\s*\(/, 'verify-claims.ts must route all fingerprint matches through matchStrippedInjectionFingerprint')
   assert.doesNotMatch(floorRecipes, /\bmatchInjectionFingerprint\s*\(/, 'floor-recipes.ts must route all fingerprint matches through matchStrippedInjectionFingerprint')
@@ -1911,11 +1908,28 @@ test('R2-04 retest parity [floor + declarative + agent-script]: drifted session,
     }
 
     // --- Engine 2: Declarative replay engine (retestReplaySpec) ---
+    // Track D Cut 2: raw declarative `http_chain` is retired, so the declarative leg persists the
+    // same typed `access_boundary` recipe envelope as the floor engine. Retest then re-runs the
+    // recipe and validates a fresh ProofReceipt instead of the deleted jq VM.
     activeCase = c
     stepCursor = 0
-    const declSpec = buildReplaySpec(c, origin, c.canonicalLabel)
+    const declSpec = {
+      ...buildReplaySpec(c, origin, c.canonicalLabel),
+      recipe: {
+        recipeId: 'access_boundary',
+        args: {
+          origin,
+          method: 'GET',
+          pathAndQuery: '/api/invoices/inv_victim_9',
+          vulnClass: 'bola',
+          owner: { handle: 'owner_a', role: 'owner', tenant: 'tenant-a' },
+          denied: { handle: 'viewer_b', role: 'viewer', tenant: 'tenant-b' },
+          probe: { handle: 'member_b', role: 'member', tenant: 'tenant-b' },
+        },
+      },
+    } as DeclarativeReplaySpec
     if (rt.scenario === 'composite_stage_rejected') {
-      const declReplay = await verifyReplaySpec({ spec: declSpec, broker, backend: jqBackend, grant, signal: AbortSignal.timeout(10_000) })
+      const declReplay = await verifyReplaySpec({ spec: declSpec, broker, backend: jqBackend, grant, signal: AbortSignal.timeout(10_000), envelopeTrust: 'host_persisted' })
       const declHealth = assessDeclarativeRetestHealth(declSpec, {
         ...declReplay,
         evidencePayload: {
@@ -1925,12 +1939,28 @@ test('R2-04 retest parity [floor + declarative + agent-script]: drifted session,
       }, { receiptBuildable: true })
       assert.equal(declHealth.healthy, false, `declarative health must reject ${c.id}`)
       assert.equal(declHealth.failureReason, 'composite_stage_rejected')
+    } else if (rt.scenario === 'unbuildable_receipt') {
+      // The declarative corpus case pins the shared health mapping: a replay with healthy
+      // baseline/probe arms but no buildable ProofReceipt is `receipt_unbuildable`, never `fixed`.
+      const declHealth = assessDeclarativeRetestHealth(declSpec, {
+        verdict: 'inconclusive',
+        outcome: { confirmed: false, controlPassed: true, reason: 'ProofReceipt could not be built.' },
+        evidencePayload: {
+          steps: {
+            entitled: { role: 'control', status: 200, personaHandle: 'owner_a', method: 'GET' },
+            probe: { role: 'probe', status: 403, personaHandle: 'member_b', method: 'GET' },
+          },
+        },
+      }, { receiptBuildable: false })
+      assert.equal(declHealth.healthy, false, `declarative health must reject ${c.id}`)
+      assert.equal(declHealth.failureReason, rt.expectedFailureReason, `declarative failureReason mismatch on ${c.id}`)
     } else {
       const declRetest = await retestReplaySpec({
         spec: declSpec,
         broker,
         backend: jqBackend,
         grant,
+        envelopeTrust: 'host_persisted',
         signal: AbortSignal.timeout(10_000),
       })
       assert.equal(declRetest.verdict, rt.expectedVerdict, `declarative verdict mismatch on ${c.id}: ${declRetest.replay.outcome.reason ?? ''}`)

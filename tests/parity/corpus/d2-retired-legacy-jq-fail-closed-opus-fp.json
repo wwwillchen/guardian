@@ -1,0 +1,111 @@
+{
+  "id": "d2-retired-legacy-jq-fail-closed-opus-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "d2-injection-fingerprint-benign-control-noise",
+  "description": "R3-05 independent cross-family review FP (claude-opus-5-5): Track D Cut 2 deletes the legacy jq assertion VM and routes sqli_boolean db_error_fingerprint signals into the typed injection_fingerprint recipe. When a backend emits the identical engine error on both the benign control and the probe, the typed injection_fingerprint recipe must reject on the benign_control guard, receiptCheckForResult and evaluateClaims must not confirm, and submitting the same evidence as a raw legacy http_chain spec without a typed recipe must fail closed as retired_legacy_spec_kind in verifyReplaySpec (and inconclusive, never fixed, in retestReplaySpec).",
+  "covers": {
+    "files": [
+      "src/server/replay-verifier.ts",
+      "src/server/floor-recipe-engine.ts",
+      "src/server/floor-recipes.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "sqli",
+      "injection"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "sqli",
+    "title": "SQL injection error oracle in catalog query",
+    "impact": "Database engine error observed on catalog query parameter.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "sqli",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "Database engine error on catalog search parameter"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog?q=kovo-synth-canary-ctl",
+      "persona": null,
+      "status": 500,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"SQLITE_ERROR: database schema has changed\",\"ref\":\"kovo-synth-ref-0001\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog?q=kovo-synth-canary-prb",
+      "persona": null,
+      "status": 500,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"SQLITE_ERROR: database schema has changed\",\"ref\":\"kovo-synth-ref-0002\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: false, confirmed: false, observed: \"retired jq assertion\", expected: \"typed injection_fingerprint receipt\" }"
+  },
+  "injectionRecipe": {
+    "param": "q",
+    "controlValue": "kovo-synth-canary-ctl",
+    "payload": "kovo-synth-canary-prb",
+    "family": "sqli"
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "injection",
+      "probeExchangeId": "prb",
+      "controlExchangeIds": [
+        "ctl"
+      ]
+    }
+  ],
+  "bareClaims": [
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 500
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 500
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "SQLITE_ERROR"
+    }
+  ]
+}

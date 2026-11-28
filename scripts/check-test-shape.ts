@@ -94,7 +94,6 @@ export const BASELINE_SOURCE_TEXT_REGEX_ASSERTS: Readonly<Record<string, number>
   'tests/arch-c3-store-repos.test.ts': 5,
   'tests/arch-o4-clock-stream.test.ts': 6,
   'tests/arch-p2-patch-gate6.test.ts': 8,
-  'tests/arch-p3-cut3-diet.test.ts': 15,
   'tests/arch-u2-control-plane.test.ts': 26,
   'tests/audit-compute-lab-fixes.test.ts': 2,
   'tests/audit-proof-a.test.ts': 9,

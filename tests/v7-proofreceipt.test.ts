@@ -21,6 +21,8 @@ import { Execution, probeCanaryClass } from '../src/server/execution.ts'
 import {
   applyReceiptGate,
   buildReplayReceipt,
+} from '../src/server/floor-recipe-engine.ts'
+import {
   proofReceiptMode,
   retestReplaySpec,
   verifyReplaySpec,

@@ -26,7 +26,7 @@ import { floorRecipe, runFloorRecipe, wiredRecipeForSpecKind } from '../src/serv
 import type { BooleanOrTimingArgs, AccessBoundaryArgs, PersistedMutationArgs } from '../src/server/floor-recipes.ts'
 import { defaultHostMintedOracle, receiptRuleFor, verifyReceipt } from '../src/server/proof-receipt.ts'
 import type { ImpactStep, ReceiptTranscript, ReceiptTranscriptEntry } from '../src/server/proof-receipt.ts'
-import type { EngineHypothesis } from '../src/server/deterministic-specs.ts'
+import type { EngineHypothesis } from '../src/server/floor-heuristics.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from '../src/server/broker.ts'
 

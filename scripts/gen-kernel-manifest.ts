@@ -113,7 +113,6 @@ export const NON_KERNEL_INFRA_BOUNDARY_FILES: ReadonlySet<string> = new Set([
   'src/server/worker-backend.ts',
   'src/server/provider.ts',
   'src/server/replay-feedback.ts',
-  'src/server/deterministic-specs.ts',
   'src/server/floor-heuristics.ts',
   'src/server/verify-runner.ts',
   'src/server/access-policy-checks.ts',

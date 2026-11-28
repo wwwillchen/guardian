@@ -81,6 +81,9 @@
     "src/server/exec-verify.ts::IMMUTABLE_CONFIRMED_FINDING_FIELDS",
     "src/server/exec-verify.ts::runV8AgentScriptProof",
     "src/server/finding-codec.ts::PROMOTED_FINDING_COLUMNS",
+    "src/server/floor-recipe-engine.ts::assessBflaImpact",
+    "src/server/floor-recipe-engine.ts::assessHttpChainProofStrength",
+    "src/server/floor-recipe-engine.ts::receiptCheckForResult",
     "src/server/floor-recipes.ts::FLOOR_RECIPE_IDS",
     "src/server/floor-recipes.ts::LEGACY_UNWIRED_SPECKINDS",
     "src/server/floor-recipes.ts::recipeForSpecKind",
@@ -116,6 +119,7 @@
     "src/server/program-graph.ts::describeGuardDiffs",
     "src/server/program-graph.ts::expandCodeSlicePath",
     "src/server/program-graph.ts::renderCodeDataflowSliceText",
+    "src/server/proof-receipt.ts::safeRegexTest",
     "src/server/proof-tools.ts::proofToolNames",
     "src/server/provider-stream.ts::scrubExactSecretsValue",
     "src/server/provider.ts::estimateTranscriptTokens",
@@ -162,6 +166,30 @@
     "src/server/worker-backend.ts::workerProcessSessionId"
   ],
   "ticketedAdditions": [
+    {
+      "key": "src/server/floor-recipe-engine.ts::assessBflaImpact",
+      "owner": "d2-delete-jq-vm",
+      "ticket": "D2-RETAINED-DECLARATIVE-PARITY-ASSESSORS",
+      "expires": "2026-12-12"
+    },
+    {
+      "key": "src/server/floor-recipe-engine.ts::assessHttpChainProofStrength",
+      "owner": "d2-delete-jq-vm",
+      "ticket": "D2-RETAINED-DECLARATIVE-PARITY-ASSESSORS",
+      "expires": "2026-12-12"
+    },
+    {
+      "key": "src/server/floor-recipe-engine.ts::receiptCheckForResult",
+      "owner": "d2-delete-jq-vm",
+      "ticket": "D2-RETAINED-DECLARATIVE-PARITY-ASSESSORS",
+      "expires": "2026-12-12"
+    },
+    {
+      "key": "src/server/proof-receipt.ts::safeRegexTest",
+      "owner": "d2-delete-jq-vm",
+      "ticket": "D2-RETAINED-DECLARATIVE-PARITY-ASSESSORS",
+      "expires": "2026-12-12"
+    },
     {
       "key": "src/server/run-status.ts::CANONICAL_RESUMABLE_NON_TERMINAL_RUN_STATUSES",
       "owner": "r2-03-merge-gate",
