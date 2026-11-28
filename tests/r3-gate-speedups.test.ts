@@ -189,6 +189,7 @@ function createMiniGateRepo(t: { after: (fn: () => void) => void }): {
     'tests/v6-verify.test.ts',
     'tests/e2e-ui-journeys.test.ts',
     'tests/ui-bucket-b1-state-settings.test.ts',
+    'tests/ui-bucket-b3-findings-proof.test.ts',
     'tests/ui-polish-foundation.test.ts',
     'tests/ui-polish-projects.test.ts',
     'tests/ui-polish-run-workbench.test.ts',
