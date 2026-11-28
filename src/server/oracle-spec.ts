@@ -9,7 +9,11 @@
  * confirmation-kernel file (`terminal-oracle-registry.ts`, `proof-receipt.ts`,
  * `v8-oracle-hydrate.ts`, `oracle-invariants.ts`, `verify-claims.ts`) derives directly
  * from this registry without introducing import cycles or parallel regex ladders.
+ *
+ * Its only runtime import is the browser-safe canonical taxonomy (`src/vuln-taxonomy.ts`), used to
+ * enforce taxonomy closure (D1) over every registered label at registry build time.
  */
+import { lookupVulnTaxonomy } from '../vuln-taxonomy.ts'
 
 export type OracleRuleId =
   | 'impact'
@@ -1360,7 +1364,8 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
     singleHopRule: 'webhook',
     canonicalVulnClass: 'webhook_forgery',
     cwes: ['CWE-345', 'CWE-347'],
-    labels: ['webhook', 'webhook_forgery'],
+    // D1 + R3-11 N2: the bare `webhook` token is too broad to classify, so it is not a confirmation label.
+    labels: ['webhook_forgery'],
     terminalContract: 'oob',
     boundaryClass: 'other',
     descriptorImpactClass: 'other',
@@ -1548,10 +1553,130 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
   },
 ]
 
+/**
+ * D1 taxonomy closure: oracle specs whose `cwes` intentionally span several canonical taxonomy classes
+ * (one mechanism confirming e.g. SQL, NoSQL, and OS-command injection). The per-label
+ * `spec.cwes ⊆ cweFamily` rule is NOT applied to them: `bindConfirmedFindingIdentity` keeps a declared
+ * CWE whenever it is inside the receipt class family, so widening e.g. the SQLi family to every umbrella
+ * CWE would let a SQLi receipt persist as path traversal and merge distinct classes in the dedupe veto.
+ * Every CWE such a spec confirms must instead be classified by some registered label's taxonomy class.
+ * Ratcheted: an entry that no longer needs the exemption is reported as stale.
+ */
+export const MULTI_CLASS_ORACLE_SPEC_IDS: ReadonlySet<string> = new Set(['impact:injection', 'oob', 'timing', 'boolean', 'browser', 'auth_bypass'])
+
+export type OracleTaxonomyClosureViolationKind =
+  | 'unclassified_label' | 'unclassified_canonical_class' | 'cwe_outside_label_family' | 'cwe_unclassified' | 'stale_multi_class_exemption'
+
+export interface OracleTaxonomyClosureViolation {
+  readonly specId: string
+  readonly kind: OracleTaxonomyClosureViolationKind
+  readonly label: string | null
+  readonly cwes: readonly string[]
+  readonly message: string
+}
+
+/**
+ * D1 / R3-11: every registered oracle label and canonical class must resolve to a classified
+ * `src/vuln-taxonomy.ts` entry and every CWE an oracle confirms must be taxonomy-accepted, so a
+ * confirmed receipt can never drift into an `unclassified` attribution. Returns every violation.
+ */
+export function auditOracleTaxonomyClosure(
+  specs: readonly OracleSpec[],
+  multiClassSpecIds: ReadonlySet<string> = MULTI_CLASS_ORACLE_SPEC_IDS,
+): OracleTaxonomyClosureViolation[] {
+  const out: OracleTaxonomyClosureViolation[] = []
+  const flag = (specId: string, kind: OracleTaxonomyClosureViolationKind, label: string | null, cwes: readonly string[], message: string) =>
+    out.push({ specId, kind, label, cwes, message })
+  const classified = new Set(specs.flatMap(spec => spec.labels.flatMap(label => lookupVulnTaxonomy(label)?.cweFamily ?? [])))
+  for (const spec of specs) {
+    if (!lookupVulnTaxonomy(spec.canonicalVulnClass)) {
+      flag(spec.id, 'unclassified_canonical_class', spec.canonicalVulnClass, [], `Oracle spec "${spec.id}" canonicalVulnClass "${spec.canonicalVulnClass}" is not in src/vuln-taxonomy.ts.`)
+    }
+    const multiClass = multiClassSpecIds.has(spec.id)
+    let spansClasses = false
+    for (const label of spec.labels) {
+      const entry = lookupVulnTaxonomy(label)
+      if (!entry) {
+        flag(spec.id, 'unclassified_label', label, [], `Oracle spec "${spec.id}" label "${label}" is not in src/vuln-taxonomy.ts (would persist as unclassified).`)
+        continue
+      }
+      const missing = spec.cwes.filter(cwe => !entry.cweFamily.includes(cwe))
+      if (missing.length) spansClasses = true
+      if (missing.length && !multiClass) {
+        flag(spec.id, 'cwe_outside_label_family', label, missing, `Oracle spec "${spec.id}" confirms ${missing.join(', ')} outside label "${label}" taxonomy class "${entry.id}".`)
+      }
+    }
+    if (!multiClass) continue
+    const unclassified = spec.cwes.filter(cwe => !classified.has(cwe))
+    if (unclassified.length) flag(spec.id, 'cwe_unclassified', null, unclassified, `Multi-class oracle spec "${spec.id}" confirms unclassified ${unclassified.join(', ')}.`)
+    if (!spansClasses) flag(spec.id, 'stale_multi_class_exemption', null, [], `Oracle spec "${spec.id}" is class-pure; remove it from MULTI_CLASS_ORACLE_SPEC_IDS.`)
+  }
+  for (const id of multiClassSpecIds) {
+    if (!specs.some(spec => spec.id === id)) flag(id, 'stale_multi_class_exemption', null, [], `MULTI_CLASS_ORACLE_SPEC_IDS names unregistered oracle spec "${id}".`)
+  }
+  return out
+}
+
+/** E1: verified terminal of a confirmed proof (always derived from a cited host-recorded exchange). */
+export interface VerifiedProofTerminal { method: string; endpoint: string; terminalExchangeId: string }
+export type ProofPromotionBlocker = 'unclassified_attribution' | 'missing_verified_terminal'
+export type ProofPromotionDecision =
+  | { status: 'confirmed'; blockers: [] }
+  | { status: 'needs_review'; blockers: ProofPromotionBlocker[]; note: string }
+
+/**
+ * D2 + E1 confirmation gate: a verified receipt becomes a `runtime_confirmed` finding only when its
+ * class resolves in the canonical taxonomy AND (when `verifiedTerminal` applies, i.e. is not
+ * `undefined`) a verified terminal exists. Otherwise it is held at `needs_review` with a structured
+ * note; the `unclassified` attribution stays visible (R3-11) and no CWE is fabricated.
+ */
+export function evaluateProofPromotion(input: { receiptClass: string; verifiedTerminal?: VerifiedProofTerminal | null }): ProofPromotionDecision {
+  const blockers: ProofPromotionBlocker[] = []
+  const details: string[] = []
+  if (!lookupVulnTaxonomy(input.receiptClass)) {
+    blockers.push('unclassified_attribution')
+    details.push(`unclassified_attribution: receipt class "${input.receiptClass.slice(0, 64)}" has no canonical taxonomy entry, so an unclassified attribution cannot be promoted to runtime_confirmed`)
+  }
+  if (input.verifiedTerminal === null) {
+    blockers.push('missing_verified_terminal')
+    details.push('missing_verified_terminal: no cited host-recorded terminal exchange with a method and endpoint backs the receipt')
+  }
+  if (!blockers.length) return { status: 'confirmed', blockers: [] }
+  return { status: 'needs_review', blockers, note: `Confirmation gate: receipt verified but the finding is held at needs_review — ${details.join('; ')}.` }
+}
+
+/** A4: chain shape — `multi_step_chain` only for a confirmed composite with `hopCount >= 2`. */
+export interface ProofChainShape { findingKind?: 'multi_step_chain'; hopCount: number; multiStepChain: boolean }
+
+export function resolveProofChainShape(composite: { receipt: { hops: readonly unknown[] }; verification: { confirmed: boolean } } | null): ProofChainShape {
+  const hopCount = composite?.verification.confirmed ? Math.max(1, composite.receipt.hops.length) : 1
+  return hopCount >= 2 ? { findingKind: 'multi_step_chain', hopCount, multiStepChain: true } : { hopCount, multiStepChain: false }
+}
+
+/**
+ * E2: exchange IDs the confirming receipt cites, in citation order. Composites cite every hop exchange
+ * plus pre-chain controls, post-chain readbacks, and the explicit terminal; single-hop receipts cite
+ * `receipt.exchangeIds`. Uncited script traffic is never included.
+ */
+export function citedProofExchangeIds(input: {
+  compositeReceipt: { hops: readonly { exchangeIds: readonly string[] }[]; terminalImpact: { preChainControlExchangeIds: readonly string[]; postChainReadbackExchangeIds: readonly string[]; terminalExchangeId?: string } } | null
+  receipt: { exchangeIds: readonly string[] } | null
+}): string[] {
+  const ti = input.compositeReceipt?.terminalImpact
+  return [...new Set(input.compositeReceipt && ti
+    ? [...input.compositeReceipt.hops.flatMap(hop => hop.exchangeIds), ...ti.preChainControlExchangeIds, ...ti.postChainReadbackExchangeIds, ...(ti.terminalExchangeId ? [ti.terminalExchangeId] : [])]
+    : input.receipt?.exchangeIds ?? [])]
+}
+
 export const DEFAULT_ORACLE_SPEC_REGISTRY: OracleSpecRegistry = (() => {
   const reg = createOracleSpecRegistry()
   for (const spec of BUILTIN_ORACLE_SPECS) {
     registerOracle(spec, reg)
+  }
+  // D1: fail fast at module load if any built-in label/CWE would drift into `unclassified`.
+  const closureViolations = auditOracleTaxonomyClosure(reg.list())
+  if (closureViolations.length > 0) {
+    throw new Error(`Oracle taxonomy closure violated: ${closureViolations.map(v => v.message).join(' | ')}`)
   }
   return reg.seal()
 })()

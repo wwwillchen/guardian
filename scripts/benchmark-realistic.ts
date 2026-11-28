@@ -820,6 +820,8 @@ interface FalsePositiveFindingLike {
   exchangeIds?: readonly string[] | null
   verificationStatus?: string | null
   provenance?: string | null
+  /** Product-persisted evidence (`evidence.verifiedTerminal` is preferred as the route). */
+  evidence?: unknown
 }
 
 interface FalsePositiveSpecLike {
@@ -897,7 +899,10 @@ export function buildFalsePositiveEvidence(
     const findingExchanges = (finding.exchangeIds ?? [])
       .map(id => exchangeById.get(id))
       .filter((ex): ex is FalsePositiveExchangeLike => Boolean(ex))
-    const primary = steps[0] ?? (findingExchanges[0]
+    const terminal = persistedVerifiedTerminal(finding)
+    const primary = (terminal ? { stepId: 'verified-terminal', method: terminal.method, path: terminal.path.split(/[?#]/, 1)[0] ?? '/' } : null)
+      ?? steps[0]
+      ?? (findingExchanges[0]
       ? { stepId: 'exchange-1', method: findingExchanges[0].method, path: findingExchanges[0].pathAndQuery.split(/[?#]/, 1)[0] ?? '/' }
       : null)
     const statusById = new Map((diff?.stepStatuses ?? []).map(step => [step.id, step.status]))
@@ -969,6 +974,48 @@ export function withScorecardVersion<T extends Record<string, unknown>>(
 }
 
 interface ExtractedEndpoint { method?: string; path: string }
+
+/**
+ * E3: the verified terminal `{ method, endpoint }` persisted on a confirmed finding by the product
+ * (`evidence.verifiedTerminal`), or null when absent/malformed.
+ */
+export function persistedVerifiedTerminal(finding: unknown): { method: string; path: string } | null {
+  const evidence = finding && typeof finding === 'object' ? (finding as { evidence?: unknown }).evidence : undefined
+  const terminal = evidence && typeof evidence === 'object' ? (evidence as { verifiedTerminal?: unknown }).verifiedTerminal : undefined
+  if (!terminal || typeof terminal !== 'object') return null
+  const { method, endpoint } = terminal as { method?: unknown; endpoint?: unknown }
+  const path = pathOf(endpoint)
+  if (typeof method !== 'string' || !method.trim() || !path) return null
+  return { method: method.trim().toUpperCase(), path }
+}
+
+/**
+ * E3: endpoints submitted for a finding — the persisted verified terminal first, then the verifying
+ * spec's own steps. Never unions endpoints across unrelated replay specs or uncited traffic; the
+ * finding's persisted exchanges are a fallback only when neither source yields an endpoint.
+ */
+export function submittedFindingEndpoints(input: {
+  finding: Pick<Finding, 'exchangeIds'>
+  verifyingSpec: Pick<ReplaySpecLike, 'spec'> | undefined
+  exchangeById: ReadonlyMap<string, Pick<ExchangeLike, 'method' | 'pathAndQuery'>>
+}): ExtractedEndpoint[] {
+  const endpoints: ExtractedEndpoint[] = []
+  const terminal = persistedVerifiedTerminal(input.finding)
+  if (terminal) endpoints.push(terminal)
+  if (input.verifyingSpec) endpoints.push(...endpointsFromReplaySpec(input.verifyingSpec.spec))
+  if (!endpoints.length) {
+    for (const id of input.finding.exchangeIds ?? []) {
+      const ex = input.exchangeById.get(id)
+      if (ex) endpoints.push({ method: ex.method.toUpperCase(), path: ex.pathAndQuery })
+    }
+  }
+  const unique = new Map<string, ExtractedEndpoint>()
+  for (const ep of endpoints) {
+    const key = `${ep.method ?? '*'}:${ep.path}`
+    if (!unique.has(key)) unique.set(key, ep)
+  }
+  return [...unique.values()]
+}
 
 function pathOf(value: unknown): string | null {
   return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') ? value : null
@@ -1302,24 +1349,11 @@ export function translateFindings(input: TranslateInput): SubmittedFinding[] {
     const verifyingSpec = specs.find(s => s.lastVerificationDiff?.verdict === 'confirmed')
       ?? specs.find(s => s.verifiedInline)
       ?? specs[0]
-    const endpoints: ExtractedEndpoint[] = []
     const params = new Set<string>()
-    for (const spec of specs.slice(0, 3)) {
-      for (const ep of endpointsFromReplaySpec(spec.spec)) endpoints.push(ep)
-    }
     if (verifyingSpec) {
       for (const name of specMutatedParams(verifyingSpec.spec)) params.add(name)
     }
-    // Fallback: exchanges persisted with the finding (when no replay spec survived).
-    if (!endpoints.length) {
-      for (const id of finding.exchangeIds ?? []) {
-        const ex = exchangeById.get(id)
-        if (ex) endpoints.push({ method: ex.method.toUpperCase(), path: ex.pathAndQuery })
-      }
-    }
-    const unique = new Map<string, ExtractedEndpoint>()
-    for (const ep of endpoints) unique.set(`${ep.method ?? '*'}:${ep.path}`, ep)
-    const clean = [...unique.values()]
+    const clean = submittedFindingEndpoints({ finding, verifyingSpec, exchangeById })
 
     const specVulnClass = verifyingSpec
       ? vulnClassFromSpec(verifyingSpec.spec, verifyingSpec.proofReceipt)

@@ -101,6 +101,7 @@ import { canaries, findings, type ReplayProofReceiptRow } from './schema.ts'
 export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
 import { classifyCompositeChainOverlap, compositeChainOriginsEquivalent, compositeChainRichnessScore, extractCompositeChainDedupSignature, extractRowCompositeSignature, isGenericSharedAuthOrUtilityEndpoint, sortChainDuplicateRows, type CompositeChainDedupSignature } from './store-findings.ts'
 import { isAuthzPrivescClassSupersessionCompatible, isSameTerminalCompositeClassCompatible, resolveCompositeSupersessionMatch } from './composite-chain-dedup.ts'
+import { citedProofExchangeIds, evaluateProofPromotion, resolveProofChainShape, type VerifiedProofTerminal } from './oracle-spec.ts'
 export { isGenericSharedAuthOrUtilityEndpoint }
 import {
   assessmentAssignments,
@@ -204,13 +205,19 @@ export interface InlineDeferredFindingCandidate {
 }
 
 
+/** D2: needs_review note when a replay's confirmed ProofReceipt class has no canonical taxonomy entry. */
+export function replayUnclassifiedConfirmationNote(replay: Pick<ReplayVerificationResult, 'receipt'>): string | null {
+  const decision = replay.receipt?.verification.confirmed ? evaluateProofPromotion({ receiptClass: replay.receipt.receipt.vulnClass }) : null
+  return decision?.status === 'needs_review' ? decision.note : null
+}
+
 function deriveReplayOutcomeStatus(spec: DeclarativeReplaySpec, replay: ReplayVerificationResult) {
   const staticSpec = spec.kind === 'static_ast_proof' ? spec : null
   const isStaticAst = staticSpec !== null
   const rawVerdict = replay.verdict as Finding['status']
   const finalStatus: Finding['status'] = isStaticAst
     ? (rawVerdict === 'confirmed' || rawVerdict === 'static_verified' ? 'static_verified' : rawVerdict)
-    : rawVerdict
+    : rawVerdict === 'confirmed' && replayUnclassifiedConfirmationNote(replay) ? 'needs_review' : rawVerdict
   const verificationTier: VerificationTier | undefined = finalStatus === 'static_verified'
     ? 'static_verified'
     : finalStatus === 'confirmed'
@@ -225,15 +232,7 @@ function deriveReplayOutcomeStatus(spec: DeclarativeReplaySpec, replay: ReplayVe
  * Post-confirmation updates (`update_proposed_finding`, inline retries, etc.) must never mutate
  * these fields to disguise or swap the confirmed vulnerability class, origin, endpoint, or title.
  */
-export const IMMUTABLE_CONFIRMED_FINDING_FIELDS = [
-  'cwe',
-  'origin',
-  'title',
-  'category',
-  'severity',
-  'fingerprintHash',
-  'endpoint',
-] as const
+export const IMMUTABLE_CONFIRMED_FINDING_FIELDS = ['cwe', 'origin', 'title', 'category', 'severity', 'fingerprintHash', 'endpoint'] as const
 
 export function extractSpecEndpointAndMethod(
   spec: DeclarativeReplaySpec,
@@ -313,36 +312,13 @@ export function isCweConsistentWithReceiptClass(
 }
 
 const SEVERITY_BY_EXTRA_CLASS: Readonly<Record<string, Finding['severity']>> = {
-  command_injection: 'critical',
-  cmdi: 'critical',
-  rce: 'critical',
-  race: 'critical',
-  race_condition: 'critical',
-  double_spend: 'critical',
-  auth_bypass: 'high',
-  jwt: 'high',
-  jwt_forgery: 'high',
-  token_forgery: 'high',
-  path_traversal: 'high',
-  directory_traversal: 'high',
-  lfi: 'high',
-  ssti: 'high',
-  template_injection: 'high',
-  nosqli: 'high',
-  nosql_injection: 'high',
-  redirect: 'medium',
+  command_injection: 'critical', cmdi: 'critical', rce: 'critical', race: 'critical', race_condition: 'critical', double_spend: 'critical',
+  auth_bypass: 'high', jwt: 'high', jwt_forgery: 'high', token_forgery: 'high', path_traversal: 'high', directory_traversal: 'high',
+  lfi: 'high', ssti: 'high', template_injection: 'high', nosqli: 'high', nosql_injection: 'high', redirect: 'medium',
 }
 
 const SEVERITY_BY_EXTRA_CWE: Readonly<Record<number, Finding['severity']>> = {
-  77: 'critical',
-  78: 'critical',
-  362: 'critical',
-  367: 'critical',
-  22: 'high',
-  23: 'high',
-  73: 'high',
-  94: 'high',
-  1336: 'high',
+  77: 'critical', 78: 'critical', 362: 'critical', 367: 'critical', 22: 'high', 23: 'high', 73: 'high', 94: 'high', 1336: 'high',
 }
 
 function lookupSeverityBand(rawKey: string | null | undefined): Finding['severity'] | null {
@@ -574,6 +550,7 @@ export function buildReplayFindingPatch(
       ...(bound.fingerprintHash !== undefined ? { fingerprintHash: bound.fingerprintHash } : {}),
     } : {}),
     ...(staticSpec ? { runtimeProofGap: staticSpec.runtimeProofGap } : {}),
+    ...(finalStatus === 'needs_review' && replayUnclassifiedConfirmationNote(replay) ? { runtimeProofGap: replayUnclassifiedConfirmationNote(replay) } : {}),
     ...(staticCodeLocations?.length ? { codeLocations: staticCodeLocations } : {}),
   }
   return { patch, cleanObserved }
@@ -583,31 +560,15 @@ export function buildReplayFindingPatch(
 const LEADING_HTTP_METHOD_RE = /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|TRACE)\s+(.+)$/i
 
 const CWE_ALIAS_GROUP_BY_CWE: Readonly<Record<string, string>> = {
-  'CWE-362': 'conservation_race',
-  'CWE-367': 'conservation_race',
-  'CWE-840': 'conservation_race',
-  'CWE-639': 'authorization',
-  'CWE-285': 'authorization',
-  'CWE-862': 'authorization',
-  'CWE-863': 'authorization',
-  'CWE-284': 'authorization',
-  'CWE-347': 'auth_crypto',
-  'CWE-287': 'auth_crypto',
-  'CWE-345': 'auth_crypto',
-  'CWE-613': 'session_revocation',
-  'CWE-384': 'session_revocation',
-  'CWE-444': 'parser_cache',
-  'CWE-436': 'parser_cache',
-  'CWE-918': 'cross_surface_ssrf',
+  'CWE-362': 'conservation_race', 'CWE-367': 'conservation_race', 'CWE-840': 'conservation_race',
+  'CWE-639': 'authorization', 'CWE-285': 'authorization', 'CWE-862': 'authorization', 'CWE-863': 'authorization', 'CWE-284': 'authorization',
+  'CWE-347': 'auth_crypto', 'CWE-287': 'auth_crypto', 'CWE-345': 'auth_crypto', 'CWE-613': 'session_revocation', 'CWE-384': 'session_revocation',
+  'CWE-444': 'parser_cache', 'CWE-436': 'parser_cache', 'CWE-918': 'cross_surface_ssrf',
 }
 
 const ORACLE_FAMILY_ALIAS_GROUP: Readonly<Record<string, string>> = {
-  economic_conservation: 'conservation_race',
-  dual_tenant_abac: 'authorization',
-  cryptographic_scope_replay: 'auth_crypto',
-  temporal_revocation: 'session_revocation',
-  parser_cache_differential: 'parser_cache',
-  cross_surface_pivot: 'cross_surface_ssrf',
+  economic_conservation: 'conservation_race', dual_tenant_abac: 'authorization', cryptographic_scope_replay: 'auth_crypto',
+  temporal_revocation: 'session_revocation', parser_cache_differential: 'parser_cache', cross_surface_pivot: 'cross_surface_ssrf',
 }
 
 const FINDING_STATUS_PRIORITY: Readonly<Record<Finding['status'], number>> = {
@@ -814,11 +775,7 @@ export function extractAgentProofTarget(input: {
   const terminalExchange = input.cleanCompositeBundle
     ? resolveCompositeTerminalExchange(input.cleanCompositeBundle.receipt, exchangeById)
     : undefined
-  const receiptExchange = (() => {
-    const ids = input.receipt?.exchangeIds ?? []
-    const matched = ids.map(id => exchangeById.get(id)).filter((ex): ex is HostRecordedExchangeView => Boolean(ex))
-    return matched.find(ex => ex.sessionRole === 'probe') ?? matched[0]
-  })()
+  const receiptExchange = selectCitedReceiptExchange(input.receipt, exchangeById)
   const baseSpecStep = input.baseSpec.kind === 'http_chain'
     ? (input.baseSpec.steps.find(step => step.role === 'probe') ?? input.baseSpec.steps[0])
     : undefined
@@ -887,6 +844,42 @@ export function extractAgentProofTarget(input: {
     : null
 
   return { origin, endpoint, normalizedEndpoint, method, terminalOracleFamily }
+}
+
+/** Single-hop receipt's cited host exchange naming the proven target (first cited probe, else first cited). */
+export function selectCitedReceiptExchange(receipt: Pick<ProofReceipt, 'exchangeIds'> | null, exchangeById: ReadonlyMap<string, HostRecordedExchangeView>, requireOrigin = false): HostRecordedExchangeView | undefined {
+  const matched = (receipt?.exchangeIds ?? []).map(id => exchangeById.get(id)).filter((ex): ex is HostRecordedExchangeView => Boolean(ex && (!requireOrigin || ex.origin)))
+  return matched.find(ex => ex.sessionRole === 'probe') ?? matched[0]
+}
+
+/**
+ * E1: verified terminal `{ method, endpoint, terminalExchangeId }` from the canonical host-signed
+ * composite terminal or the cited single-hop exchange — never worker-declared targets or uncited
+ * traffic. Null when no cited host-recorded exchange carries both a method and an endpoint.
+ */
+export function resolveVerifiedProofTerminal(input: { compositeReceipt: CompositeProofReceipt | null; receipt: Pick<ProofReceipt, 'exchangeIds'> | null; exchangeById: ReadonlyMap<string, HostRecordedExchangeView> }): VerifiedProofTerminal | null {
+  const ex = input.compositeReceipt ? resolveCompositeTerminalExchange(input.compositeReceipt, input.exchangeById) : selectCitedReceiptExchange(input.receipt, input.exchangeById)
+  const method = normalizeMethodToken(ex?.method), endpoint = ex?.pathAndQuery.trim()
+  return ex && method && endpoint ? { method, endpoint: endpoint.startsWith('/') ? endpoint : `/${endpoint}`, terminalExchangeId: ex.exchangeId } : null
+}
+
+/** D2 + E1 + A4 persistence gate shared by first persistence and re-verification of script proofs. */
+export function resolveAgentProofPersistenceGate(composite: V8CompositeProofBundle | null, receipt: ProofReceipt | null, receiptClass: string, exchangeById: ReadonlyMap<string, HostRecordedExchangeView>) {
+  const verifiedTerminal = resolveVerifiedProofTerminal({ compositeReceipt: composite?.receipt ?? null, receipt, exchangeById })
+  const promotion = evaluateProofPromotion({ receiptClass, verifiedTerminal })
+  const note = promotion.status === 'needs_review' ? promotion.note : null
+  const promoted = promotion.status === 'confirmed'
+  return { verifiedTerminal, chainShape: resolveProofChainShape(composite), promotion, promoted, note }
+}
+
+/** Persisted finding `evidence`: composite bundle (when present) + redacted verified terminal, hop count, and gate blockers. */
+function agentProofFindingEvidence(composite: V8CompositeProofBundle | null, gate: ReturnType<typeof resolveAgentProofPersistenceGate>, secrets: readonly NamedSecret[]): Record<string, unknown> {
+  const v = composite?.verification
+  return {
+    ...(composite ? { compositeReceipt: composite.receipt, compositeVerification: v, hopActors: composite.hopActors, ...(v?.terminalOracleFamily ? { terminalOracleFamily: v.terminalOracleFamily } : {}), ...(v?.terminalEndpoint ? { terminalEndpoint: v.terminalEndpoint } : {}) } : {}),
+    ...(gate.verifiedTerminal ? { verifiedTerminal: redactJsonValue(gate.verifiedTerminal, secrets) } : {}), hopCount: gate.chainShape.hopCount, multiStepChain: gate.chainShape.multiStepChain,
+    ...(gate.promotion.status === 'needs_review' ? { confirmationGate: { blockers: gate.promotion.blockers } } : {}),
+  }
 }
 
 function extractExistingFindingTargetMeta(
@@ -2531,7 +2524,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     title?: string
     proof: AgentScriptProofResult | V8AgentScriptProofResult
     secrets: readonly NamedSecret[]
-  }): { findingId: string; replaySpecId: string; receiptId: string | null } {
+  }): { findingId: string; replaySpecId: string; receiptId: string | null; findingStatus: 'confirmed' | 'needs_review' } {
     if (input.runtime !== 'ts') {
       throw new Error(`Unsupported kovo_verify runtime: ${String(input.runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
     }
@@ -2572,11 +2565,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       origin = originCheck.origin
       compositeTerminalExchange = originCheck.terminalExchange
     } else {
-      const receiptExchange = (() => {
-        const ids = receipt?.exchangeIds ?? []
-        const matched = ids.map(id => hostExchangeById.get(id)).filter((ex): ex is HostRecordedExchangeView => Boolean(ex && ex.origin))
-        return matched.find(ex => ex.sessionRole === 'probe') ?? matched[0]
-      })()
+      const receiptExchange = selectCitedReceiptExchange(receipt, hostExchangeById, true)
       if (receiptExchange?.origin && receipt?.target.origin && normalizeOrigin(receipt.target.origin) !== normalizeOrigin(receiptExchange.origin)) {
         throw new InvariantError(
           'invariant.confirmation_evidence',
@@ -2630,12 +2619,15 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     )
 
     const compositeExchangeIds = cleanCompositeBundle
-      ? [...new Set([
-          ...cleanCompositeBundle.receipt.hops.flatMap(h => h.exchangeIds),
-          ...cleanCompositeBundle.receipt.terminalImpact.preChainControlExchangeIds,
-          ...cleanCompositeBundle.receipt.terminalImpact.postChainReadbackExchangeIds,
-        ])]
+      ? citedProofExchangeIds({ compositeReceipt: cleanCompositeBundle.receipt, receipt: null })
       : []
+    // D2 + E1 + A4: verified terminal, chain shape, and the runtime_confirmed promotion gate.
+    const gate = resolveAgentProofPersistenceGate(
+      cleanCompositeBundle,
+      receipt,
+      claim,
+      hostExchangeById,
+    )
     const envelope: AgentScriptProofEnvelope = {
       kind: 'agent_script',
       runtime: input.runtime,
@@ -2649,8 +2641,8 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       confirmedAt: Date.now(),
     }
     const feedback: InlineVerifyFeedback = {
-      verdict: 'confirmed',
-      verificationTier: 'runtime_confirmed',
+      verdict: gate.promoted ? 'confirmed' : 'needs_review',
+      ...(gate.promoted ? { verificationTier: 'runtime_confirmed' as const } : {}),
       controlPassed: proof.verdict.attempts.every(attempt => attempt.oraclePassed),
       assertionSummary: {
         observed: cleanCompositeBundle
@@ -2659,7 +2651,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         expected: cleanCompositeBundle
           ? 'every hop, causal edge binding, and attacker-origin provenance verifies over host-signed transcripts'
           : verification?.expected ?? 'the claimed impact is re-derivable from the recorded transcript',
-        ...(cleanCompositeBundle?.verification.reason
+        ...(gate.note ? { reason: gate.note } : cleanCompositeBundle?.verification.reason
           ? { reason: cleanCompositeBundle.verification.reason }
           : verification?.reason
             ? { reason: verification.reason }
@@ -2676,6 +2668,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       envelope,
       proof,
       receipt,
+      compositeReceipt: cleanCompositeBundle?.receipt ?? null,
     })
     const proofTarget = extractAgentProofTarget({
       cleanCompositeBundle,
@@ -2787,7 +2780,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           id: findingId,
           origin,
           title: cleanTitle,
-          status: 'confirmed',
+          status: gate.promotion.status,
           severity,
           reason: cleanCompositeBundle?.verification.reason ?? verification?.reason ?? proof.verdict.detail ?? 'Confirmed by a Layer-3 verification script.',
           remediation: attribution.remediation,
@@ -2801,21 +2794,18 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
             : receipt
               ? `ProofReceipt ${receipt.exchangeIds[0] ?? scriptSha256.slice(0, 12)} · ${verification?.rule ?? 'receipt'} rule · ${verification?.reason ?? 'verified'}`
               : `Layer-3 script proof (${input.runtime}) · ${proof.verdict.attempts.length} signed runs · digest ${proof.transcriptDigests[0]?.slice(0, 12) ?? 'n/a'}`,
-          verificationTier: 'runtime_confirmed',
-          findingKind: 'multi_step_chain',
+          ...(gate.promoted ? { verificationTier: 'runtime_confirmed' as const } : { runtimeProofGap: gate.note }),
+          ...(gate.chainShape.findingKind ? { findingKind: gate.chainShape.findingKind } : {}),
           ...(effectiveFingerprintHash ? { fingerprintHash: effectiveFingerprintHash } : {}),
           replaySpecId: canonicalSpecId,
           exchangeIds: existingDup ? [...new Set([...(existingDup.finding.exchangeIds ?? []), ...incomingExchangeIds])] : incomingExchangeIds,
           evidenceIds: existingDup ? [...new Set([...existingDup.finding.evidenceIds, artifact.id])] : [artifact.id],
-          ...(cleanCompositeBundle ? {
-            evidence: {
-              compositeReceipt: cleanCompositeBundle.receipt,
-              compositeVerification: cleanCompositeBundle.verification,
-              hopActors: cleanCompositeBundle.hopActors,
-              ...(cleanCompositeBundle.verification.terminalOracleFamily ? { terminalOracleFamily: cleanCompositeBundle.verification.terminalOracleFamily } : {}),
-              ...(cleanCompositeBundle.verification.terminalEndpoint ? { terminalEndpoint: cleanCompositeBundle.verification.terminalEndpoint } : {}),
-            },
-          } : {}),
+          // E1 / A4: persisted verified terminal, hop count, chain shape, and any gate blockers.
+          evidence: agentProofFindingEvidence(
+            cleanCompositeBundle,
+            gate,
+            allSecrets,
+          ),
           scopeRevision: run.scopeRevision,
         }
     const upsertAssetId = existingDup?.assetId ?? asset.id
@@ -2823,7 +2813,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       ? [...new Set([...existingDup.sourceOrigins, origin])]
       : [origin]
     const savedFinding = this.storage.upsertChainFinding(run, upsertAssetId, finding, canonicalSpecId, upsertOrigins)
-    if (cleanCompositeBundle) {
+    if (cleanCompositeBundle && gate.promoted) {
       this.supersedeUpstreamCompositeFindings(
         run,
         savedFinding.id,
@@ -2832,9 +2822,11 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         cleanCompositeBundle.verification,
       )
     }
-    recordReportedFindingCoverage(this.storage, run, assignment.id, origin, attribution.category, `Confirmed via agent script proof: ${cleanTitle}`, findingId, (r, o) => this.host.permitted(r, o))
-    this.storage.event(run.id, 'agent.script_proof_confirmed', `Agent script proof confirmed a ${attribution.label} finding on ${origin}.`, {
+    recordReportedFindingCoverage(this.storage, run, assignment.id, origin, attribution.category, `${gate.promoted ? 'Confirmed' : 'Held at needs_review'} via agent script proof: ${cleanTitle}`, findingId, (r, o) => this.host.permitted(r, o))
+    this.storage.event(run.id, 'agent.script_proof_confirmed', gate.promoted ? `Agent script proof confirmed a ${attribution.label} finding on ${origin}.` : `Agent script proof receipt verified on ${origin}, but the ${attribution.label} finding is held at needs_review (${gate.promotion.blockers.join(', ')}).`, {
       findingId,
+      findingStatus: gate.promotion.status,
+      ...(gate.promotion.status === 'needs_review' ? { promotionBlockers: gate.promotion.blockers } : {}),
       replaySpecId: canonicalSpecId,
       artifactId: artifact.id,
       scriptSha256,
@@ -2854,6 +2846,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       findingId,
       replaySpecId: canonicalSpecId,
       receiptId: cleanCompositeBundle?.receipt.chainId ?? receipt?.exchangeIds[0] ?? null,
+      findingStatus: gate.promotion.status,
     }
   }
 
@@ -3057,12 +3050,19 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     envelope: AgentScriptProofEnvelope
     proof: AgentScriptProofResult
     receipt: import('./proof-receipt.ts').ProofReceipt | null
+    /** Confirmed composite receipt: when present its hop/terminal citations define the cited set. */
+    compositeReceipt?: CompositeProofReceipt | null
   }): DeclarativeReplaySpec {
-    const cited = input.receipt?.exchangeIds ?? []
-    const ordered = [
-      ...input.proof.exchanges.filter(exchange => cited.includes(exchange.exchangeId)),
-      ...input.proof.exchanges.filter(exchange => !cited.includes(exchange.exchangeId)),
-    ].slice(0, 8)
+    // E2: steps cite ONLY receipt-cited exchanges (never uncited script traffic), keeping the verified terminal in the cap.
+    const compositeReceipt = input.compositeReceipt ?? null
+    const citedIds = new Set(citedProofExchangeIds({ compositeReceipt, receipt: input.receipt }))
+    const cited = input.proof.exchanges.filter(exchange => citedIds.has(exchange.exchangeId))
+    const terminalId = resolveVerifiedProofTerminal({ compositeReceipt, receipt: input.receipt, exchangeById: buildHostRecordedExchangeIndex(input.proof) })?.terminalExchangeId
+    const late = cited.findIndex(exchange => exchange.exchangeId === terminalId) >= 8 ? cited.find(exchange => exchange.exchangeId === terminalId) : undefined
+    // A receipt citing no recorded exchange falls back to its own scoped target; the promotion gate holds it at needs_review.
+    const target = input.receipt?.target
+    const ordered = cited.length ? [...cited.filter(exchange => exchange !== late).slice(0, late ? 7 : 8), ...(late ? [late] : [])]
+      : target ? [{ exchangeId: 'receipt-target', origin: target.origin, method: target.method ?? 'GET', pathAndQuery: target.pathAndQuery ?? '/', status: null, personaHandle: null }] : []
     const steps = (ordered.length >= 2 ? ordered : [...ordered, ...ordered]).slice(0, 8).map((exchange, index) => ({
       id: `proof_${index + 1}`,
       role: index === 0 ? 'control' as const : 'probe' as const,
@@ -3285,29 +3285,30 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       && !isCweConsistentWithReceiptClass(findingRow.finding.cwe, provenVulnClass)
       ? `Re-verification receipt class "${provenVulnClass}" (${cweFamilyForReceiptClass(provenVulnClass).cwe}) drifted from confirmed finding CWE ${normalizeCwe(findingRow.finding.cwe)}.`
       : null
-    const identityDriftReason = originDriftReason ?? classDriftReason
-    const confirmed = rawConfirmed && !identityDriftReason
-    const status: Finding['status'] = confirmed
-      ? 'confirmed'
-      : identityDriftReason
-        ? 'inconclusive'
-        : result.verdict.reason === 'oracle_failed' || isFixedEligibleFailureReason(result.verdict.reason)
-          ? 'dismissed'
-          : 'inconclusive'
+    // D2 + E1: same promotion gate as first persistence, so re-verification never (re-)promotes an unclassified or terminal-less proof.
+    const reverifyGate = rawConfirmed ? resolveAgentProofPersistenceGate(result.compositeReceipt?.verification.confirmed ? result.compositeReceipt : null, result.receipt?.receipt ?? null, provenVulnClass ?? 'disclosure', reverifyExchangeById) : null
+    const gateReason = reverifyGate?.note ?? null
+    const identityDriftReason = gateReason ? null : (originDriftReason ?? classDriftReason)
+    const heldReason = gateReason ?? identityDriftReason
+    const confirmed = rawConfirmed && !heldReason
+    const status: Finding['status'] = confirmed ? 'confirmed'
+      : gateReason ? 'needs_review'
+        : identityDriftReason ? 'inconclusive'
+          : result.verdict.reason === 'oracle_failed' || isFixedEligibleFailureReason(result.verdict.reason) ? 'dismissed' : 'inconclusive'
     const verificationTier: VerificationTier | undefined = confirmed ? 'runtime_confirmed' : undefined
     const feedback: InlineVerifyFeedback = {
-      verdict: status === 'confirmed' ? 'confirmed' : status === 'dismissed' ? 'dismissed' : 'inconclusive',
+      verdict: status === 'confirmed' || status === 'needs_review' || status === 'dismissed' ? status : 'inconclusive',
       ...(verificationTier ? { verificationTier } : {}),
       controlPassed: !identityDriftReason && result.verdict.attempts.every(attempt => attempt.oraclePassed),
       assertionSummary: {
         observed: confirmed
           ? `Agent script ${envelope.runtime} proof reproduced and its receipt re-validated.`
-          : identityDriftReason
-            ? identityDriftReason
+          : heldReason
+            ? heldReason
             : `Agent script proof did not re-confirm: ${result.verdict.reason}.`,
         expected: 'the persisted script reproduces the confirmation and its receipt re-validates',
-        ...(identityDriftReason
-          ? { reason: identityDriftReason }
+        ...(heldReason
+          ? { reason: heldReason }
           : result.verdict.detail
             ? { reason: result.verdict.detail }
             : {}),
@@ -3357,26 +3358,25 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         verificationTier,
         reason: preservedReason
           ?? cleanReverifyComposite?.verification.reason
-          ?? identityDriftReason
+          ?? heldReason
           ?? (result.verdict.detail || result.verdict.reason),
         confidence: confirmed ? 'high' : 'low',
         verification: confirmed
           ? cleanReverifyComposite
             ? `ProofReceipt (Composite) ${cleanReverifyComposite.receipt.chainId} · ${cleanReverifyComposite.verification.hopCount} hops · ${cleanReverifyComposite.receipt.replayMode} · ${cleanReverifyComposite.verification.reason}`
             : `ProofReceipt · ${result.receipt?.verification.rule ?? 'script'} rule · ${result.receipt?.verification.reason ?? result.verdict.reason}`
-          : identityDriftReason
-            ? `Agent script proof re-verification returned inconclusive (${identityDriftReason}).`
+          : heldReason
+            ? `Agent script proof re-verification returned ${status} (${heldReason}).`
             : `Agent script proof re-verification returned ${status} (${result.verdict.reason}).`,
         exchangeIds: result.exchanges.map(exchange => exchange.exchangeId),
         replaySpecId: updatedSpec.id,
-        ...(cleanReverifyComposite ? {
-          evidence: {
-            compositeReceipt: cleanReverifyComposite.receipt,
-            compositeVerification: cleanReverifyComposite.verification,
-            hopActors: cleanReverifyComposite.hopActors,
-            ...(cleanReverifyComposite.verification.terminalOracleFamily ? { terminalOracleFamily: cleanReverifyComposite.verification.terminalOracleFamily } : {}),
-            ...(cleanReverifyComposite.verification.terminalEndpoint ? { terminalEndpoint: cleanReverifyComposite.verification.terminalEndpoint } : {}),
-          },
+        // E1 / A4: refreshed verified terminal + hop count; composite bundle when re-confirmed as a composite.
+        ...(confirmed && reverifyGate ? {
+          evidence: agentProofFindingEvidence(
+            cleanReverifyComposite,
+            reverifyGate,
+            reverifySecrets,
+          ),
         } : {}),
         scopeRevision: run.scopeRevision,
       }
@@ -3402,7 +3402,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
             reason: nextFinding.reason,
             confidence: 'low',
             verification: nextFinding.verification,
-            exchangeIds: nextFinding.exchangeIds,
+            exchangeIds: nextFinding.exchangeIds, ...(gateReason ? { runtimeProofGap: gateReason } : {}),
           },
         })
       }

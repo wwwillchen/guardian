@@ -84,6 +84,7 @@ import {
   isInertAgenticRun,
   linkSnapshotModelCredentials,
   openCellStore,
+  persistedVerifiedTerminal,
   prepareIsolatedDataDir,
   resolveObservedEffectiveConfigForRunner,
   shouldIsolateDataDir,
@@ -2869,7 +2870,9 @@ function sanitizeRouteSummary(
   submittedMatch: SubmittedFinding | undefined,
   secrets: readonly NamedSecret[],
 ): string | null {
-  const ep = submittedMatch?.endpoints?.[0]
+  // E3: the product-persisted verified terminal is the finding's route; submitted endpoints and
+  // legacy route/endpoint fields are fallbacks only.
+  const ep = persistedVerifiedTerminal(finding) ?? submittedMatch?.endpoints?.[0]
   if (ep?.path) {
     const cleanPath = ep.path.split('?')[0]!.split('#')[0]!
     const method = ep.method ? `${ep.method.toUpperCase()} ` : ''
