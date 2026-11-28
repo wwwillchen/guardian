@@ -198,7 +198,9 @@ describe('R2-H-2: Provider pool per-candidate API key isolation', () => {
       })
     }
 
-    const { models, model } = providerPool([profileA, profileB], 'coordinator', { fetch: stubFetch })
+    // E2-A: equal-priority profiles balance across sessions (pool instances), never mid-session, so
+    // exercise both endpoints with two consecutive sessions of two turns each.
+    const sessions = [0, 1].map(() => providerPool([profileA, profileB], 'coordinator', { fetch: stubFetch }))
     const transcript = {
       systemPrompt: 'Say hi.',
       messages: [{ role: 'user' as const, content: 'ping', timestamp: Date.now() }],
@@ -206,6 +208,7 @@ describe('R2-H-2: Provider pool per-candidate API key isolation', () => {
     }
 
     for (let i = 0; i < 4; i++) {
+      const { models, model } = sessions[i % 2]!
       const s = models.stream(model, transcript)
       for await (const _ev of s) { /* drain */ }
       const res = await s.result()
