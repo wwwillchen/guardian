@@ -127,23 +127,40 @@ export interface AttackerProvenanceResult {
 export interface CompactCheckpointHop {
   hop: number; receiptId: string; capId: string; kind: CapabilityKind; surface: CapabilitySurface
   service: string; tenant: string; actor: string; role?: string; at?: string; binding?: CausalEdgeBindingKind
+  /** Set on ancestor hops that sit on a side branch, not on the primary root-to-terminal spine. */
+  offSpine?: true
 }
 export interface HopCheckpointNextGoal {
   targetSurfaceKey: string; surface: CapabilitySurface; service: string; endpoint: string; method?: string
   hypothesisClass: string; expectedBinding?: CausalEdgeBindingKind; targetTenant?: string; targetRole?: string; goal: string
 }
 export interface HopWorkflowNotebook { discoveredRoutes?: string[]; verifiedHypotheses?: string[]; triedRecipes?: string[]; openHypotheses?: string[] }
+/**
+ * Proof-carrying handoff draft: the last near-miss verification attempt, sanitized so a rotated
+ * worker can repair the proof instead of restarting. Never carries raw credentials.
+ */
+export interface HopProofDraft {
+  /** Oracle / verifier stage (and optional failed sub-stage) that rejected the last attempt. */
+  rejectedBy?: string
+  /** Unmet oracle requirements reported by the verifier. */
+  missingEvidence?: string[]
+  /** Ordered root-to-terminal hop spine (`METHOD /path`) exercised by the last attempt. */
+  orderedHops?: string[]
+  /** Redacted structural outline of the last attempted verification script. */
+  scriptSkeleton?: string
+}
 export interface HopCheckpointBrief {
   schema: 'v8.hop_checkpoint.v1'; branchKey: string; depth: number; targetHop: number
   mode: 'pivot' | 'fuse' | 'discover' | 'sweep'; evi: number
   verifiedHops: CompactCheckpointHop[]; omittedEarlierHops?: number
   capabilityHandles: string[]; fuseWithBranchKey?: string; nextGoal: HopCheckpointNextGoal
   prunedBranches?: Array<{ surface: string; hypothesis: string; reason: NegativeEdgeReason }>
-  workflowNotebook?: HopWorkflowNotebook; truncated?: boolean; doNotRediscover: true
+  workflowNotebook?: HopWorkflowNotebook; proofDraft?: HopProofDraft; truncated?: boolean; doNotRediscover: true
 }
 export interface HopCheckpointBriefOptions {
   branchKey?: string; evi?: number; mode?: 'pivot' | 'fuse' | 'discover' | 'sweep'
   fuseWithBranchKey?: string; nextGoal?: Partial<HopCheckpointNextGoal>; workflowNotebook?: HopWorkflowNotebook
+  proofDraft?: HopProofDraft
 }
 
 const OPAQUE_BRIEF_HANDLE_RE = /^(?:cap|state|ref|hop|handle|secret|artifact|id):[A-Za-z0-9:._/-]{1,96}$/
@@ -189,49 +206,191 @@ export function sanitizeWorkflowNotebook(nb?: HopWorkflowNotebook): HopWorkflowN
   return { ...(discoveredRoutes.length ? { discoveredRoutes } : {}), ...(verifiedHypotheses.length ? { verifiedHypotheses } : {}), ...(triedRecipes.length ? { triedRecipes } : {}), ...(openHypotheses.length ? { openHypotheses } : {}) }
 }
 
-/** Strictly bound a canonical `v8.hop_checkpoint.v1` brief to `<= maxBytes` UTF-8 (default 2 KB). */
+const SKELETON_STRUCTURAL_LINE_RE = /(?:\bawait\b|\bctx\.|\breturn\b|\bprove|\bexpect\b|\bassert\b)/
+const SKELETON_LONG_LITERAL_RE = /(["'`])(?:\\.|(?!\1)[^\\]){48,}\1/g
+
+/**
+ * Redacted structural outline of a verification script: only structural lines (awaits, `ctx.*`
+ * calls, returns, assertions), long literals collapsed, every line secret-scrubbed, bounded.
+ */
+export function redactProofScriptSkeleton(script: string, maxLen = 560): string {
+  const lines: string[] = []
+  for (const raw of String(script ?? '').split(/\r?\n/)) {
+    const line = raw.trim().replace(/\s+/g, ' ')
+    if (!line || line.startsWith('//') || line.startsWith('/*') || line.startsWith('*')) continue
+    if (!SKELETON_STRUCTURAL_LINE_RE.test(line)) continue
+    const scrubbed = scrubNotebookItem(line.replace(SKELETON_LONG_LITERAL_RE, '$1…$1'), 100)
+    if (scrubbed && lines.at(-1) !== scrubbed) lines.push(scrubbed)
+    if (lines.length >= 14) break
+  }
+  let out = lines.join('\n')
+  while (out.length > maxLen && lines.length > 1) { lines.pop(); out = lines.join('\n') }
+  return truncateBriefText(out, maxLen)
+}
+
+/** Sanitize + bound a `HopProofDraft`; returns `undefined` when nothing actionable remains. */
+export function sanitizeProofDraft(draft?: HopProofDraft | null): HopProofDraft | undefined {
+  if (!draft || typeof draft !== 'object') return undefined
+  const list = (items: unknown, maxItems: number, maxLen: number): string[] => Array.isArray(items)
+    ? [...new Set(items.map(v => scrubNotebookItem(String(v ?? ''), maxLen)).filter(Boolean))].slice(0, maxItems) : []
+  const rejectedBy = typeof draft.rejectedBy === 'string' ? scrubNotebookItem(draft.rejectedBy, 120) : ''
+  const missingEvidence = list(draft.missingEvidence, 6, 110)
+  const orderedHops = Array.isArray(draft.orderedHops) ? draft.orderedHops.map(v => scrubNotebookItem(String(v ?? ''), 88)).filter(Boolean).slice(0, 8) : []
+  const scriptSkeleton = typeof draft.scriptSkeleton === 'string' ? draft.scriptSkeleton.split('\n').map(l => scrubNotebookItem(l, 100)).filter(Boolean).join('\n').slice(0, 560) : ''
+  if (!rejectedBy && !missingEvidence.length && !orderedHops.length && !scriptSkeleton) return undefined
+  return { ...(rejectedBy ? { rejectedBy } : {}), ...(missingEvidence.length ? { missingEvidence } : {}), ...(orderedHops.length ? { orderedHops } : {}), ...(scriptSkeleton ? { scriptSkeleton } : {}) }
+}
+
+/** A draft is an active near-miss repair handoff when it names a rejection AND a hop path/script to repair. */
+export const isActiveProofDraft = (draft?: HopProofDraft | null): boolean =>
+  Boolean(draft && (draft.rejectedBy || draft.missingEvidence?.length) && (draft.orderedHops?.length || draft.scriptSkeleton))
+
+export interface NearMissProofInput {
+  script?: string; rejectedBy?: string | null; failedStage?: string | null; reason?: string | null
+  missingEvidence?: readonly string[]
+  transcript?: ReadonlyArray<{ seq?: number; method?: string | null; pathAndQuery?: string | null; status?: number | null }>
+}
+
+/** Build a sanitized near-miss `HopProofDraft` from a rejected verification attempt. */
+export function buildNearMissProofDraft(input: NearMissProofInput): HopProofDraft | undefined {
+  const rejectedBy = [input.rejectedBy, input.failedStage].map(v => (typeof v === 'string' ? v.trim() : '')).filter(Boolean).join(':')
+  const missingEvidence = [...(input.missingEvidence ?? []), ...(input.reason ? [input.reason] : [])]
+  const orderedHops: string[] = []
+  for (const ex of [...(input.transcript ?? [])].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
+    const status = typeof ex.status === 'number' ? ex.status : 0
+    const path = typeof ex.pathAndQuery === 'string' ? ex.pathAndQuery.split('?')[0] || '/' : ''
+    if (!ex.method || !path || status < 200 || status >= 400) continue
+    const label = `${ex.method.toUpperCase()} ${path}`
+    if (orderedHops.at(-1) !== label) orderedHops.push(label)
+  }
+  return sanitizeProofDraft({
+    ...(rejectedBy ? { rejectedBy } : {}), missingEvidence, orderedHops,
+    ...(input.script ? { scriptSkeleton: redactProofScriptSkeleton(input.script) } : {}),
+  })
+}
+
+type BriefTrimStage = (brief: HopCheckpointBrief) => boolean
+const NOTEBOOK_TRIM_ORDER: ReadonlyArray<keyof HopWorkflowNotebook> = ['triedRecipes', 'discoveredRoutes', 'openHypotheses', 'verifiedHypotheses']
+const noteOmittedHop = (brief: HopCheckpointBrief, idx: number): boolean => {
+  brief.verifiedHops.splice(idx, 1); brief.omittedEarlierHops = (brief.omittedEarlierHops ?? 0) + 1; return true
+}
+const dropMiddle = (items: unknown[] | undefined): boolean => Boolean(items && items.length > 2 && items.splice(Math.floor(items.length / 2), 1))
+
+/**
+ * Ordered byte-budget trim stages. Secondary chatter (pruned branches, notebook, verbose draft
+ * snippets) goes first; off-spine / redundant hops next; the contiguous root-to-terminal spine is
+ * only thinned from the middle as a last resort, so the root hop and terminal hop always survive.
+ */
+const BRIEF_TRIM_STAGES: readonly BriefTrimStage[] = [
+  b => { if (!b.prunedBranches?.length) return false; b.prunedBranches.pop(); if (!b.prunedBranches.length) delete b.prunedBranches; return true },
+  b => {
+    const nb = b.workflowNotebook, k = nb && NOTEBOOK_TRIM_ORDER.find(key => nb[key]?.length)
+    if (!nb || !k) { delete b.workflowNotebook; return false }
+    nb[k]!.pop(); if (!nb[k]!.length) delete nb[k]
+    if (!Object.keys(nb).length) delete b.workflowNotebook
+    return true
+  },
+  b => {
+    const d = b.proofDraft
+    if (!d?.scriptSkeleton) return false
+    const lines = d.scriptSkeleton.split('\n'); lines.pop()
+    if (lines.length) d.scriptSkeleton = lines.join('\n'); else delete d.scriptSkeleton
+    return true
+  },
+  b => Boolean(b.proofDraft?.missingEvidence && b.proofDraft.missingEvidence.length > 1 && b.proofDraft.missingEvidence.pop()),
+  b => { const idx = b.verifiedHops.map(h => Boolean(h.offSpine)).lastIndexOf(true); return idx >= 0 && noteOmittedHop(b, idx) },
+  b => { const seen = new Set<string>(); const idx = b.verifiedHops.findIndex(h => seen.has(h.capId) || !seen.add(h.capId)); return idx > 0 && noteOmittedHop(b, idx) },
+  b => {
+    if (b.capabilityHandles.length <= 1) return false
+    const hopCaps = new Set(b.verifiedHops.map(h => h.capId)), last = b.capabilityHandles.length - 1
+    const idx = b.capabilityHandles.findIndex((h, i) => i > 0 && i < last && hopCaps.has(h))
+    if (idx > 0) { b.capabilityHandles.splice(idx, 1); return true }
+    return dropMiddle(b.capabilityHandles)
+  },
+  b => dropMiddle(b.proofDraft?.orderedHops),
+  b => { if (!b.proofDraft) return false; delete b.proofDraft; return true },
+  b => b.verifiedHops.length > 2 && noteOmittedHop(b, Math.floor(b.verifiedHops.length / 2)),
+]
+
+function compactBriefScalars(brief: HopCheckpointBrief): void {
+  brief.branchKey = truncateUtf8Bytes(brief.branchKey, 24)
+  brief.capabilityHandles = brief.capabilityHandles.slice(-1).map(h => truncateUtf8Bytes(h, 32))
+  brief.nextGoal = {
+    targetSurfaceKey: truncateUtf8Bytes(brief.nextGoal.targetSurfaceKey, 32), surface: brief.nextGoal.surface,
+    service: truncateUtf8Bytes(brief.nextGoal.service, 24), endpoint: truncateUtf8Bytes(brief.nextGoal.endpoint, 24),
+    hypothesisClass: truncateUtf8Bytes(brief.nextGoal.hypothesisClass, 24), goal: truncateUtf8Bytes(brief.nextGoal.goal, 24),
+  }
+  delete brief.fuseWithBranchKey
+}
+
+/**
+ * Last-resort hop compaction: shrink per-hop strings, then thin toward the root hop. The root hop is
+ * dropped only if even a lone compacted root cannot fit the hard byte cap (degenerate budgets).
+ */
+function compactSpineHops(brief: HopCheckpointBrief, overBudget: () => boolean): void {
+  brief.verifiedHops = brief.verifiedHops.map(h => {
+    const { role: _role, at: _at, ...rest } = h
+    return { ...rest, receiptId: truncateUtf8Bytes(h.receiptId, 24), capId: truncateUtf8Bytes(h.capId, 40), service: truncateUtf8Bytes(h.service, 16), tenant: truncateUtf8Bytes(h.tenant, 12), actor: truncateUtf8Bytes(h.actor, 12) }
+  })
+  while (overBudget() && brief.verifiedHops.length > 0) noteOmittedHop(brief, brief.verifiedHops.length > 2 ? 1 : brief.verifiedHops.length - 1)
+}
+
+/**
+ * Strictly bound a canonical `v8.hop_checkpoint.v1` brief to `<= maxBytes` UTF-8 (default 2 KB),
+ * preserving the root-to-terminal verified hop spine (see `BRIEF_TRIM_STAGES`).
+ */
 export function finalizeHopCheckpointBrief(rawBrief: HopCheckpointBrief, maxBytes = DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES): { brief: HopCheckpointBrief; checkpointJson: string; checkpointBytes: number } {
   const cap = Math.max(256, Math.min(DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES, Math.floor(maxBytes)))
   const workflowNotebook = sanitizeWorkflowNotebook(rawBrief.workflowNotebook)
+  const proofDraft = sanitizeProofDraft(rawBrief.proofDraft)
   const brief: HopCheckpointBrief = {
     ...rawBrief, schema: 'v8.hop_checkpoint.v1', verifiedHops: rawBrief.verifiedHops.map(h => ({ ...h })),
     capabilityHandles: [...rawBrief.capabilityHandles], nextGoal: { ...rawBrief.nextGoal },
     ...(rawBrief.prunedBranches ? { prunedBranches: rawBrief.prunedBranches.map(p => ({ ...p })) } : {}),
-    ...(workflowNotebook ? { workflowNotebook } : {}),
+    ...(workflowNotebook ? { workflowNotebook } : {}), ...(proofDraft ? { proofDraft } : {}),
     doNotRediscover: true,
   }
   if (!workflowNotebook) delete brief.workflowNotebook
+  if (!proofDraft) delete brief.proofDraft
   const measure = () => { const json = JSON.stringify(brief); return { json, bytes: Buffer.byteLength(json, 'utf8') } }
   let m = measure()
   if (m.bytes <= cap) return { brief, checkpointJson: m.json, checkpointBytes: m.bytes }
   brief.truncated = true
-  while (m.bytes > cap && brief.prunedBranches?.length) { brief.prunedBranches.pop(); if (!brief.prunedBranches.length) delete brief.prunedBranches; m = measure() }
-  if (brief.workflowNotebook) {
-    const nbKeys: ReadonlyArray<keyof HopWorkflowNotebook> = ['triedRecipes', 'discoveredRoutes', 'openHypotheses', 'verifiedHypotheses']
-    for (const k of nbKeys) {
-      while (m.bytes > cap && brief.workflowNotebook?.[k]?.length) {
-        brief.workflowNotebook[k]!.pop()
-        if (!brief.workflowNotebook[k]!.length) delete brief.workflowNotebook[k]
-        if (brief.workflowNotebook && Object.keys(brief.workflowNotebook).length === 0) delete brief.workflowNotebook
-        m = measure()
-      }
-    }
+  for (const stage of BRIEF_TRIM_STAGES) {
+    while (m.bytes > cap && stage(brief)) m = measure()
   }
-  while (m.bytes > cap && brief.verifiedHops.length > 0) { brief.verifiedHops.shift(); brief.omittedEarlierHops = (brief.omittedEarlierHops ?? 0) + 1; m = measure() }
-  while (m.bytes > cap && brief.capabilityHandles.length > 1) { brief.capabilityHandles.shift(); m = measure() }
-  if (m.bytes > cap) {
-    brief.branchKey = truncateUtf8Bytes(brief.branchKey, 24)
-    brief.capabilityHandles = brief.capabilityHandles.slice(-1).map(h => truncateUtf8Bytes(h, 32))
-    brief.nextGoal = {
-      targetSurfaceKey: truncateUtf8Bytes(brief.nextGoal.targetSurfaceKey, 32), surface: brief.nextGoal.surface,
-      service: truncateUtf8Bytes(brief.nextGoal.service, 24), endpoint: truncateUtf8Bytes(brief.nextGoal.endpoint, 24),
-      hypothesisClass: truncateUtf8Bytes(brief.nextGoal.hypothesisClass, 24), goal: truncateUtf8Bytes(brief.nextGoal.goal, 24),
-    }
-    delete brief.fuseWithBranchKey
-    m = measure()
-  }
+  if (m.bytes > cap) { compactBriefScalars(brief); m = measure() }
   if (m.bytes > cap) { brief.nextGoal.goal = truncateUtf8Bytes(brief.nextGoal.goal, 12); brief.nextGoal.targetSurfaceKey = truncateUtf8Bytes(brief.nextGoal.targetSurfaceKey, 16); m = measure() }
+  if (m.bytes > cap) compactSpineHops(brief, () => (m = measure()).bytes > cap)
   return { brief, checkpointJson: m.json, checkpointBytes: m.bytes }
+}
+
+/**
+ * Primary root-to-terminal spine: walk back from the terminal cap, always through the precondition
+ * with the longest path to an attacker root (ties broken lexically), so side branches are off-spine.
+ */
+function primaryHopSpine(terminalCapId: string, incomingEdgeByCap: ReadonlyMap<string, CausalEdge>): Set<string> {
+  const height = new Map<string, number>()
+  const heightOf = (capId: string, visiting: Set<string>): number => {
+    const known = height.get(capId)
+    if (known !== undefined) return known
+    if (visiting.has(capId)) return 0
+    visiting.add(capId)
+    const pre = incomingEdgeByCap.get(capId)?.preconditionCapIds ?? []
+    const h = pre.length ? 1 + Math.max(...pre.map(id => heightOf(id, visiting))) : 0
+    visiting.delete(capId); height.set(capId, h)
+    return h
+  }
+  const spine = new Set<string>([terminalCapId])
+  let cur: string | undefined = terminalCapId
+  while (cur) {
+    const pre: string[] = incomingEdgeByCap.get(cur)?.preconditionCapIds ?? []
+    const next: string | undefined = [...pre].filter(id => !spine.has(id))
+      .sort((a, b) => heightOf(b, new Set()) - heightOf(a, new Set()) || a.localeCompare(b))[0]
+    if (next) spine.add(next)
+    cur = next
+  }
+  return spine
 }
 
 export interface CapabilityLedgerStats { totalNodes: number; quarantinedNodes: number; terminalEligibleNodes: number; positiveEdges: number; negativeEdges: number; prunedBranches: number }
@@ -834,6 +993,7 @@ export class CapabilityLedger {
     const orderedHandles = [...ancestorCaps].sort((a, b) => (depthByCap.get(b) ?? 0) - (depthByCap.get(a) ?? 0) || a.localeCompare(b))
     const incomingEdgeByCap = new Map<string, CausalEdge>()
     for (const edge of orderedEdges) if (edge.postconditionCapId) incomingEdgeByCap.set(edge.postconditionCapId, edge)
+    const spine = primaryHopSpine(capId, incomingEdgeByCap)
     const verifiedHops: CompactCheckpointHop[] = orderedHandles.map((id, idx) => {
       const node = this.getCapability(id), edge = incomingEdgeByCap.get(id)
       return {
@@ -842,7 +1002,7 @@ export class CapabilityLedger {
         service: truncateBriefText(node?.serviceOrigin ?? targetNode.serviceOrigin, 48), tenant: truncateBriefText(node?.tenantScope ?? targetNode.tenantScope, 36),
         actor: truncateBriefText(edge?.actorContext.persona ?? node?.actorPersona ?? targetNode.actorPersona, 36),
         ...(edge?.actorContext.roleLabel ? { role: truncateBriefText(edge.actorContext.roleLabel, 28) } : {}),
-        ...(edge ? { binding: edge.edgeBindingKind } : {}),
+        ...(edge ? { binding: edge.edgeBindingKind } : {}), ...(spine.has(id) ? {} : { offSpine: true as const }),
       }
     })
     const ng = options.nextGoal, endpoint = sanitizeCheckpointText(ng?.endpoint ?? (typeof targetNode.metadata.endpoint === 'string' ? targetNode.metadata.endpoint : '/'), 96)
@@ -862,6 +1022,7 @@ export class CapabilityLedger {
       },
       ...(prunedRelevant.length > 0 ? { prunedBranches: prunedRelevant.map(n => ({ surface: truncateBriefText(n.targetSurfaceKey, 64), hypothesis: truncateBriefText(n.hypothesisClass, 48), reason: n.reason })) } : {}),
       ...(options.workflowNotebook ? { workflowNotebook: options.workflowNotebook } : {}),
+      ...(options.proofDraft ? { proofDraft: options.proofDraft } : {}),
       truncated: false, doNotRediscover: true,
     }, maxBytes).brief
   }
@@ -879,5 +1040,158 @@ export class CapabilityLedger {
     const clauses = ['run_id = ?'], params: Array<string | number> = [this.runId]
     for (const [col, val] of filters) if (val !== undefined) { clauses.push(`${col} = ?`); params.push(val) }
     return this.db.prepare(`SELECT * FROM ${table} WHERE ${clauses.join(' AND ')} ORDER BY ${orderBy}`).all(...params) as DbRow[]
+  }
+}
+
+/** Parse a persisted `v8.hop_checkpoint.v1` brief (object or JSON string); `null` when malformed. */
+export function parseHopCheckpointBriefJson(raw: unknown): HopCheckpointBrief | null {
+  if (!raw) return null
+  let obj: unknown = raw
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed.startsWith('{')) return null
+    try { obj = JSON.parse(trimmed) } catch { return null }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
+  const rec = obj as Record<string, unknown>
+  if (rec.schema !== 'v8.hop_checkpoint.v1' || typeof rec.branchKey !== 'string' || !rec.nextGoal || typeof rec.nextGoal !== 'object') return null
+  return rec as unknown as HopCheckpointBrief
+}
+
+/**
+ * Parent hop-checkpoint briefs for a step: every `hop_checkpoint` parent fact, plus the cached
+ * step checkpoint when no parent fact carried a workflow notebook.
+ */
+export function collectParentHopCheckpointBriefs(
+  parentFacts: ReadonlyArray<{ data?: Record<string, unknown> | null } | undefined>,
+  cachedCheckpointJson?: string,
+): HopCheckpointBrief[] {
+  const briefs: HopCheckpointBrief[] = []
+  for (const fact of parentFacts) {
+    if (fact?.data?.subkind !== 'hop_checkpoint') continue
+    const brief = parseHopCheckpointBriefJson(fact.data.checkpointBrief ?? fact.data.checkpointJson)
+    if (brief) briefs.push(brief)
+  }
+  if (!briefs.some(b => b.workflowNotebook)) {
+    const cached = parseHopCheckpointBriefJson(cachedCheckpointJson)
+    if (cached) briefs.push(cached)
+  }
+  return briefs
+}
+
+/** One hop of the parent hypothesis's ordered hop sequence (structurally compatible with `ChainHop`). */
+export interface PredictedHopRef { hopIndex: number; endpoint?: string; method?: string; verified: boolean }
+
+const DECLARED_HOP_SEG_RE = /\bHop\s+(\d+)\b([\s\S]*?)(?=\bHop\s+\d+\b|$)/gi
+const DECLARED_HOP_ROUTE_RE = /\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\/[A-Za-z0-9._~:/?#@!$&*+=%-]+)/i
+/** Parse ordered `Hop N (METHOD /path)` declarations from audit suspect facts / step hypotheses. */
+export function parseDeclaredHopsFromText(texts: readonly (string | null | undefined)[]): PredictedHopRef[] {
+  const byIndex = new Map<number, PredictedHopRef>()
+  for (const raw of texts) {
+    if (!raw) continue
+    for (const m of raw.matchAll(DECLARED_HOP_SEG_RE)) {
+      const n = Number(m[1]); if (!Number.isFinite(n) || n < 1 || n > 12) continue
+      const hopIndex = n - 1, route = (m[2] ?? '').slice(0, 220).match(DECLARED_HOP_ROUTE_RE)
+      const endpoint = route?.[2]?.split('?')[0]?.replace(/[.,;:]+$/, '')
+      if (!byIndex.get(hopIndex)?.endpoint) byIndex.set(hopIndex, { hopIndex, verified: false, ...(route?.[1] ? { method: route[1].toUpperCase() } : {}), ...(endpoint ? { endpoint } : {}) })
+    }
+  }
+  return [...byIndex.values()].sort((a, b) => a.hopIndex - b.hopIndex)
+}
+
+/** First unverified predicted hop at or beyond `reachedHopCount` in the parent's ordered sequence. */
+export function resolvePredictedNextHop(hops: readonly PredictedHopRef[], reachedHopCount: number): PredictedHopRef | null {
+  const seen = new Set<string>()
+  const ordered = [...hops]
+    .filter(h => typeof h.endpoint === 'string' && h.endpoint.startsWith('/'))
+    .sort((a, b) => a.hopIndex - b.hopIndex)
+    .filter(h => { const key = `${(h.method ?? '').toUpperCase()} ${h.endpoint}`; if (seen.has(key)) return false; seen.add(key); return true })
+  return ordered.slice(Math.max(0, Math.floor(reachedHopCount))).find(h => !h.verified) ?? null
+}
+
+export interface ContinuationParentContextInput {
+  parentBriefs: readonly HopCheckpointBrief[]
+  predictedHops: readonly PredictedHopRef[]
+  /** Hop count of the largest composite actually persisted as a confirmed finding this assignment. */
+  confirmedCompositeHopCount?: number
+  /** Near-miss draft captured during this assignment (takes precedence over inherited drafts). */
+  proofDraft?: HopProofDraft
+}
+
+export interface ContinuationParentContext {
+  declaredHopCount: number
+  confirmedCompositeHopCount: number
+  /** Confirmed composite stopped short of the parent's declared hop chain (or a predicted hop remains). */
+  partialComposite: boolean
+  nextHop: PredictedHopRef | null
+  proofDraft?: HopProofDraft
+  /** `+1` extra continuation for an active near-miss repair handoff, else `0`. */
+  repairBonus: 0 | 1
+  notebooks: HopWorkflowNotebook[]
+}
+
+/** Resolve the generic parent-hypothesis context that steers a hop continuation. */
+export function resolveContinuationParentContext(input: ContinuationParentContextInput): ContinuationParentContext {
+  const confirmedCompositeHopCount = Math.max(0, Math.floor(input.confirmedCompositeHopCount ?? 0))
+  const declaredHopCount = Math.max(0, input.predictedHops.length, ...input.parentBriefs.map(b => (Number.isFinite(b.targetHop) ? b.targetHop : 0)))
+  const nextHop = resolvePredictedNextHop(input.predictedHops, confirmedCompositeHopCount)
+  const partialComposite = confirmedCompositeHopCount > 0 && (confirmedCompositeHopCount < declaredHopCount || nextHop !== null)
+  const proofDraft = sanitizeProofDraft(input.proofDraft) ?? input.parentBriefs.map(b => sanitizeProofDraft(b.proofDraft)).find(Boolean)
+  return {
+    declaredHopCount, confirmedCompositeHopCount, partialComposite, nextHop,
+    ...(proofDraft ? { proofDraft } : {}),
+    repairBonus: isActiveProofDraft(proofDraft) ? 1 : 0,
+    notebooks: input.parentBriefs.flatMap(b => (b.workflowNotebook ? [b.workflowNotebook] : [])),
+  }
+}
+
+/** Maximum continuation depth: base budget plus the near-miss repair bonus (generic chains stay capped). */
+export function resolveHopContinuationBudget(input: { requestedMax: number; genericCap: number; hasSealedLedgerCap: boolean; repairBonus: number }): number {
+  const base = Math.max(0, Math.floor(input.requestedMax))
+  const bonus = Math.max(0, Math.min(1, Math.floor(input.repairBonus)))
+  return input.hasSealedLedgerCap ? base + bonus : Math.min(base, Math.max(0, Math.floor(input.genericCap))) + bonus
+}
+
+/** Structured repair context appended to the continuation prompt (partial composite + near-miss draft). */
+export function renderHopContinuationRepairContext(ctx: Pick<ContinuationParentContext, 'partialComposite' | 'confirmedCompositeHopCount' | 'declaredHopCount' | 'nextHop' | 'proofDraft'>, maxLen = 640): string {
+  const parts: string[] = []
+  const next = ctx.nextHop?.endpoint ? `${ctx.nextHop.method ? `${ctx.nextHop.method.toUpperCase()} ` : ''}${sanitizeCheckpointText(ctx.nextHop.endpoint, 80)}` : ''
+  if (ctx.partialComposite) parts.push(`Partial composite confirmed (${ctx.confirmedCompositeHopCount}/${Math.max(ctx.declaredHopCount, ctx.confirmedCompositeHopCount + 1)} hops); extend the same chain${next ? ` to the predicted next hop ${next}` : ' to the next declared hop'}.`)
+  else if (next) parts.push(`Predicted next hop: ${next}.`)
+  const d = ctx.proofDraft
+  if (d) {
+    parts.push('Near-miss proof draft — repair it, do not restart:')
+    if (d.rejectedBy) parts.push(`rejectedBy=${d.rejectedBy};`)
+    if (d.missingEvidence?.length) parts.push(`missingEvidence=[${d.missingEvidence.join('; ')}];`)
+    if (d.orderedHops?.length) parts.push(`orderedHops=${d.orderedHops.map((h, i) => `${i + 1}) ${h}`).join(' -> ')};`)
+    if (d.scriptSkeleton) parts.push(`script outline: ${d.scriptSkeleton.split('\n').join(' | ')}`)
+  }
+  return truncateBriefText(parts.join(' '), maxLen)
+}
+
+/**
+ * Per-assignment proof-handoff state. Confirmation is recorded ONLY after the persistence callback
+ * returns a persisted finding, so a throwing / non-persisting persist keeps retries and
+ * continuations enabled. Also tracks the confirmed composite hop count and the last near-miss draft.
+ */
+export class AssignmentProofHandoffState {
+  confirmed = false
+  confirmedCompositeHopCount = 0
+  proofDraft: HopProofDraft | undefined
+
+  recordNearMiss(input: NearMissProofInput): void {
+    const draft = buildNearMissProofDraft(input)
+    if (draft) this.proofDraft = draft
+  }
+
+  commitPersistence<T extends { findingId?: string | null }>(persist: () => T, compositeHopCount = 0): T {
+    const persisted = persist()
+    if (!persisted || typeof persisted.findingId !== 'string' || !persisted.findingId.trim()) {
+      throw new Error('Proof persistence returned no confirmed finding; confirmation was not recorded.')
+    }
+    this.confirmed = true
+    this.confirmedCompositeHopCount = Math.max(this.confirmedCompositeHopCount, Math.max(0, Math.floor(compositeHopCount)))
+    this.proofDraft = undefined
+    return persisted
   }
 }

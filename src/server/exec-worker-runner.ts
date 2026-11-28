@@ -16,7 +16,7 @@ import {
 import { detectKovoVerifyScriptAliases, recordKovoVerifyAliasUsage, type KovoVerifyAliasKey } from './verify-runner.ts'
 import type { AgentTrace } from './agent-trace.ts'
 import { BrokerDenied, type BrokerExchangeResult, type Grant } from './broker.ts'
-import { DERIVED_CAPABILITY_HANDLE_RE, type NegativeEdge } from './capability-ledger.ts'
+import { AssignmentProofHandoffState, DERIVED_CAPABILITY_HANDLE_RE, isActiveProofDraft, type NegativeEdge } from './capability-ledger.ts'
 import type { CompositeProofReceipt, CompositeReceiptVerification, HostSignedTranscript } from './composite-receipt.ts'
 import { extractCoverageEvidenceMetadata } from './coverage-category.ts'
 import { queryCves } from './cve-broker.ts'
@@ -1391,6 +1391,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     const sessionSealedCapHandles: string[] = []
     const checkpointOnlyGuard = createCheckpointOnlySessionGuard()
     let confirmedDuringAssignment = false
+    const proofHandoff = new AssignmentProofHandoffState() // kovo_verify: confirm only AFTER persistence succeeds; carries near-miss proof draft
     let gapCodedDuringAssignment = false
     let enteredKovoVerify = false, kovoVerifyProgressed = false
     let inFlightProofCalls = 0
@@ -2506,6 +2507,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               })
             }
             if (!proof.verdict.confirmed) {
+              proofHandoff.recordNearMiss({ script, rejectedBy: proof.verdict.rejectedBy, failedStage: proof.compositeReceipt?.verification.failedStage ?? null, missingEvidence: proof.verdict.missingEvidence, transcript: proof.verdict.transcriptSummary, ...(proof.compositeReceipt && !proof.compositeReceipt.verification.confirmed ? { reason: proof.compositeReceipt.verification.reason } : {}) })
               const negEdge = extractVerifiedNegativeEdge({ result: proof as unknown as Record<string, unknown>, transcriptRecords: proof.transcriptRecords, script, defaultOrigin: [...approved][0] ?? '', fallbackCategory: step.category })
               if (negEdge) this.recordNegativeEdgeCoverage(curRun.id, { ...negEdge, assignmentId: job.assignment.id })
               const summarized = checkpointOnlyGuard.summarizeOutcome({
@@ -2513,12 +2515,12 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               })
               return proof.compositeReceipt?.verification.rejectedBy ? { ...summarized, compositeRejectedBy: proof.compositeReceipt.verification.rejectedBy, ...(negEdge ? { negativeEdgeRecorded: true } : {}) } : (negEdge ? { ...summarized, negativeEdgeRecorded: true } : summarized)
             }
-            confirmedDuringAssignment = true
-            const persisted = this.host.persistAgentScriptProof({
+            const persisted = proofHandoff.commitPersistence(() => this.host.persistAgentScriptProof({
               run: curRun, assignment: job.assignment, script, runtime,
               title: args.title?.trim() || proof.claimTitle || undefined, proof,
               secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault), ...vaultScrubDescriptors(verifyVault)],
-            })
+            }), compositeReceipt?.confirmed ? compositeReceipt.hopCount : 0)
+            confirmedDuringAssignment = confirmedDuringAssignment || proofHandoff.confirmed
             this.host.schedulePlanner(curRun.id)
             return checkpointOnlyGuard.summarizeOutcome({
               verdict: {
@@ -3082,11 +3084,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           })
         }
       }
-      const isWallClockRotated = sessionResult.status === 'wall_clock_rotated'
-      const isNonConfirmedSealedExit = !confirmedDuringAssignment
-        && sessionSealedCapHandles.length > 0
-        && (sessionResult.status === 'completed' || sessionResult.status === 'turn_limit' || sessionResult.status === 'nudged_out')
-      if (!confirmedDuringAssignment && ((isWallClockRotated && (isMultiHopChainStep(step) || isPersistentWorkflowContinuationStep(step))) || isNonConfirmedSealedExit)) {
+      const isWallClockRotated = sessionResult.status === 'wall_clock_rotated', isChainStep = isMultiHopChainStep(step) || isPersistentWorkflowContinuationStep(step)
+      const isRepairableExit = sessionResult.status === 'completed' || sessionResult.status === 'turn_limit' || sessionResult.status === 'nudged_out'
+      const isNonConfirmedSealedExit = !confirmedDuringAssignment && sessionSealedCapHandles.length > 0 && isRepairableExit
+      const isProofDraftRepairExit = !confirmedDuringAssignment && isActiveProofDraft(proofHandoff.proofDraft) && isChainStep && isRepairableExit
+      if ((!confirmedDuringAssignment && ((isWallClockRotated && isChainStep) || isNonConfirmedSealedExit || isProofDraftRepairExit)) || proofHandoff.confirmedCompositeHopCount > 0) {
         try {
           const recordedFacts = collectAllPages((offset, limit) =>
             this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
@@ -3103,10 +3105,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             .from(brokerExchanges)
             .where(and(eq(brokerExchanges.runId, run.id), eq(brokerExchanges.assignmentId, job.assignment.id)))
             .all()
-          const newLedgerHandles = this.storage.capabilityLedger(run.id)
-            .listCapabilities()
-            .filter(c => !baselineCapIds.has(c.capId) && DERIVED_CAPABILITY_HANDLE_RE.test(c.capId))
-            .map(c => c.capId)
+          const newLedgerHandles = this.storage.capabilityLedger(run.id).listCapabilities()
+            .filter(c => !baselineCapIds.has(c.capId) && DERIVED_CAPABILITY_HANDLE_RE.test(c.capId)).map(c => c.capId)
           const sealedCapHandles = [...new Set([...sessionSealedCapHandles, ...newLedgerHandles])]
           this.host.reconPlanner.enqueueHopContinuationOnRotation({
             run: latestRun,
@@ -3118,8 +3118,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             recordedFacts,
             recordedExchanges,
             sealedCapHandles,
-            trigger: isWallClockRotated ? 'wall_clock_rotated' : 'sealed_handle_exit',
-            allowNonChainWithSealedCap: isNonConfirmedSealedExit,
+            trigger: isWallClockRotated ? 'wall_clock_rotated' : isNonConfirmedSealedExit ? 'sealed_handle_exit' : isProofDraftRepairExit ? 'proof_draft_repair' : 'partial_composite',
+            allowNonChainWithSealedCap: isNonConfirmedSealedExit, confirmedCompositeHopCount: proofHandoff.confirmedCompositeHopCount, ...(proofHandoff.proofDraft ? { proofDraft: proofHandoff.proofDraft } : {}),
           })
         } catch (err) {
           this.noteLifecycleWarning(run.id, 'enqueueHopContinuationOnRotation', err, {
