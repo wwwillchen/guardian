@@ -7,7 +7,7 @@ import { BoardPane, useBoardSeen } from './coordinator.tsx'
 import { RunDataProvider, useRun } from './data.tsx'
 import { ACTIONS, approvalCommand, DecisionsProvider, useDecisions } from './decisions.tsx'
 import { fmtN, fmtUsd, host, RUN_SUBMODE_PARAMS } from './format.ts'
-import { RunHeader } from './header.tsx'
+import { openBudgetPopover, RunHeader } from './header.tsx'
 import { Icon } from './icons.tsx'
 import { KeyboardProvider, useShortcuts } from './keyboard.tsx'
 import { VIEWS } from './meta.ts'
@@ -332,13 +332,6 @@ export function budgetPausedCopy(r: { spentUsd: number; budgetUsd: number; spent
   return `Paused at budget: ${fmtUsd(r.spentUsd)} / ${fmtUsd(r.budgetUsd)} · ${reqs}. Partial report saved.`
 }
 
-function openHeaderBudgetPopover() {
-  if (typeof document === 'undefined') return
-  if (document.querySelector('[role="dialog"][aria-label="Budget and rate limit"]')) return
-  const trigger = document.querySelector<HTMLButtonElement>('header [data-rl-btn][title^="Budget "]')
-  trigger?.click()
-}
-
 /** Show the pinned top approval banner outside Queue and consent/review screens when active approvals wait. */
 export function shouldShowApprovalBanner(input: {
   activeApprovalCount: number
@@ -426,7 +419,11 @@ export async function probeLocalAuthStatus(fetchImpl?: typeof fetch): Promise<Lo
   }
 }
 
-/** Pending approvals, budget-paused, auth-issue, model-missing, session-expired, reconnecting: crisp one-line banners under the run line. */
+/**
+ * Pending approvals, budget-paused, auth-issue, model-missing, session-expired, reconnecting: crisp
+ * one-line banners under the run line. On Overview the run hero owns the budget-paused state (and its
+ * single "Raise budget" primary), so the budget banner only shows on the other views.
+ */
 function RunBanners() {
   const { detail, model, events, connection, pending } = useRun()
   const nav = useNav()
@@ -471,12 +468,12 @@ function RunBanners() {
       onReviewInQueue={() => nav.setView('queue')}
       onApproveAll={() => { void q.approveAllPending() }}
     />}
-    {r.status === 'budget_paused' && <div className={wCls} role="status" aria-label="Budget paused" data-testid="budget-paused-banner">
+    {r.status === 'budget_paused' && nav.view !== 'overview' && <div className={wCls} role="status" aria-label="Budget paused" data-testid="budget-paused-banner">
       <Icon name="budget" className="text-warn" />
       <span className="num line-clamp-2 min-w-0 flex-1 whitespace-normal" title={budgetPausedCopy(r)}>
         <b className="font-medium text-fg">Paused at budget:</b> {budgetPausedCopy(r).slice('Paused at budget: '.length)}
       </span>
-      <button type="button" data-rl-btn="" className={runBtn({ variant: 'primary' })} onClick={openHeaderBudgetPopover}>
+      <button type="button" data-rl-btn="" className={runBtn({ variant: 'primary' })} onClick={openBudgetPopover}>
         <Icon name="budget" />Raise budget
       </button>
     </div>}

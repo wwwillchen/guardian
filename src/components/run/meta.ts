@@ -1,6 +1,11 @@
 // Static vocabulary for the run workspace: views, severities, statuses,
 // coverage categories and phases. Shared by every view; extend additively.
+import { runLifecycleLabel } from '../run-state.ts'
 import type { IconName } from './icons.tsx'
+
+// The one run vocabulary (mode × lifecycle × phase) lives in `run-state.ts`; re-exported for run views.
+export { lifecycleBreakdown, RUN_LIFECYCLES, RUN_PHASES, runLifecycleLabel, runLifecycleMeta, runLifecycleOf, runModeMeta, runModeOf, runPhaseOf } from '../run-state.ts'
+export type { RunLifecycle, RunMode, RunPhaseInfo, RunPhaseKey } from '../run-state.ts'
 
 export const VIEW_IDS = ['overview', 'workflow', 'queue', 'findings', 'report', 'surface', 'exchanges', 'activity'] as const
 export type ViewId = typeof VIEW_IDS[number]
@@ -50,8 +55,8 @@ export const ST_LABEL: Record<string, string> = {
 }
 export const stLabel = (s: string) => ST_LABEL[s] ?? (s.charAt(0).toUpperCase() + s.slice(1).replace(/_/g, ' '))
 
-/** Run status label for the run line and rail. */
-export const runStatusLabel = (s: string) => s === 'waiting' ? 'Waiting' : stLabel(s)
+/** Run status label for the run line, rail and palette: the canonical six-state lifecycle label. */
+export const runStatusLabel = (s: string) => runLifecycleLabel(s)
 
 /** The 11 coverage categories, in matrix column order: [id, label, letter, short]. */
 export const CATS: [string, string, string, string][] = [

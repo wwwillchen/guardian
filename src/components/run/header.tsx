@@ -1,8 +1,8 @@
-// Run line header: breadcrumb with goal, then status · phase track · round ·
-// budget meter · request meter · testing mode and hosts · elapsed. Items drop by
-// priority when the line overflows. Primary action + "…" menu carry run-level
-// commands: resume/pause, budget, approval policy, scope, goal revision,
-// exports, stop, delete.
+// Run header. Row 1: breadcrumb + run title + actions (resume/pause, "…" menu, panel toggle).
+// Row 2: the fixed-slot KPI strip ([U7]) — Status · Phase n/N · Spend · Requests · Elapsed ·
+// Round — each slot a compact label over a tabular `<Num>` value with a reserved width, so a live
+// tick never slices or shifts a digit. Denominators, then low-priority slots, drop whole when the
+// strip is narrow; tokens, turns, mode, hosts and leases live in the "More telemetry" popover.
 import { Link, useNavigate, useRouter } from '@tanstack/react-router'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, ReactNode, RefObject } from 'react'
@@ -17,20 +17,21 @@ import {
 import type { ApprovalPolicy } from '../../domain.ts'
 import { canOfferResumeButton, isRunDeleteBlocked, isRunEditable } from '../../server/run-status.ts'
 import type { RunActivity } from '../../server/run-status.ts'
-import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
+import { approvalPolicyMeta, capabilityTierMeta, RUN_PHASES, runLifecycleMeta, runLifecycleOf, runModeMeta, runModeOf, runPhaseOf } from '../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
 import { useRun, useRunModel } from './data.tsx'
 import type { Command } from './data.tsx'
 import { HostLabel, Tag } from './display.tsx'
 import { fmtAgo, fmtDur, fmtFullDateTime, fmtN, fmtTime, fmtUsd, host, plural, short } from './format.ts'
-import { PhaseTrack, StatusGlyph, TierBars } from './glyphs.tsx'
+import { StatusGlyph, TierBars } from './glyphs.tsx'
 import { Icon } from './icons.tsx'
 import type { IconName } from './icons.tsx'
 import { useShortcuts } from './keyboard.tsx'
-import { normFStatus, PHASE_LABEL, runStatusLabel } from './meta.ts'
+import { normFStatus, runStatusLabel } from './meta.ts'
 import type { RiskTier } from './meta.ts'
 import { Meter } from './motion.tsx'
 import { useNav } from './nav.tsx'
+import { Num } from './num.tsx'
 import { useOverlays } from './overlays.tsx'
 import { useToast } from './toast.tsx'
 import { cn, runBtn, runDdItem, RW } from './tw.ts'
@@ -71,7 +72,47 @@ export function buildBudgetCommand(
   return cmd
 }
 
-type Popover = 'menu' | 'budget' | 'policy' | 'leases' | 'scope' | 'goal' | null
+type Popover = 'menu' | 'budget' | 'policy' | 'leases' | 'scope' | 'goal' | 'telemetry' | null
+
+/** Window event the run hero / banners dispatch to open the header's budget popover. */
+export const OPEN_BUDGET_EVENT = 'kovo:open-budget'
+export function openBudgetPopover() {
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(OPEN_BUDGET_EVENT))
+}
+
+/**
+ * Labelled phase track on the canonical `RUN_PHASES` (one model for the header, consent stepper
+ * and workflow): `compact` is the header slot ("2/5 Threat model"), `stepper` the consent track.
+ */
+export function PhaseTrack({ phase, variant = 'compact', className }: { phase: string; variant?: 'compact' | 'stepper'; className?: string }) {
+  const info = runPhaseOf(phase)
+  const state = (i: number) => (info.done || i + 1 < info.index ? 'done' : i + 1 === info.index ? 'current' : 'todo')
+  if (variant === 'stepper') {
+    return <ol className={cn('m-0 grid list-none grid-cols-5 border-t border-line p-0', className)} aria-label={info.ariaLabel} data-testid="consent-stepper" data-phase-index={info.index}>
+      {RUN_PHASES.map((p, i) => {
+        const st = state(i)
+        return <li
+          key={p.key}
+          aria-current={st === 'current' ? 'step' : undefined}
+          className={cn(
+            'relative pr-3 pt-2.5 text-[12px] leading-[17px] text-fg-subtle before:absolute before:-top-px before:left-0 before:right-3 before:h-0.5 before:content-[""]',
+            st === 'current' ? 'before:bg-accent' : st === 'done' ? 'before:bg-fg-subtle' : 'before:bg-line-2',
+          )}
+        >
+          <b className={cn('mb-0.5 block font-medium', st === 'current' ? 'text-fg' : 'text-fg-muted')}><span className="num text-fg-subtle">{i + 1}</span> {p.label}</b>
+          {p.summary}
+        </li>
+      })}
+    </ol>
+  }
+  return <span className={cn('inline-flex items-center gap-1.5', className)} role="img" aria-label={info.ariaLabel} data-phase-index={info.index}>
+    <span className="inline-flex gap-0.5" aria-hidden="true">
+      {RUN_PHASES.map((p, i) => <i key={p.key} className={cn('h-1 w-2 rounded-[2px]', state(i) === 'done' ? 'bg-fg-subtle' : state(i) === 'current' ? 'bg-accent' : 'bg-line-2')} />)}
+    </span>
+    <span className="tabular-nums text-fg-subtle" aria-hidden="true">{info.index}/{info.total}</span>
+    <span className="text-fg" aria-hidden="true">{info.label}</span>
+  </span>
+}
 
 /**
  * Fit the run line without ever slicing a number: hide denominators
@@ -131,9 +172,13 @@ function deriveActiveLeaseGrants(detail: ReturnType<typeof useRun>['detail'], no
 }
 
 const rlItemClass =
-  'mr-3 inline-flex h-4 flex-none items-center gap-1.5 whitespace-nowrap border-r border-line pr-3 leading-4 last:border-r-0 data-[lastv=true]:border-r-0'
+  'mr-3 inline-flex flex-none flex-col items-start justify-center gap-px whitespace-nowrap border-r border-line py-0.5 pr-3 last:border-r-0 data-[lastv=true]:border-r-0'
 const rlBtnClass =
-  'group/rlb mr-3 inline-flex h-auto min-h-[22px] flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-none border-0 border-r border-line bg-transparent py-0.5 pl-0 pr-3 font-sans text-[12.5px] font-normal text-inherit shadow-none last:border-r-0 data-[lastv=true]:border-r-0 hover:bg-transparent'
+  'group/rlb mr-3 inline-flex h-auto min-h-[22px] flex-none cursor-pointer flex-col items-start justify-center gap-px whitespace-nowrap rounded-none border-0 border-r border-line bg-transparent py-0.5 pl-0 pr-3 text-left font-sans text-[12.5px] font-normal text-inherit shadow-none last:border-r-0 data-[lastv=true]:border-r-0 hover:bg-transparent'
+/** KPI slot caption above its value. */
+const rlLabel = 'text-[10.5px] font-medium leading-[13px] text-fg-subtle'
+/** KPI slot value row (one line, tabular). */
+const rlValue = 'inline-flex h-4 items-center gap-1 leading-4 text-fg-muted'
 
 export function RunHeader() {
   const { detail, send, pending } = useRun()
@@ -169,7 +214,9 @@ export function RunHeader() {
   const hasRunningLab = Boolean(detail.labTarget)
     || Boolean(detail.activity?.blockingReasons.some(reason => reason.code === 'running_lab_container'))
   const durLabel = fmtDur(dur)
-  useFitRunline(rl, [r.status, r.phase, r.spentUsd, r.budgetUsd, r.spentRequests, r.budgetRequests, scopeN, totalGrants, durLabel.length])
+  useFitRunline(rl, [r.status, r.phase, r.roundNo, r.spentUsd, r.budgetUsd, r.spentRequests, r.budgetRequests, durLabel.length])
+  const lifecycle = runLifecycleOf(detail.activity?.lifecycle ?? r.status)
+  const phaseInfo = runPhaseOf(r.phase)
 
   useEffect(() => {
     if (!pop) return
@@ -178,6 +225,11 @@ export function RunHeader() {
     return () => document.removeEventListener('mousedown', down)
   }, [pop])
   useShortcuts([{ key: 'Escape', allowInInput: true, run: () => setPop(null) }], { priority: 50, enabled: pop != null })
+  useEffect(() => {
+    const open = () => setPop('budget')
+    window.addEventListener(OPEN_BUDGET_EVENT, open)
+    return () => window.removeEventListener(OPEN_BUDGET_EVENT, open)
+  }, [])
 
   const copyRunId = () => {
     const done = () => toast.show('Copied run ID', { icon: 'check', sub: short(r.id) })
@@ -187,11 +239,12 @@ export function RunHeader() {
   }
   const run = (cmd: Parameters<typeof send>[0], done?: string) => send(cmd).then(() => { if (done) toast.show(done) }, () => {})
 
+  // The overview hero owns the state's single filled CTA; the header copy stays a demoted default button.
   let action: ReactNode = null
   if (canOfferResumeButton(r)) {
-    action = <button type="button" className={runBtn()} disabled={pending > 0} onClick={() => run({ action: 'resume' }, 'Resuming the run')}><Icon name="play" />Resume</button>
+    action = <button type="button" className={runBtn({ variant: 'default' })} disabled={pending > 0} data-hero-demoted={nav.view === 'overview' || undefined} onClick={() => run({ action: 'resume' }, 'Resuming the run')}><Icon name="play" />Resume</button>
   } else if (r.status === 'budget_paused') {
-    action = <button type="button" className={runBtn()} onClick={() => setPop(pop === 'budget' ? null : 'budget')}><Icon name="budget" />Raise budget</button>
+    action = <button type="button" className={runBtn({ variant: 'default' })} data-hero-demoted={nav.view === 'overview' || undefined} onClick={() => setPop(pop === 'budget' ? null : 'budget')}><Icon name="budget" />Raise budget</button>
   } else if (r.status === 'running') {
     action = <button type="button" className={runBtn()} disabled={pending > 0} onClick={() => run({ action: 'pause' }, 'Pausing the run')}><Icon name="pause" />Pause</button>
   } else if (r.status === 'waiting' && nav.view !== 'overview') {
@@ -354,6 +407,7 @@ export function RunHeader() {
         {pop === 'leases' && <LeasesPopover onClose={() => setPop(null)} />}
         {pop === 'scope' && <ScopePopover onClose={() => setPop(null)} onEdit={() => { setPop(null); openScope() }} />}
         {pop === 'goal' && <GoalPopover onClose={() => setPop(null)} />}
+        {pop === 'telemetry' && <TelemetryPopover totalGrants={totalGrants} onOpen={setPop} />}
       </span>
     </div>
     <DeleteRunDialog
@@ -368,70 +422,83 @@ export function RunHeader() {
         await navigate({ to: '/projects/$projectId', params: { projectId: detail.project.id }, replace: true })
       }}
     />
-    <div
-      className="num -mt-1.5 flex h-[34px] items-center overflow-hidden whitespace-nowrap text-[12.5px] text-fg-muted [mask-image:linear-gradient(90deg,#000_calc(100%-24px),transparent)]"
-      ref={rl}
-      data-testid="run-line"
-    >
-      <span className={rlItemClass} data-rl=""><StatusGlyph status={r.status} /><b className="font-medium text-fg">{runStatusLabel(r.status)}</b></span>
-      <span className={rlItemClass} data-rl="" data-p="4">
-        <PhaseTrack phase={r.phase} />
-        {r.phase !== 'complete' && <span>{PHASE_LABEL[r.phase] ?? r.phase}</span>}
-        <span className="text-fg-subtle">{r.phase === 'complete' ? '' : '· '}Round {r.roundNo}</span>
-      </span>
+    <div className="-mt-1 flex h-[38px] min-w-0 items-center gap-2">
+      <div
+        className="num flex min-w-0 flex-1 items-center overflow-hidden whitespace-nowrap text-[12.5px] text-fg-muted"
+        ref={rl}
+        data-testid="run-line"
+        aria-label="Run telemetry"
+        role="group"
+      >
+        <span className={rlItemClass} data-rl="" data-kpi="status">
+          <span className={rlLabel}>Status</span>
+          <span className={rlValue}><StatusGlyph status={runLifecycleMeta[lifecycle].glyph} /><b className="font-medium text-fg">{runLifecycleMeta[lifecycle].label}</b></span>
+        </span>
+        <button
+          type="button"
+          className={rlBtnClass}
+          data-rl=""
+          data-p="4"
+          data-kpi="phase"
+          title={`${phaseInfo.ariaLabel} · Open the workflow`}
+          onClick={() => nav.setView('workflow')}
+        >
+          <span className={rlLabel}>Phase</span>
+          <span className={rlValue}><PhaseTrack phase={r.phase} /></span>
+        </button>
+        <button
+          type="button"
+          className={rlBtnClass}
+          data-rl=""
+          data-rl-btn=""
+          data-p="8"
+          data-kpi="spend"
+          title={`Budget ${fmtUsd(r.spentUsd)} of ${fmtUsd(r.budgetUsd)} · ${fmtN(r.spentTokens)} tokens`}
+          onClick={() => setPop(pop === 'budget' ? null : 'budget')}
+        >
+          <span className={rlLabel}>Spend</span>
+          <span className={rlValue}>
+            <span className="inline-flex" data-p="5"><Meter id="hdr.budget" value={bPct} /></span>
+            <b className="font-medium text-fg"><Num value={r.spentUsd} kind="usd" /></b>
+            <span className="text-fg-subtle group-hover/rlb:text-fg-muted" data-rl-sub="">/ <Num value={r.budgetUsd} kind="usd" /> (<Num value={bPct} kind="pct" />)</span>
+          </span>
+        </button>
+        <span
+          className={rlItemClass}
+          data-rl=""
+          data-p="7"
+          data-kpi="requests"
+          title={r.budgetRequests ? `${fmtN(r.spentRequests)} of ${fmtN(r.budgetRequests)} HTTP requests sent through the safety proxy` : 'HTTP requests sent through the safety proxy (uncapped)'}
+        >
+          <span className={rlLabel}>Requests</span>
+          <span className={rlValue}>
+            {r.budgetRequests > 0 && <span className="inline-flex" data-p="5"><Meter id="hdr.req" value={rPct} /></span>}
+            <b className="font-medium text-fg"><Num value={r.spentRequests} kind="count" /></b>
+            {r.budgetRequests > 0
+              ? <span className="text-fg-subtle" data-rl-sub="">/ <Num value={r.budgetRequests} kind="count" /> (<Num value={rPct} kind="pct" />)</span>
+              : <span className="text-fg-subtle" data-rl-sub="">· uncapped</span>}
+          </span>
+        </span>
+        <span className={rlItemClass} data-rl="" data-p={r.status === 'running' ? '6' : '3'} data-rl-elapsed="" data-kpi="elapsed" title={`Started ${fmtFullDateTime(r.createdAt)}`}>
+          <span className={rlLabel}>Elapsed</span>
+          <span className={rlValue}><span className="tabular-nums text-fg" suppressHydrationWarning>{r.status === 'running' || dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span></span>
+        </span>
+        <span className={rlItemClass} data-rl="" data-p="2" data-kpi="round">
+          <span className={rlLabel}>Round</span>
+          <span className={rlValue}><Num value={r.roundNo} kind="count" className="text-fg" /></span>
+        </span>
+      </div>
       <button
         type="button"
-        className={rlBtnClass}
-        data-rl=""
+        className={cn(runBtn({ variant: pop === 'telemetry' ? 'ghostOn' : 'ghost', size: 'sm' }), 'flex-none')}
         data-rl-btn=""
-        data-p="8"
-        title={`Budget ${fmtUsd(r.spentUsd)} of ${fmtUsd(r.budgetUsd)} · ${fmtN(r.spentTokens)} tokens`}
-        onClick={() => setPop(pop === 'budget' ? null : 'budget')}
+        aria-haspopup="dialog"
+        aria-expanded={pop === 'telemetry'}
+        title="Tokens, turns, mode, hosts and leases"
+        onClick={() => setPop(pop === 'telemetry' ? null : 'telemetry')}
       >
-        <span className="inline-flex" data-p="5"><Meter id="hdr.budget" value={bPct} /></span>
-        <b className="font-medium text-fg">{fmtUsd(r.spentUsd)}</b>
-        <span className="text-fg-subtle group-hover/rlb:text-fg-muted" data-rl-sub="">/ {fmtUsd(r.budgetUsd)}</span>
+        <Icon name="sliders" />More telemetry
       </button>
-      <span
-        className={rlItemClass}
-        data-rl=""
-        data-p="7"
-        title={r.budgetRequests ? `${fmtN(r.spentRequests)} of ${fmtN(r.budgetRequests)} HTTP requests sent through the safety proxy` : 'HTTP requests sent through the safety proxy (uncapped)'}
-      >
-        {r.budgetRequests > 0 && <span className="inline-flex" data-p="5"><Meter id="hdr.req" value={rPct} /></span>}
-        <b className="font-medium text-fg">{fmtN(r.spentRequests)}</b>
-        {r.budgetRequests > 0 && <span className="text-fg-subtle" data-rl-sub="">/ {fmtN(r.budgetRequests)}</span>}
-        <span className="text-fg-subtle">req</span>
-        {!r.budgetRequests && <span className="text-fg-subtle" data-rl-sub="">· uncapped</span>}
-      </span>
-      <button
-        type="button"
-        className={rlBtnClass}
-        data-rl=""
-        data-rl-btn=""
-        data-p="1"
-        title={`${capabilityTierMeta[r.capabilityTier].name} · ${approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].label}`}
-        onClick={() => setPop(pop === 'scope' ? null : 'scope')}
-      >
-        <span className="group-hover/rlb:text-fg">{capabilityTierMeta[r.capabilityTier].short}</span>
-        <span className="text-fg-subtle group-hover/rlb:text-fg-muted">· {plural(scopeN, 'host')}</span>
-      </button>
-      {totalGrants > 0 && <button
-        type="button"
-        className={rlBtnClass}
-        data-rl=""
-        data-rl-btn=""
-        data-p="2"
-        title="Active route approval leases — click to inspect or revoke"
-        onClick={() => setPop(pop === 'leases' ? null : 'leases')}
-      >
-        <Icon name="lock" size={12} className="text-fg-subtle group-hover/rlb:text-fg" />
-        <span className="group-hover/rlb:text-fg">Leases</span>
-        <span className="text-fg-subtle group-hover/rlb:text-fg-muted">· {totalGrants}</span>
-      </button>}
-      <span className={rlItemClass} data-rl="" data-p={r.status === 'running' ? '6' : '3'} data-rl-elapsed="" title={`Started ${fmtFullDateTime(r.createdAt)}`}>
-        <span className="text-fg-subtle" suppressHydrationWarning>{r.status === 'running' || dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span>
-      </span>
     </div>
   </header>
 }
@@ -445,6 +512,30 @@ function PopShell({ title, sub, children, footer, wide = false }: { title: React
     <div className="flex max-h-[60vh] flex-col gap-2.5 overflow-auto px-3.5 pb-3 pt-2.5 [&_p]:m-0 [&_p]:text-[12px] [&_p]:leading-[18px] [&_p]:text-fg-subtle">{children}</div>
     {footer && <div className="flex items-center justify-end gap-1.5 border-t border-line bg-sunk px-3 py-[9px]">{footer}</div>}
   </div>
+}
+
+/** Secondary run telemetry that does not earn a fixed KPI slot. */
+function TelemetryPopover({ totalGrants, onOpen }: { totalGrants: number; onOpen: (p: Popover) => void }) {
+  const { detail } = useRun()
+  const model = useRunModel()
+  const r = detail.run
+  const mode = runModeMeta[runModeOf(r)]
+  const row = (label: string, value: ReactNode, title?: string) => <>
+    <dt className="text-fg-subtle">{label}</dt>
+    <dd className="m-0 min-w-0 truncate text-right text-fg" title={title}>{value}</dd>
+  </>
+  const link = (label: string, to: Popover) => <button type="button" className={runBtn({ variant: 'link', size: 'none' })} onClick={() => onOpen(to)}>{label}</button>
+  return <PopShell title="More telemetry" sub={mode.label}>
+    <dl className="m-0 grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-1.5 text-[12px]" data-testid="more-telemetry">
+      {row('Tokens', <Num value={r.spentTokens} kind="tokens" />)}
+      {row('Turns', <Num value={r.turnsUsed} kind="turns" />)}
+      {row('Mode', mode.label, `${capabilityTierMeta[r.capabilityTier].name} · ${approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].label}`)}
+      {row('Scope', link(plural(model.scopeOrigins.length, 'host'), 'scope'))}
+      {row('Rate limit', <Num value={r.maxRpsPerOrigin} kind="count" unit="req/s per origin" />)}
+      {row('Approval leases', totalGrants > 0 ? link(`${fmtN(totalGrants)} active`, 'leases') : <span className="text-fg-subtle">None</span>)}
+      {row('Started', <span suppressHydrationWarning>{fmtFullDateTime(r.createdAt)}</span>)}
+    </dl>
+  </PopShell>
 }
 
 function BudgetPopover({ onClose }: { onClose: () => void }) {

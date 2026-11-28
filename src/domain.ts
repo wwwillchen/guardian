@@ -1038,6 +1038,15 @@ export function canReviewScope(phase: Phase, status: RunStatus) {
     : ['threat_model', 'investigation', 'verification'].includes(phase) && status !== 'complete' && status !== 'failed'
 }
 
+/**
+ * Discovery consent ("Approve & start" on a fresh run) is accepted exactly while the run waits in
+ * the consent phase — the same guard the server's `discover` command enforces. Scope edits stay on
+ * `canReviewScope` (which deliberately excludes the consent phase).
+ */
+export function canApproveDiscovery(phase: Phase, status: RunStatus) {
+  return phase === 'consent' && status === 'waiting'
+}
+
 export interface Candidate {
   id: string
   origin: string

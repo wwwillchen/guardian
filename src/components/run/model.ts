@@ -5,8 +5,9 @@ import type { RunDetail } from '../run-state.ts'
 import { projectRunFindings } from '../../findings-view.ts'
 import { isTerminalRunStatus } from '../../server/run-status.ts'
 import { capF, firstSentence, host, sharedApex, words } from './format.ts'
-import { COV_L, covCat, FSTAT_ORDER, PHASE_ORDER, SEV, SEV_ORDER } from './meta.ts'
-import type { RiskTier, Severity } from './meta.ts'
+import { COV_L, covCat, FSTAT_ORDER, PHASE_LABEL, PHASE_ORDER, runLifecycleMeta, runLifecycleOf, SEV, SEV_ORDER } from './meta.ts'
+import type { RiskTier, RunLifecycle, Severity } from './meta.ts'
+import type { LifecycleTone } from '../run-state.ts'
 
 export type Detail = RunDetail
 export type Run = RunDetail['run']
@@ -575,39 +576,379 @@ export function coverageCounts(cov: readonly Coverage[]) {
   return order.filter(k => ct[k]).map(k => ({ status: k, label: COV_L[k], count: ct[k] }))
 }
 
+// ---------------------------------------------------------------- traffic sparkline ([U7])
+
+/** Live runs chart the trailing hour; a quiet notice appears after 10 minutes without traffic. */
+export const SPARK_LIVE_WINDOW_MS = 60 * 60_000
+export const SPARK_QUIET_MS = 10 * 60_000
+const SPARK_MAX_BUCKETS = 60
+
+/** Target-side refusals and errors drawn as red ticks (proxy denials are counted separately by kind). */
+export const isDeniedHttpStatus = (status: number) => status === 403 || status === 429 || status >= 500
+
+export interface TrafficBucket {
+  /** Bucket start (ms epoch). */
+  t: number
+  /** Requests sent through the safety proxy in this bucket. */
+  count: number
+  /** `count` normalised to requests per minute. */
+  perMin: number
+  /** Proxy denials plus 403 / 429 / 5xx responses in this bucket. */
+  denied: number
+}
+
+export interface TrafficSparkline {
+  window: 'live' | 'full'
+  t0: number
+  t1: number
+  bucketMs: number
+  buckets: TrafficBucket[]
+  /** Reference line: `maxRpsPerOrigin × 60` requests per minute (0 when uncapped). */
+  capPerMin: number
+  /** The cap line sits inside the y-range (otherwise it is labelled as off-scale). */
+  capInScale: boolean
+  peakPerMin: number
+  yMax: number
+  total: number
+  denied: number
+  lastAt: number | null
+  /** No traffic was ever recorded. */
+  empty: boolean
+  /** Live run with traffic, but none in the last 10 minutes. */
+  quiet: boolean
+}
+
 /**
- * Exchange (and broker denial) histogram across the run's traffic window. The domain comes from
- * traffic timestamps only, so a late non-traffic event (restart recovery, interruption) cannot
- * stretch the axis and pile every request into the first bin.
+ * Requests/min sparkline: the last 60 minutes while the run is live (running, paused, awaiting
+ * approval), the full traffic span once terminal. Prefers the broker event stream (complete) and
+ * falls back to the loaded exchange window. The full-run domain ends at the last traffic
+ * timestamp, so a late non-traffic record cannot stretch the axis and pile requests into bucket 0.
  */
-export function trafficHistogram(m: RunModel, events: readonly RunEvent[], bins = 36) {
-  const allowed: number[] = []
-  const denied: number[] = []
-  for (const e of events) {
-    if (e.kind === 'broker.allowed') allowed.push(e.createdAt)
-    else if (e.kind === 'broker.denied') denied.push(e.createdAt)
+export function buildTrafficSparkline(input: {
+  status: string
+  createdAt: number
+  now: number
+  maxRpsPerOrigin: number
+  exchanges: readonly { createdAt: number; status: number }[]
+  events: readonly { kind: string; createdAt: number }[]
+  window?: 'live' | 'full'
+}): TrafficSparkline {
+  const finite = (t: unknown): t is number => typeof t === 'number' && Number.isFinite(t)
+  const allowedEv: number[] = []
+  const deniedAt: number[] = []
+  for (const e of input.events) {
+    if (!finite(e.createdAt)) continue
+    if (e.kind === 'broker.allowed') allowedEv.push(e.createdAt)
+    else if (e.kind === 'broker.denied') deniedAt.push(e.createdAt)
   }
-  // Prefer the event stream (complete); fall back to the loaded exchange window.
-  const ok = allowed.length ? allowed : m.detail.exchangesSummary.map(e => e.createdAt)
-  let t0 = Infinity
-  let tEnd = -Infinity
-  const span1 = (t: number) => { if (Number.isFinite(t)) { if (t < t0) t0 = t; if (t > tEnd) tEnd = t } }
-  for (const t of ok) span1(t)
-  for (const t of denied) span1(t)
-  if (!allowed.length) {
-    for (const e of m.detail.exchangesSummary) {
-      if (typeof e.durationMs === 'number' && Number.isFinite(e.durationMs) && e.durationMs > 0) span1(e.createdAt + e.durationMs)
+  const sent = allowedEv.length ? allowedEv : input.exchanges.map(e => e.createdAt).filter(finite)
+  for (const e of input.exchanges) if (finite(e.createdAt) && isDeniedHttpStatus(Number(e.status))) deniedAt.push(e.createdAt)
+  let lastAt: number | null = null
+  for (const t of [...sent, ...deniedAt]) if (lastAt == null || t > lastAt) lastAt = t
+  const live = runLifecycleMeta[runLifecycleOf(input.status)].live
+  const window = input.window ?? (live ? 'live' : 'full')
+  let t0: number
+  let bucketMs: number
+  let n: number
+  if (window === 'live') {
+    bucketMs = 60_000
+    n = SPARK_MAX_BUCKETS
+    t0 = input.now - n * bucketMs
+  } else {
+    t0 = finite(input.createdAt) ? input.createdAt : Infinity
+    for (const t of sent) if (t < t0) t0 = t
+    for (const t of deniedAt) if (t < t0) t0 = t
+    if (!Number.isFinite(t0)) t0 = input.now - 60_000
+    const tEnd = Math.max(t0 + 60_000, (lastAt ?? t0) + 1)
+    bucketMs = Math.max(60_000, Math.ceil((tEnd - t0) / SPARK_MAX_BUCKETS))
+    n = Math.max(1, Math.min(SPARK_MAX_BUCKETS, Math.ceil((tEnd - t0) / bucketMs)))
+  }
+  const buckets: TrafficBucket[] = Array.from({ length: n }, (_, i) => ({ t: t0 + i * bucketMs, count: 0, perMin: 0, denied: 0 }))
+  const slot = (t: number) => {
+    const i = Math.floor((t - t0) / bucketMs)
+    return i >= 0 && i < n ? buckets[i] : window === 'full' ? buckets[Math.min(n - 1, Math.max(0, i))] : undefined
+  }
+  let total = 0
+  let denied = 0
+  for (const t of sent) { const b = slot(t); if (b) { b.count += 1; total += 1 } }
+  for (const t of deniedAt) { const b = slot(t); if (b) { b.denied += 1; denied += 1 } }
+  let peak = 0
+  for (const b of buckets) {
+    b.perMin = Math.round(b.count / (bucketMs / 60_000) * 10) / 10
+    if (b.perMin > peak) peak = b.perMin
+  }
+  const capPerMin = input.maxRpsPerOrigin > 0 ? input.maxRpsPerOrigin * 60 : 0
+  const capInScale = capPerMin > 0 && capPerMin <= Math.max(1, peak) * 4
+  const yMax = Math.max(1, peak * 1.15, capInScale ? capPerMin * 1.1 : 0)
+  const empty = sent.length === 0 && deniedAt.length === 0
+  const quiet = live && !empty && (lastAt == null || input.now - lastAt > SPARK_QUIET_MS)
+  return { window, t0, t1: t0 + n * bucketMs, bucketMs, buckets, capPerMin, capInScale, peakPerMin: peak, yMax, total, denied, lastAt, empty, quiet }
+}
+
+// ---------------------------------------------------------------- state-aware run hero ([U4])
+
+export type HeroActionId = 'raise_budget' | 'resume' | 'show_failed' | 'approve' | 'inspect'
+
+export interface RunHeroModel {
+  lifecycle: RunLifecycle
+  tone: LifecycleTone
+  title: string
+  detail: string
+  /** The single filled call to action, when the state needs the operator. */
+  primary: { id: HeroActionId; label: string } | null
+  /** A quiet link-style follow-up (never filled). */
+  secondary: { id: HeroActionId; label: string } | null
+}
+
+/** "Awaiting approval — discovery consent" / "— scope review": shared by the hero and the consent sheet. */
+export function awaitingApprovalTitle(phase: string): string {
+  const label = runLifecycleMeta.awaiting_approval.label
+  return phase === 'consent' ? `${label} — discovery consent` : phase === 'review' ? `${label} — scope review` : label
+}
+
+const grouped = (n: number) => Number.isFinite(n) ? Math.round(n).toLocaleString('en-US') : '0'
+const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
+const workersWord = (n: number) => `${grouped(n)} ${n === 1 ? 'worker' : 'workers'}`
+
+/**
+ * One hero per run state, replacing the budget banner, the "Provisional summary · As of <now>"
+ * eyebrow and the duplicate header primaries. Exactly one primary when the state is actionable.
+ */
+export function deriveRunHero(input: {
+  status: string
+  phase: string
+  roundNo: number
+  spentUsd: number
+  budgetUsd: number
+  spentRequests: number
+  budgetRequests: number
+  workers: readonly { status: string; outcome?: string | null }[]
+  endedAt: number
+  liveSummary?: string
+  reportLabel?: string | null
+  context?: readonly (string | null | undefined | false)[]
+  fmtWhen: (ms: number) => string
+}): RunHeroModel {
+  const lifecycle = runLifecycleOf(input.status)
+  const tone = runLifecycleMeta[lifecycle].tone
+  const failed = input.workers.filter(w => w.status === 'failed')
+  const parked = input.workers.filter(w => w.status === 'paused' || w.status === 'waiting_approval').length
+  const running = input.workers.filter(w => w.status === 'running').length
+  const ctx = (extra: readonly (string | null | undefined | false)[]) => [...extra, ...(input.context ?? [])].filter(Boolean).join(' · ')
+  const phase = PHASE_LABEL[input.phase] ?? (input.phase ? capF(input.phase.replace(/_/g, ' ')) : 'Running')
+  const showFailed = failed.length > 0 ? { id: 'show_failed' as const, label: failed.length === 1 ? 'Show failed worker' : 'Show failed workers' } : null
+  const base = { lifecycle, tone }
+  switch (lifecycle) {
+    case 'awaiting_approval': {
+      const consent = input.phase === 'consent'
+      return {
+        ...base,
+        title: awaitingApprovalTitle(input.phase),
+        detail: consent
+          ? 'Nothing has been sent yet. Approve discovery to map the project seeds.'
+          : 'Approve the hosts, mode and budget to start testing.',
+        primary: { id: 'approve', label: 'Approve & start' },
+        secondary: null,
+      }
+    }
+    case 'running':
+      return {
+        ...base,
+        title: `Running — ${phase}`,
+        detail: ctx([input.liveSummary || `Round ${grouped(input.roundNo)}`, failed.length > 0 && `${workersWord(failed.length)} failed`]),
+        primary: null,
+        secondary: showFailed ?? (running > 0 ? { id: 'inspect', label: 'Inspect' } : null),
+      }
+    case 'paused': {
+      if (input.status === 'budget_paused') {
+        const reqHit = input.budgetRequests > 0 && input.spentRequests >= input.budgetRequests
+        const usdHit = input.budgetUsd > 0 && input.spentUsd >= input.budgetUsd
+        const title = reqHit
+          ? `Paused at request budget — ${grouped(input.spentRequests)} / ${grouped(input.budgetRequests)}`
+          : usdHit
+            ? `Paused at spend budget — ${usd.format(input.spentUsd)} / ${usd.format(input.budgetUsd)}`
+            : 'Paused at budget'
+        return { ...base, title, detail: ctx(['Partial report saved', 'raise the cap to resume where testing stopped']), primary: { id: 'raise_budget', label: 'Raise budget' }, secondary: null }
+      }
+      return {
+        ...base,
+        title: 'Paused — ready to resume',
+        detail: ctx([parked > 0 && `${workersWord(parked)} parked`, `Round ${grouped(input.roundNo)}`]),
+        primary: input.phase === 'complete' ? null : { id: 'resume', label: 'Resume' },
+        secondary: showFailed,
+      }
+    }
+    case 'failed': {
+      const reason = failed.map(w => stripFailurePrefix(w.outcome)).find(Boolean)
+      return {
+        ...base,
+        title: failed.length > 0 ? `Failed — ${workersWord(failed.length)} exited` : 'Failed — the run stopped on an error',
+        detail: ctx([reason ? firstSentence(reason) : null, input.reportLabel]),
+        primary: showFailed,
+        secondary: null,
+      }
+    }
+    case 'stopped':
+      return { ...base, title: `Stopped ${input.fmtWhen(input.endedAt)}`, detail: ctx([input.reportLabel ?? 'No report saved']), primary: null, secondary: showFailed }
+    case 'complete':
+      return { ...base, title: `Complete — finished ${input.fmtWhen(input.endedAt)}`, detail: ctx([input.reportLabel]), primary: null, secondary: null }
+    default: {
+      const never: never = lifecycle
+      return never
     }
   }
-  if (!Number.isFinite(t0)) { t0 = m.base; tEnd = m.end }
-  const span = Math.max(1, tEnd - t0)
-  const out = Array.from({ length: bins }, () => [0, 0] as [number, number])
-  const put = (t: number, k: 0 | 1) => { out[Math.min(bins - 1, Math.max(0, Math.floor((t - t0) / span * bins)))][k]++ }
-  for (const t of ok) put(t, 0)
-  for (const t of denied) put(t, 1)
-  let max = 1
-  for (const b of out) if (b[0] + b[1] > max) max = b[0] + b[1]
-  return { bins: out, t0, t1: tEnd, max }
+}
+
+// ---------------------------------------------------------------- worker triage ([U6])
+
+/** Outcome text without the redundant "Worker failed:" lead-in. */
+const stripFailurePrefix = (outcome: string | null | undefined) => String(outcome ?? '').replace(/^\s*worker failed:\s*/i, '').trim()
+
+/** Active-now rows shown before the "Show all {n}" toggle. */
+export const ACTIVE_NOW_CAP = 6
+
+export type AttentionKind = 'failed' | 'approval' | 'stalled'
+
+export interface AttentionGroup {
+  key: string
+  kind: AttentionKind
+  /** Normalised failure signature shared by every member ("Upstream model endpoint returned 503"). */
+  signature: string
+  /** One-line reason shown on the lane row. */
+  reason: string
+  workers: Assignment[]
+}
+
+/**
+ * Failure signature: the first sentence of the outcome with volatile tokens (ids, hex, numbers
+ * other than HTTP-like status codes, URLs, quoted values) folded, so five workers that failed on the
+ * same upstream timeout group as one "×5" row instead of five.
+ */
+export function failureSignature(outcome: string | null | undefined): string {
+  const first = firstSentence(stripFailurePrefix(outcome)).replace(/\.$/, '').trim()
+  if (!first) return 'Worker exited without a recorded reason'
+  const folded = first
+    .replace(/https?:\/\/\S+/gi, '<url>')
+    .replace(/(["'`]).*?\1/g, '…')
+    .replace(/\b[0-9a-f]{8,}\b/gi, '<id>')
+    .replace(/\b(?![1-5]\d\d\b)\d[\d,._:]*(ms|s|m|h|kb|mb|gb)?\b/gi, (_m, unit: string | undefined) => 'N' + (unit ?? ''))
+    .replace(/\s+/g, ' ')
+  return capF(folded.length > 96 ? folded.slice(0, 95).trimEnd() + '…' : folded)
+}
+
+/**
+ * Failure-first triage lane: failed workers grouped by signature, workers waiting on an approval,
+ * and stalled workers (paused while the run itself is running). Returns the member ids so the
+ * phase groups below can exclude them (each worker is listed exactly once).
+ */
+export function buildAttentionLane(workers: readonly Assignment[], runStatus: string): { groups: AttentionGroup[]; ids: Set<string> } {
+  const runLive = runLifecycleOf(runStatus) === 'running'
+  const terminal = !runLifecycleMeta[runLifecycleOf(runStatus)].live
+  const by = new Map<string, AttentionGroup>()
+  const add = (kind: AttentionKind, signature: string, reason: string, a: Assignment) => {
+    const key = kind + ':' + signature
+    const g = by.get(key)
+    if (g) g.workers.push(a)
+    else by.set(key, { key, kind, signature, reason, workers: [a] })
+  }
+  for (const a of workers) {
+    if (a.status === 'failed') {
+      const sig = failureSignature(a.outcome)
+      add('failed', sig, sig, a)
+    } else if (!terminal && a.status === 'waiting_approval') {
+      add('approval', 'approval', 'Waiting for an operator approval decision', a)
+    } else if (runLive && a.status === 'paused') {
+      add('stalled', 'stalled', 'Paused while the run is still running', a)
+    }
+  }
+  const rank: Record<AttentionKind, number> = { failed: 0, approval: 1, stalled: 2 }
+  const groups = [...by.values()].sort((x, y) => rank[x.kind] - rank[y.kind] || y.workers.length - x.workers.length || x.signature.localeCompare(y.signature))
+  for (const g of groups) g.workers.sort((x, y) => x.createdAt - y.createdAt)
+  return { groups, ids: new Set(groups.flatMap(g => g.workers.map(a => a.id))) }
+}
+
+/** Active-now rows: the first `cap` unless expanded, plus how many are folded behind "Show all". */
+export function capActiveNow<T>(items: readonly T[], showAll: boolean, cap = ACTIVE_NOW_CAP): { shown: T[]; hidden: number } {
+  if (showAll || items.length <= cap) return { shown: items.slice(), hidden: 0 }
+  return { shown: items.slice(0, cap), hidden: items.length - cap }
+}
+
+// ---------------------------------------------------------------- turn timeline rail ([U6])
+
+export type ToolStatus = 'ok' | 'error' | 'finding' | 'pending'
+export type TurnFilter = 'all' | 'errors' | 'findings' | 'slow'
+export const SLOW_TURN_MS = 10_000
+
+export interface TimelineTurnInput {
+  turn: number
+  durationMs?: number
+  tools: readonly { id: string; status: ToolStatus; durationMs?: number }[]
+}
+
+export interface TimelineRow {
+  turn: number
+  /** Bar width as a share of the slowest turn (equal ticks when durations are absent). */
+  width: number
+  durationMs: number | null
+  segments: { id: string; status: ToolStatus; share: number }[]
+  errors: number
+  findings: number
+  slow: boolean
+}
+
+/**
+ * One rail row per turn with a proportional duration bar whose segments are the turn's tool calls
+ * coloured by outcome. Missing durations fall back to equal ticks, so the rail never collapses.
+ */
+export function buildTurnTimeline(turns: readonly TimelineTurnInput[]): { rows: TimelineRow[]; counts: Record<TurnFilter, number>; proportional: boolean } {
+  const dur = (t: TimelineTurnInput) => {
+    if (typeof t.durationMs === 'number' && Number.isFinite(t.durationMs) && t.durationMs >= 0) return t.durationMs
+    const sum = t.tools.reduce((s, x) => s + (typeof x.durationMs === 'number' && Number.isFinite(x.durationMs) ? Math.max(0, x.durationMs) : 0), 0)
+    return sum > 0 ? sum : null
+  }
+  const ds = turns.map(dur)
+  const proportional = ds.some(d => d != null && d > 0)
+  const maxD = Math.max(1, ...ds.map(d => d ?? 0))
+  const rows = turns.map((t, i): TimelineRow => {
+    const d = ds[i] ?? null
+    const known = t.tools.map(x => (typeof x.durationMs === 'number' && Number.isFinite(x.durationMs) ? Math.max(0, x.durationMs) : 0))
+    const knownSum = known.reduce((a, b) => a + b, 0)
+    const segments = t.tools.map((x, k) => ({ id: x.id, status: x.status, share: knownSum > 0 ? known[k]! / knownSum : 1 / Math.max(1, t.tools.length) }))
+    return {
+      turn: t.turn,
+      width: proportional ? Math.max(0.04, (d ?? 0) / maxD) : 1,
+      durationMs: d,
+      segments,
+      errors: t.tools.filter(x => x.status === 'error').length,
+      findings: t.tools.filter(x => x.status === 'finding').length,
+      slow: d != null && d > SLOW_TURN_MS,
+    }
+  })
+  const counts: Record<TurnFilter, number> = {
+    all: rows.length,
+    errors: rows.filter(r => r.errors > 0).length,
+    findings: rows.filter(r => r.findings > 0).length,
+    slow: rows.filter(r => r.slow).length,
+  }
+  return { rows, counts, proportional }
+}
+
+export function matchesTurnFilter(row: Pick<TimelineRow, 'errors' | 'findings' | 'slow'>, filter: TurnFilter): boolean {
+  return filter === 'all' || (filter === 'errors' ? row.errors > 0 : filter === 'findings' ? row.findings > 0 : row.slow)
+}
+
+/** Successful tool calls collapse to one line; errors and findings open by default. */
+export const toolOpenByDefault = (status: ToolStatus) => status === 'error' || status === 'finding'
+
+/** Window a long trace: render only rows near the viewport once a trace passes `threshold` turns. */
+export const TRACE_WINDOW_THRESHOLD = 40
+export function traceWindow(total: number, firstVisible: number, opts: { threshold?: number; size?: number; overscan?: number } = {}): { start: number; end: number; windowed: boolean } {
+  const threshold = opts.threshold ?? TRACE_WINDOW_THRESHOLD
+  if (total <= threshold) return { start: 0, end: total, windowed: false }
+  const size = opts.size ?? 24
+  const over = opts.overscan ?? 8
+  const start = Math.max(0, Math.min(total - 1, firstVisible) - over)
+  return { start, end: Math.min(total, start + size + over * 2), windowed: true }
 }
 
 /** Aggregate status of a group of workers (paused/waiting beats running beats failed beats complete). */

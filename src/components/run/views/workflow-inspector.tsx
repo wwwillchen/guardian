@@ -1,6 +1,9 @@
 // Workflow inspectors (Agent W): worker (summary · transcript · evidence),
-// stack, queued steps, single chain step, and memory summary digest.
-import { useEffect, useMemo, useState } from 'react'
+// stack, queued steps, single chain step, and memory summary digest. The transcript
+// pairs a turn timeline rail (proportional duration bars, tool outcome segments,
+// All · Errors · Findings · Slow >10s filters, click-to-jump) with the trace, where
+// successful tool calls collapse to one line and errors/findings open by default.
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { readGraphDigest, readWorkerSessionAction } from '../../../actions.ts'
 import type { WorkerSessionData } from '../../../server/worker-session-reader.ts'
@@ -23,10 +26,11 @@ import type { Round0HostSignal, Round0PipelineState, Round0PipelineStep, Round0S
 import { LiveGlyph, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { normFStatus, PHASE_LABEL, prettyCat, stLabel } from '../meta.ts'
-import { aggStatus } from '../model.ts'
-import type { Assignment, ChainStep, Fact, FindingRow } from '../model.ts'
+import { aggStatus, buildTurnTimeline, matchesTurnFilter, toolOpenByDefault, traceWindow } from '../model.ts'
+import type { Assignment, ChainStep, Fact, FindingRow, TimelineRow, ToolStatus, TurnFilter } from '../model.ts'
 import { Meter } from '../motion.tsx'
 import { useLinks, useNav, useViewState } from '../nav.tsx'
+import { Num } from '../num.tsx'
 import { ExchangeLink, PaneBody, PaneFooter, PaneHeader } from '../pane.tsx'
 import type { InspectorProps } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
@@ -154,7 +158,6 @@ function useWorkerSession(runId: string, a: Assignment | undefined): SessionStat
 
 function Transcript({ a, s }: { a: Assignment; s: SessionState }) {
   const model = useRunModel()
-  const [open, setOpen] = useState<Record<string, boolean>>({})
   const turns = s.data?.turns ?? []
   if (s.loading && !turns.length) return <div className={WF_LOAD}><span className={WF_SPIN} />Loading the durable session…</div>
   if (!turns.length) {
@@ -176,49 +179,166 @@ function Transcript({ a, s }: { a: Assignment; s: SessionState }) {
         ? `${plural(a.turnsUsed, 'turn')} ran, but no durable transcript was recorded.`
         : 'No durable session transcript was recorded for this worker.'}</p>
   }
-  return <div className="flex flex-col pt-1">
-    {turns.map(t => <div key={t.turn} className="border-b border-line pb-2.5 pt-3 last:border-b-0">
-      <div className="mb-1.5 flex items-center gap-2 text-[11.5px] text-fg-subtle">
-        <span className="font-semibold capitalize text-fg-muted">Turn {t.turn}</span>
-        {t.durationMs != null && <span className="tabular-nums">{(t.durationMs / 1000).toFixed(1)}s</span>}
-        <span className="flex-1" />
-        {t.timestamp != null && <span className="font-mono text-[11.5px]">{fmtRel(t.timestamp, model.base)}</span>}
-      </div>
-      {t.thinking && <p className="m-0 mb-2 whitespace-pre-wrap break-words border-l-2 border-line-2 pl-2.5 text-[12px] leading-[18px] text-fg-subtle">{t.thinking}</p>}
-      {t.text && t.text !== a.outcome && <p className="m-0 mb-2 whitespace-pre-wrap break-words text-[12.5px] leading-[19px] text-fg">{t.text}</p>}
-      {t.tools.map(tc => {
-        const k = t.turn + ':' + tc.id
-        return <div
-          key={tc.id}
+  return <TurnTrace a={a} turns={turns} loading={s.loading} />
+}
+
+type SessionTurn = WorkerSessionData['turns'][number]
+const TURN_FILTERS: [TurnFilter, string][] = [['all', 'All'], ['errors', 'Errors'], ['findings', 'Findings'], ['slow', 'Slow >10s']]
+const SEG_BG: Record<ToolStatus, string> = { ok: 'bg-ok', error: 'bg-danger', finding: 'bg-accent', pending: 'bg-warn' }
+/** Sticky offset under the worker tablist (h-6 + py-2 + 1px border). */
+const TRACE_STICKY = 'top-[41px]'
+
+const fmtSecs = (ms: number | null) => (ms == null ? 'no timing' : ms < 1000 ? `${fmtN(Math.round(ms))} ms` : `${(ms / 1000).toFixed(1)}s`)
+
+/** Timeline rail + filtered, windowed trace for a worker session. */
+function TurnTrace({ a, turns, loading }: { a: Assignment; turns: readonly SessionTurn[]; loading: boolean }) {
+  const model = useRunModel()
+  const [filter, setFilter] = useViewState<TurnFilter>('wf.turnFilter', 'all')
+  const [open, setOpen] = useState<Record<string, boolean>>({})
+  const [anchor, setAnchor] = useState(0)
+  const [focusTurn, setFocusTurn] = useState<number | null>(null)
+  const refs = useRef(new Map<number, HTMLDivElement>())
+  const timeline = useMemo(() => buildTurnTimeline(turns), [turns])
+  const visible = useMemo(() => timeline.rows.map((row, i) => ({ row, t: turns[i]! })).filter(x => matchesTurnFilter(x.row, filter)), [timeline, turns, filter])
+  const win = traceWindow(visible.length, anchor)
+  const shown = visible.slice(win.start, win.end)
+  useEffect(() => { setAnchor(0) }, [filter])
+  const jump = (turn: number) => {
+    const idx = visible.findIndex(x => x.t.turn === turn)
+    if (idx < 0) return
+    setFocusTurn(turn)
+    if (idx < win.start || idx >= win.end) setAnchor(idx)
+    requestAnimationFrame(() => refs.current.get(turn)?.scrollIntoView({ block: 'start', behavior: 'auto' }))
+  }
+  const shift = (delta: number) => setAnchor(i => Math.max(0, Math.min(visible.length - 1, i + delta)))
+  return <div className="pt-2" data-testid="turn-trace">
+    <div className="mb-2 flex flex-wrap items-center gap-1" role="group" aria-label="Filter turns">
+      {TURN_FILTERS.map(([k, label]) => {
+        const on = filter === k
+        const n = timeline.counts[k]
+        return <button
+          key={k}
+          type="button"
+          aria-pressed={on}
+          data-turn-filter={k}
+          disabled={k !== 'all' && n === 0}
           className={cn(
-            'mt-1.5 rounded-[7px] px-[9px] pb-2 pt-[7px]',
-            tc.status === 'finding'
-              ? 'bg-panel shadow-[inset_0_0_0_1px_var(--line-strong)]'
-              : tc.status === 'error'
-                ? 'bg-sunk shadow-[inset_0_0_0_1px_var(--bad-line,var(--line-strong))]'
-                : 'bg-sunk shadow-[inset_0_0_0_1px_var(--line)]',
+            'inline-flex h-auto min-h-[22px] cursor-pointer items-center gap-1 whitespace-normal rounded-full border px-2 py-0.5 font-sans text-[11.5px] font-medium shadow-none transition-colors duration-[var(--d1)] disabled:cursor-default disabled:opacity-45',
+            on ? 'border-accent-line bg-accent-soft text-accent' : 'border-line bg-transparent text-fg-muted hover:bg-hover hover:text-fg',
           )}
+          onClick={() => setFilter(k)}
         >
-          <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-fg-subtle" data-tool-head="">
-            <Icon name={tc.status === 'finding' ? 'findings' : tc.status === 'error' ? 'alert' : 'node'} size={12} className="flex-none" />
-            <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] font-medium text-fg" title={tc.name}>{tc.name}</span>
-            <span className={cn(
-              'flex-none text-[11px]',
-              tc.status === 'error' ? 'text-danger' : tc.status === 'finding' ? 'font-medium text-fg' : tc.status === 'pending' ? 'text-warn' : 'text-fg-subtle',
-            )}>{tc.status}</span>
-            {tc.durationMs != null && <span className="flex-none tabular-nums">{fmtN(tc.durationMs)} ms</span>}
-          </div>
-          {tc.argsPreview && <div className="my-1 mb-0.5 line-clamp-3 break-all font-mono text-[11px] leading-4 text-fg-muted">{tc.argsPreview}</div>}
-          {tc.resultPreview && <>
-            <button type="button" className={cn(WF_CHIP, 'mt-[5px]')} onClick={() => setOpen(o => ({ ...o, [k]: !o[k] }))} aria-expanded={!!open[k]}>
-              {open[k] ? 'Hide result' : 'Show result'}<Icon name={open[k] ? 'chevU' : 'chevD'} size={10} />
-            </button>
-            {open[k] && <pre className={WF_PRE_JSON}>{tc.resultPreview}</pre>}
-          </>}
-        </div>
+          {label}<span className={cn('tabular-nums', on ? 'text-accent/80' : 'text-fg-subtle')}>{fmtN(n)}</span>
+        </button>
       })}
-    </div>)}
-    {s.loading && <div className={WF_LOAD}><span className={WF_SPIN} />Refreshing…</div>}
+    </div>
+    <div className="grid grid-cols-[96px_minmax(0,1fr)] gap-3">
+      <nav className={cn('sticky self-start', TRACE_STICKY)} aria-label="Turn timeline" data-testid="turn-timeline">
+        <ol className="m-0 flex max-h-[calc(100vh-220px)] list-none flex-col gap-px overflow-y-auto p-0 pr-0.5">
+          {timeline.rows.map(row => {
+            const dim = !matchesTurnFilter(row, filter)
+            return <li key={row.turn}>
+              <TimelineRailRow row={row} dim={dim} current={focusTurn === row.turn} proportional={timeline.proportional} onJump={() => jump(row.turn)} />
+            </li>
+          })}
+        </ol>
+      </nav>
+      <div className="min-w-0" data-testid="turn-list" data-windowed={win.windowed || undefined}>
+        {win.start > 0 && <button type="button" className={cn(WF_CHIP, 'mb-1 h-auto whitespace-normal py-0.5 shadow-none')} onClick={() => shift(-24)}>
+          Show earlier turns ({fmtN(win.start)})
+        </button>}
+        {shown.map(({ t, row }) => <div
+          key={t.turn}
+          ref={el => { if (el) refs.current.set(t.turn, el); else refs.current.delete(t.turn) }}
+          className={cn('scroll-mt-[44px] border-b border-line pb-2.5 last:border-b-0', focusTurn === t.turn && 'bg-accent-soft/25')}
+          data-turn={t.turn}
+        >
+          <div className={cn('sticky z-[1] -mx-1 mb-1 flex items-center gap-2 bg-panel px-1 pb-1 pt-2.5 text-[11.5px] text-fg-subtle', TRACE_STICKY)} data-turn-head="">
+            <span className="font-semibold capitalize text-fg-muted">Turn {t.turn}</span>
+            {row.durationMs != null && <span className={cn('tabular-nums', row.slow && 'font-medium text-warn')}>{fmtSecs(row.durationMs)}</span>}
+            {row.errors > 0 && <span className="text-danger">{plural(row.errors, 'error')}</span>}
+            {row.findings > 0 && <span className="font-medium text-fg">{plural(row.findings, 'finding')}</span>}
+            <span className="flex-1" />
+            {t.timestamp != null && <span className="font-mono text-[11.5px]">{fmtRel(t.timestamp, model.base)}</span>}
+          </div>
+          {t.thinking && <p className="m-0 mb-2 whitespace-pre-wrap break-words border-l-2 border-line-2 pl-2.5 text-[12px] leading-[18px] text-fg-subtle">{t.thinking}</p>}
+          {t.text && t.text !== a.outcome && <p className="m-0 mb-2 whitespace-pre-wrap break-words text-[12.5px] leading-[19px] text-fg">{t.text}</p>}
+          {t.tools.map(tc => {
+            const k = t.turn + ':' + tc.id
+            const isOpen = open[k] ?? toolOpenByDefault(tc.status)
+            return <ToolCallBlock key={tc.id} tc={tc} open={isOpen} onToggle={() => setOpen(o => ({ ...o, [k]: !isOpen }))} />
+          })}
+        </div>)}
+        {win.end < visible.length && <button type="button" className={cn(WF_CHIP, 'mt-1 h-auto whitespace-normal py-0.5 shadow-none')} onClick={() => shift(24)}>
+          Show later turns ({fmtN(visible.length - win.end)})
+        </button>}
+        {!visible.length && <p className={WF_NONE}>No turns match this filter.</p>}
+        {loading && <div className={WF_LOAD}><span className={WF_SPIN} />Refreshing…</div>}
+      </div>
+    </div>
+  </div>
+}
+
+/** One rail row: turn number + proportional duration bar split into tool-outcome segments. */
+function TimelineRailRow({ row, dim, current, proportional, onJump }: { row: TimelineRow; dim: boolean; current: boolean; proportional: boolean; onJump: () => void }) {
+  const tip = [`Turn ${row.turn}`, fmtSecs(row.durationMs), row.errors ? plural(row.errors, 'error') : null, row.findings ? plural(row.findings, 'finding') : null, row.slow ? 'slow (>10s)' : null].filter(Boolean).join(' · ')
+  return <button
+    type="button"
+    className={cn(
+      'flex h-auto min-h-[18px] w-full cursor-pointer items-center gap-1.5 whitespace-normal rounded-[4px] border-0 bg-transparent px-1 py-0.5 text-left font-sans shadow-none transition-[background-color,opacity] duration-[var(--d1)] hover:bg-hover',
+      current && 'bg-press hover:bg-press',
+      dim && 'opacity-35',
+    )}
+    title={tip}
+    aria-label={tip}
+    data-rail-turn={row.turn}
+    onClick={onJump}
+  >
+    <span className="w-[3ch] flex-none text-right text-[10.5px] tabular-nums text-fg-subtle">{row.turn}</span>
+    <span className="relative h-1.5 min-w-0 flex-1 rounded-[2px] bg-line" aria-hidden="true">
+      <span className="absolute inset-y-0 left-0 flex overflow-hidden rounded-[2px]" style={{ width: `${Math.round(row.width * 1000) / 10}%` }} data-rail-bar="" data-proportional={proportional || undefined}>
+        {row.segments.length
+          ? row.segments.map(sg => <i key={sg.id} className={cn('block h-full border-r border-panel last:border-r-0', SEG_BG[sg.status])} style={{ flex: Math.max(0.05, sg.share) }} data-seg={sg.status} />)
+          : <i className="block h-full flex-1 bg-fg-subtle" data-seg="text" />}
+      </span>
+    </span>
+  </button>
+}
+
+/** A tool call: one-line head (click to expand); errors and findings open by default. */
+function ToolCallBlock({ tc, open, onToggle }: { tc: SessionTurn['tools'][number]; open: boolean; onToggle: () => void }) {
+  return <div
+    className={cn(
+      'mt-1.5 rounded-[7px]',
+      tc.status === 'finding'
+        ? 'bg-panel shadow-[inset_0_0_0_1px_var(--line-strong)]'
+        : tc.status === 'error'
+          ? 'bg-sunk shadow-[inset_0_0_0_1px_var(--bad-line,var(--line-strong))]'
+          : 'bg-sunk shadow-[inset_0_0_0_1px_var(--line)]',
+    )}
+    data-tool-status={tc.status}
+    data-tool-open={open || undefined}
+  >
+    <button
+      type="button"
+      className="flex h-auto min-h-[26px] w-full min-w-0 cursor-pointer items-center gap-1.5 whitespace-normal rounded-[7px] border-0 bg-transparent px-[9px] py-1 text-left font-sans text-[11.5px] font-normal text-fg-subtle shadow-none hover:bg-hover"
+      aria-expanded={open}
+      onClick={onToggle}
+      data-tool-head=""
+    >
+      <Icon name={tc.status === 'finding' ? 'findings' : tc.status === 'error' ? 'alert' : 'node'} size={12} className="flex-none" />
+      <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] font-medium text-fg" title={tc.name}>{tc.name}</span>
+      <span className={cn(
+        'flex-none text-[11px]',
+        tc.status === 'error' ? 'text-danger' : tc.status === 'finding' ? 'font-medium text-fg' : tc.status === 'pending' ? 'text-warn' : 'text-fg-subtle',
+      )}>{tc.status}</span>
+      {tc.durationMs != null && <Num value={tc.durationMs} kind="ms" className="flex-none" />}
+      <Icon name={open ? 'chevU' : 'chevD'} size={10} className="flex-none" />
+    </button>
+    {open && <div className="px-[9px] pb-2">
+      {tc.argsPreview && <div className="mb-0.5 line-clamp-3 break-all font-mono text-[11px] leading-4 text-fg-muted">{tc.argsPreview}</div>}
+      {tc.resultPreview ? <pre className={WF_PRE_JSON}>{tc.resultPreview}</pre> : !tc.argsPreview && <p className="m-0 text-[11.5px] text-fg-subtle">No arguments or result recorded.</p>}
+    </div>}
   </div>
 }
 

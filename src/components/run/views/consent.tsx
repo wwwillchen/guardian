@@ -3,18 +3,21 @@
 import { Link } from '@tanstack/react-router'
 import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { canReviewScope, maxBudgetRequests, maxRpsPerOriginCeiling, maxScopeHosts } from '../../../domain.ts'
+import { canApproveDiscovery, canReviewScope, maxBudgetRequests, maxRpsPerOriginCeiling, maxScopeHosts } from '../../../domain.ts'
 import type { ApprovalPolicy, CapabilityTier } from '../../../domain.ts'
-import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
+import { approvalPolicyMeta, capabilityTierMeta, runModeMeta, runModeOf } from '../../run-state.ts'
+import type { RunMode } from '../../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../../ui/dialog.tsx'
 import { useRun } from '../data.tsx'
 import type { Command } from '../data.tsx'
 import { Kbd } from '../display.tsx'
 import { fmtN, fmtUsd, host, plural, words } from '../format.ts'
 import { StatusGlyph } from '../glyphs.tsx'
+import { PhaseTrack } from '../header.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
 import { PHASE_LABEL, runStatusLabel } from '../meta.ts'
+import { awaitingApprovalTitle } from '../model.ts'
 import { useOverlays } from '../overlays.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, RW } from '../tw.ts'
@@ -39,18 +42,18 @@ export function isCustomRunGoal(goal: string | null | undefined): boolean {
   return trimmed.length > 0 && !DEFAULT_SCAN_MODE_GOALS.has(trimmed)
 }
 
-type ScanModeKey = 'passive' | 'supervised' | 'autonomous'
+type ScanModeKey = Exclude<RunMode, 'offline'>
 
+// Option text is the long form of the canonical run mode (`runModeMeta[key].scanLabel`).
 const SCAN_MODE_OPTIONS: readonly { key: ScanModeKey; label: string; summary: string }[] = [
-  { key: 'passive', label: 'Passive Scan', summary: 'Read-only checks (plus bound test accounts); never mutates state.' },
-  { key: 'supervised', label: 'Supervised Scan', summary: 'Safe active checks automatically; pauses for approval before risky writes.' },
-  { key: 'autonomous', label: 'Autonomous Scan', summary: 'All in-scope active probes automatically with hard safety guardrails enforced.' },
+  { key: 'passive', label: 'Passive Scan', summary: runModeMeta.passive.summary },
+  { key: 'supervised', label: 'Supervised Scan', summary: runModeMeta.supervised.summary },
+  { key: 'autonomous', label: 'Autonomous Scan', summary: runModeMeta.autonomous.summary },
 ]
 
 function draftScanMode(d: { capabilityTier: CapabilityTier; approvalPolicy: ApprovalPolicy }): ScanModeKey {
-  if (d.capabilityTier === 3 && d.approvalPolicy === 'yolo') return 'autonomous'
-  if (d.capabilityTier === 3) return 'supervised'
-  return 'passive'
+  const mode = runModeOf(d)
+  return mode === 'offline' ? 'passive' : mode
 }
 
 /** Compact live summary shown on the left of the sticky Scope Review action bar. */
@@ -859,14 +862,6 @@ function ScopeCard({
   </div>
 }
 
-const STEPS: [string, string][] = [
-  ['Consent', 'Approve hosts, mode, and budget.'],
-  ['Threat model', 'Rank hosts by attack surface.'],
-  ['Investigation', 'Workers test through the safety proxy.'],
-  ['Verification', 'Automated replay confirms every finding.'],
-  ['Report', 'Findings, coverage, and gaps.'],
-]
-
 /** Why "Approve & start" is unavailable, or null when the only blocker is an in-flight approval. */
 export function approveBlockReason(input: {
   reviewable: boolean
@@ -887,26 +882,6 @@ export function approveBlockReason(input: {
     ].filter(Boolean).join(' ')
   }
   return null
-}
-
-/** Assessment track: a continuous segment per step, the current step marked for AT (A-141). */
-function ConsentStepper() {
-  return <ol className="m-0 mt-5 grid list-none grid-cols-5 border-t border-line p-0" aria-label="Assessment steps" data-testid="consent-stepper">
-    {STEPS.map((s, i) => {
-      const cur = i === 0
-      return <li
-        key={s[0]}
-        aria-current={cur ? 'step' : undefined}
-        className={cn(
-          'relative pr-3 pt-2.5 text-[12px] leading-[17px] text-fg-subtle before:absolute before:-top-px before:left-0 before:right-3 before:h-0.5 before:content-[""]',
-          cur ? 'before:bg-accent' : 'before:bg-line-2',
-        )}
-      >
-        <b className={cn('mb-0.5 block font-medium', cur ? 'text-fg' : 'text-fg-muted')}>{s[0]}</b>
-        {s[1]}
-      </li>
-    })}
-  </ol>
 }
 
 /** Overview for a waiting run: "Nothing has been sent yet." */
@@ -946,7 +921,8 @@ export function ConsentView() {
   const nw = (r.goal || '').split(/\s+/).filter(Boolean).length
   const count = discovery ? hosts.length : draft.assetIds.length
   const overLimit = draft.assetIds.length > maxScopeHosts
-  const reviewable = canReviewScope(r.phase, r.status)
+  // Discovery consent and scope review are separate server guards (`discover` vs `scope`).
+  const reviewable = discovery ? canApproveDiscovery(r.phase, r.status) : canReviewScope(r.phase, r.status)
   const canApprove = !approving && reviewable && (discovery || (count > 0 && !overLimit))
   // A disabled "Approve & start" always says why, in the sticky bar and on the button (A-140).
   const footerNote = approveBlockReason({ reviewable, discovery, count, overLimit, phase: r.phase, status: r.status })
@@ -969,7 +945,7 @@ export function ConsentView() {
   }
   useShortcuts([{ key: 'a', run: () => { if (!canApprove) return false; void approve() } }])
 
-  const eyebrow = r.phase === 'review' ? 'Waiting on your scope approval' : 'Waiting on your consent'
+  const eyebrow = awaitingApprovalTitle(r.phase)
   const customGoal = isCustomRunGoal(r.goal) ? r.goal.trim() : null
   const stickySummary = consentStickySummary({
     discovery,
@@ -1011,13 +987,13 @@ export function ConsentView() {
         <Icon name="alert" className="mt-[2px] flex-none text-warn" />
         <div>This goal is {words(nw)} word{nw === 1 ? '' : 's'} long. The coordinator will plan broadly across all {plural(count, 'host')}. Sharpen it in the coordinator chat to focus the {fmtUsd(draft.budgetUsd)} budget.</div>
       </div>}
+      <PhaseTrack phase={r.phase} variant="stepper" className="mb-4" />
       <ScopeCard
         editing={editing}
         draft={draft}
         setDraft={setDraft}
         onHostsTouched={() => setUserTouchedHosts(true)}
       />
-      <ConsentStepper />
       <LabPanel className="mt-5 border-t border-line" />
     </div>
 
