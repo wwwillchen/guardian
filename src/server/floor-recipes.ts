@@ -2548,12 +2548,12 @@ export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
   { specKind: 'http_chain', vulnClasses: ['mass_assignment', 'workflow_bypass', 'business_logic', 'price_tampering', 'csrf'], recipe: 'persisted_mutation', note: 'Tier-1 state_delta_and_conservation: signed baseline/final readbacks bracket the probe write, and a probe-only body value must be newly persisted (control-write values may not leak).' },
   { specKind: 'http_chain', vulnClasses: ['info_disclosure', 'secret_disclosure', 'disclosure'], recipe: 'disclosure', note: 'Tier-1 access_differential: an authenticated same-route peer is denied while the probe is served a substantive, unmasked, non-own-tenant payload.' },
   { specKind: 'http_chain', vulnClasses: ['xxe', 'ssrf', 'webhook_forgery'], recipe: 'oob_callback', note: 'Tier-1 oob_and_execution_witness: the host canary relay observes the probe canary on an independent channel; the benign control canary must stay silent.' },
+  { specKind: 'http_chain', vulnClasses: ['sqli', 'injection'], recipe: 'injection_fingerprint', note: 'Track D Cut 2: structural engine/parser error differentials (quote-terminated arm vs benign control) run the typed injection_fingerprint recipe; the benign control must not produce the same fingerprint. Confirmation owns a ProofReceipt, never a jq error chain.' },
 ]
 
 /**
  * Rows whose recipe exists but that stay on the legacy verifier for a measured reason. Empty since
- * Track D Cut 1: every active floor spec kind is wired and gated by a Track A2 Tier-1 primitive
- * (`executeFloorRecipeById`). Kept exported (typed) so Cut 2 callers/tests stay source-compatible.
+ * Track D Cut 1: every active floor spec kind is wired and gated by a Track A2 Tier-1 primitive.
  */
 export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId | Cut3FloorRecipeId; reason: string }[] = []
 
