@@ -616,3 +616,96 @@ test('E2: attribution spec cites only receipt-cited exchanges (single-hop and co
   const persisted = await persistScenario(t, origin, compositeProof({ origin, chainId: 'e2p', hopPaths: ['/setup/49', '/resource/49'] }))
   assert.equal(specPaths(persisted.specRow?.spec).includes('/unrelated/inventory'), false)
 })
+
+// ---------------------------------------------------------------------------------------------
+// 5. R3-05 cross-family review soundness regressions
+// ---------------------------------------------------------------------------------------------
+
+test('R3-05 review: missing receipt class fails closed as unclassified (never fabricates disclosure/CWE-200)', async t => {
+  const origin = 'http://127.0.0.1:4710'
+  const proof = singleHopProof({ origin, path: '/resource/60', vulnClass: 'bola', prefix: 'nocls' })
+  // Simulate a receipt whose vulnClass is absent at runtime; must never fall back to 'disclosure' (CWE-200).
+  ;(proof.receipt!.receipt as { vulnClass?: string }).vulnClass = undefined
+  const { result, row, persisted, specRow } = await persistScenario(t, origin, proof)
+  assert.equal(result.findingStatus, 'needs_review')
+  assertHeldAtNeedsReview(row, persisted)
+  assert.equal(row.cwe, 'unclassified')
+  assert.equal(persisted.category, 'unclassified')
+  assert.match(persisted.runtimeProofGap ?? '', /unclassified_attribution/)
+  assert.equal(specRow?.verifiedInline, false, 'held needs_review spec must not claim verifiedInline=true')
+})
+
+test('R3-05 review: held terminal-less proof never sets verifiedInline, leaks uncited exchangeIds, or pollutes an existing confirmed finding', async t => {
+  const origin = 'http://127.0.0.1:4711'
+  const storage = makeStore(t)
+  const { runId } = await setupApprovedRun(storage, { seeds: [origin], environment: 'local-lab', tier: 3 })
+  const run = storage.run(runId)
+  const worker = storage.makeWorker(run, 'investigation', run.candidates[0]!, 'Worker', 'r3-05 review')
+  const verifier = makeVerifier(storage)
+
+  // Standalone terminal-less proof: held at needs_review, verifiedInline=false, proof verdict inconclusive, zero uncited exchangeIds.
+  const noTermStandalone = singleHopProof({ origin, path: '/resource/61', vulnClass: 'bola', prefix: 'nt1', citeExchanges: false })
+  const res1 = verifier.persistAgentScriptProof({ run, assignment: worker, script: '// nt1', runtime: 'ts', proof: noTermStandalone, secrets: [] })
+  assert.equal(res1.findingStatus, 'needs_review')
+  const row1 = storage.db.select().from(findings).where(eq(findings.id, res1.findingId)).get()!
+  const spec1 = storage.db.select().from(replaySpecs).where(eq(replaySpecs.id, res1.replaySpecId)).get()!
+  const proofRec1 = storage.replaySpecProof(run.id, res1.replaySpecId)
+  assertHeldAtNeedsReview(row1, row1.finding)
+  assert.equal(spec1.verifiedInline, false)
+  assert.equal(proofRec1?.verdict, 'inconclusive')
+  assert.deepEqual(row1.finding.exchangeIds ?? [], [], 'uncited script exchanges must never pollute finding.exchangeIds')
+
+  // Existing confirmed finding on /resource/62: a later duplicate terminal-less proof must preserve confirmed status cleanly with zero uncited pollution.
+  const confirmedFirst = singleHopProof({ origin, path: '/resource/62', vulnClass: 'bola', prefix: 'cf2' })
+  const res2 = verifier.persistAgentScriptProof({ run, assignment: worker, script: '// cf2', runtime: 'ts', proof: confirmedFirst, secrets: [] })
+  assert.equal(res2.findingStatus, 'confirmed')
+  const dupNoTerm = singleHopProof({ origin, path: '/resource/62', vulnClass: 'bola', prefix: 'dupnt', citeExchanges: false })
+  const res3 = verifier.persistAgentScriptProof({ run, assignment: worker, script: '// dupnt', runtime: 'ts', proof: dupNoTerm, secrets: [] })
+  assert.equal(res3.findingId, res2.findingId)
+  assert.equal(res3.replaySpecId, res2.replaySpecId, 'unpromoted duplicate must not fork confirmed spec')
+  assert.equal(res3.findingStatus, 'confirmed', 'returned findingStatus must match persisted confirmed row')
+  const row2 = storage.db.select().from(findings).where(eq(findings.id, res2.findingId)).get()!
+  assert.equal(row2.status, 'confirmed')
+  assert.equal((row2.finding.exchangeIds ?? []).includes('dupnt-uncited'), false, 'uncited duplicate exchanges must not pollute confirmed finding')
+})
+
+test('R3-05 review: reverifyAgentScriptProof ignores rejected compositeReceipt class and keeps exchangeIds cited-only', async t => {
+  const origin = 'http://127.0.0.1:4712'
+  const storage = makeStore(t)
+  const { runId } = await setupApprovedRun(storage, { seeds: [origin], environment: 'local-lab', tier: 3 })
+  const run = storage.run(runId)
+  const worker = storage.makeWorker(run, 'investigation', run.candidates[0]!, 'Worker', 'r3-05 reverify')
+  const verifier = makeVerifier(storage)
+
+  const initial = singleHopProof({ origin, path: '/resource/63', vulnClass: 'bola', prefix: 'rv0' })
+  const persisted = verifier.persistAgentScriptProof({ run, assignment: worker, script: '// rv0', runtime: 'ts', proof: initial, secrets: [] })
+  assert.equal(persisted.findingStatus, 'confirmed')
+  const proofRecord = storage.replaySpecProof(run.id, persisted.replaySpecId)!
+  assert.ok(proofRecord)
+
+  const grant = makeLabGrant(origin)
+  const job = { assignment: worker, controller: new AbortController() } as never
+
+  // Case A: valid single-hop reverify with uncited script exchange -> stays confirmed, exchangeIds excludes uncited traffic.
+  const validReverify = singleHopProof({ origin, path: '/resource/63', vulnClass: 'bola', prefix: 'rv1' })
+  ;(verifier as unknown as { runAgentScriptProof: () => Promise<AgentScriptProofResult> }).runAgentScriptProof = async () => validReverify
+  const rvOk = await verifier.reverifyAgentScriptProof(run, { job, grant, currentSecrets: () => [] }, proofRecord)
+  assert.equal(rvOk?.status, 'confirmed')
+  const rowOk = storage.db.select().from(findings).where(eq(findings.id, persisted.findingId)).get()!
+  assert.deepEqual(rowOk.finding.exchangeIds, ['rv0-ctrl', 'rv0-probe', 'rv1-ctrl', 'rv1-probe'])
+  assert.equal((rowOk.finding.exchangeIds ?? []).includes('rv1-uncited'), false, 'reverify must never leak uncited script exchanges onto finding.exchangeIds')
+
+  // Case B: rejected compositeReceipt (terminalVulnClass='bola', confirmed=false) alongside confirmed unclassified single-hop receipt.
+  // The rejected composite MUST NOT shadow the confirmed unclassified single-hop class to bypass D2.
+  const shadowed = singleHopProof({ origin, path: '/resource/63', vulnClass: 'zz_unmapped_receipt_class', prefix: 'rv2' })
+  const rejectedComposite = compositeProof({ origin, chainId: 'rv2-rej', hopPaths: ['/setup/63', '/resource/63'], terminalVulnClass: 'bola' })
+  rejectedComposite.compositeReceipt!.verification.confirmed = false
+  shadowed.compositeReceipt = rejectedComposite.compositeReceipt
+  ;(verifier as unknown as { runAgentScriptProof: () => Promise<AgentScriptProofResult> }).runAgentScriptProof = async () => shadowed
+  const rvHeld = await verifier.reverifyAgentScriptProof(run, { job, grant, currentSecrets: () => [] }, proofRecord)
+  assert.equal(rvHeld?.status, 'needs_review')
+  assert.equal(rvHeld?.verificationTier, undefined)
+  const rowHeld = storage.db.select().from(findings).where(eq(findings.id, persisted.findingId)).get()!
+  assertHeldAtNeedsReview(rowHeld, rowHeld.finding)
+  assert.match(rowHeld.finding.runtimeProofGap ?? '', /unclassified_attribution/)
+})

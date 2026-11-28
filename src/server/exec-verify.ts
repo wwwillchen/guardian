@@ -2425,13 +2425,13 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         exchangeIds: [...new Set([...(findingRow.finding.exchangeIds ?? []), ...result.exchangeIds])],
         scopeRevision: current.scopeRevision,
       }
-      const rawFeedback = buildInlineVerifyFeedback(
+      const builtFeedback = buildInlineVerifyFeedback(
         specRow.spec, result, Math.max(1, specRow.attemptCount), maxInlineVerifyRetries, secretsList,
       )
-      phaseFeedback = rawFeedback
+      const { verificationTier: _droppedTier, ...feedbackRest } = builtFeedback
+      phaseFeedback = { ...feedbackRest, verdict: finalStatus as InlineVerifyFeedback['verdict'], ...(verificationTier ? { verificationTier } : {}) }
       this.host.recordSpecVerification(
-        current.id, specRow.id, rawFeedback,
-        `phase3 ${specRow.spec.kind} attempt ${specRow.attemptCount} returned ${finalStatus}`,
+        current.id, specRow.id, phaseFeedback, `phase3 ${specRow.spec.kind} attempt ${specRow.attemptCount} returned ${finalStatus}`,
       )
       if (finalStatus === 'confirmed' || finalStatus === 'static_verified') {
         this.persistReplayConfirmation(
@@ -2549,7 +2549,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           hopActors: compositeBundle.hopActors,
         }
       : null
-    const claim = cleanCompositeBundle?.receipt.terminalVulnClass ?? receipt?.vulnClass ?? 'disclosure'
+    const claim = cleanCompositeBundle?.receipt.terminalVulnClass ?? receipt?.vulnClass ?? ''
     const attribution = agentProofAttribution(claim)
     // R3-H-15: Derive composite finding origin strictly from the terminal exchange's host-signed
     // `origin` in the transcript — NEVER from worker-declared `hops[terminal].target.origin`.
@@ -2715,8 +2715,8 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       : undefined
     const existingHasComposite = Boolean(existingDup && existingRowHasCompositeProof(existingDup, existingSpecRow))
     const incomingUpgradesComposite = Boolean(
-      cleanCompositeBundle && existingDup && compositeChainRichnessScore(incomingCompositeSig) > compositeChainRichnessScore(extractRowCompositeSignature(existingDup, existingSpecRow)))
-    const reuseExistingConfirmedSpec = Boolean(existingDup && existingDup.finding.status === 'confirmed' && existingCanonicalSpecId && (!cleanCompositeBundle || (existingHasComposite && !incomingUpgradesComposite)))
+      gate.promoted && cleanCompositeBundle && existingDup && compositeChainRichnessScore(incomingCompositeSig) > compositeChainRichnessScore(extractRowCompositeSignature(existingDup, existingSpecRow)))
+    const reuseExistingConfirmedSpec = Boolean(existingDup && existingDup.finding.status === 'confirmed' && existingCanonicalSpecId && (!cleanCompositeBundle || !gate.promoted || (existingHasComposite && !incomingUpgradesComposite)))
 
     let canonicalSpecId: string
     if (reuseExistingConfirmedSpec) {
@@ -2741,7 +2741,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       const proofRecord: AgentScriptProofRecord = {
         replaySpecId: '',
         findingId,
-        verdict: 'confirmed',
+        verdict: gate.promoted ? 'confirmed' : 'inconclusive',
         runtime: input.runtime,
         scriptSha256,
         artifactId: artifact.id,
@@ -2754,16 +2754,12 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         findingId,
         spec,
         [origin],
-        { initialAttemptCount: 1, verifiedInline: true, lastVerificationDiff: feedback, proof: proofRecord },
+        { initialAttemptCount: 1, verifiedInline: gate.promoted, lastVerificationDiff: feedback, proof: proofRecord },
       )
       canonicalSpecId = specRow.id
     }
 
-    const incomingExchangeIds = compositeExchangeIds.length
-      ? compositeExchangeIds
-      : receipt?.exchangeIds?.length
-        ? [...receipt.exchangeIds]
-        : envelope.exchangeIds
+    const incomingExchangeIds = citedProofExchangeIds({ compositeReceipt: cleanCompositeBundle?.receipt ?? null, receipt })
 
     const finding: Finding & { evidence?: Record<string, unknown> } = reuseExistingConfirmedSpec && existingDup
       ? {
@@ -2846,7 +2842,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       findingId,
       replaySpecId: canonicalSpecId,
       receiptId: cleanCompositeBundle?.receipt.chainId ?? receipt?.exchangeIds[0] ?? null,
-      findingStatus: gate.promotion.status,
+      findingStatus: savedFinding.status === 'confirmed' ? 'confirmed' : gate.promotion.status,
     }
   }
 
@@ -3278,15 +3274,15 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         : null
     // H-18 step 6: Reject receipt class drift on reverify when the re-verified receipt class
     // disagrees with the confirmed finding's CWE family.
-    const provenVulnClass = result.compositeReceipt?.receipt.terminalVulnClass
-      ?? result.receipt?.receipt.vulnClass
-      ?? null
+    const confirmedReverifyComposite = result.compositeReceipt?.verification.confirmed ? result.compositeReceipt : null
+    const confirmedReverifyReceipt = result.receipt?.verification.confirmed ? result.receipt : null
+    const provenVulnClass = confirmedReverifyComposite?.receipt.terminalVulnClass ?? confirmedReverifyReceipt?.receipt.vulnClass ?? null
     const classDriftReason = rawConfirmed && findingRow?.finding.cwe && provenVulnClass
       && !isCweConsistentWithReceiptClass(findingRow.finding.cwe, provenVulnClass)
       ? `Re-verification receipt class "${provenVulnClass}" (${cweFamilyForReceiptClass(provenVulnClass).cwe}) drifted from confirmed finding CWE ${normalizeCwe(findingRow.finding.cwe)}.`
       : null
     // D2 + E1: same promotion gate as first persistence, so re-verification never (re-)promotes an unclassified or terminal-less proof.
-    const reverifyGate = rawConfirmed ? resolveAgentProofPersistenceGate(result.compositeReceipt?.verification.confirmed ? result.compositeReceipt : null, result.receipt?.receipt ?? null, provenVulnClass ?? 'disclosure', reverifyExchangeById) : null
+    const reverifyGate = rawConfirmed ? resolveAgentProofPersistenceGate(confirmedReverifyComposite, confirmedReverifyReceipt?.receipt ?? null, provenVulnClass ?? '', reverifyExchangeById) : null
     const gateReason = reverifyGate?.note ?? null
     const identityDriftReason = gateReason ? null : (originDriftReason ?? classDriftReason)
     const heldReason = gateReason ?? identityDriftReason
@@ -3368,7 +3364,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           : heldReason
             ? `Agent script proof re-verification returned ${status} (${heldReason}).`
             : `Agent script proof re-verification returned ${status} (${result.verdict.reason}).`,
-        exchangeIds: result.exchanges.map(exchange => exchange.exchangeId),
+        exchangeIds: rawConfirmed ? citedProofExchangeIds({ compositeReceipt: confirmedReverifyComposite?.receipt ?? null, receipt: confirmedReverifyReceipt?.receipt ?? null }) : result.exchanges.map(exchange => exchange.exchangeId),
         replaySpecId: updatedSpec.id,
         // E1 / A4: refreshed verified terminal + hop count; composite bundle when re-confirmed as a composite.
         ...(confirmed && reverifyGate ? {
@@ -3632,8 +3628,9 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     }
 
     const { isStaticAst, finalStatus, verificationTier } = deriveReplayOutcomeStatus(parsed, replay)
+    const { verificationTier: _droppedInlineTier, ...inlineFeedbackRest } = feedback
     const normalizedFeedback: InlineVerifyFeedback = {
-      ...feedback,
+      ...inlineFeedbackRest,
       verdict: finalStatus as InlineVerifyFeedback['verdict'],
       ...(verificationTier ? { verificationTier } : {}),
     }
