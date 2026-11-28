@@ -81,9 +81,10 @@ test('floor regress: the hardened twin of the privileged delete is dismissed', (
 })
 
 test('floor regress: a denial recorded before the probe still has to be crossed', () => {
+  const peerViewer = { ...viewer, handle: 'viewer_peer' }
   const steps: ImpactStep[] = [
     { id: 'control', arm: 'control', method: 'GET', route: '/api/admin/activity', status: 403, actor: viewer },
-    { id: 'probe', arm: 'probe', method: 'GET', route: '/api/admin/activity', status: 200, actor: admin, json: { items: [] } },
+    { id: 'probe', arm: 'probe', method: 'GET', route: '/api/admin/activity', status: 200, actor: peerViewer, json: { items: [] } },
   ]
   const crossed = assessBoundary({ impactClass: 'authorization', boundaryClass: 'access', steps })
   assert.equal(crossed.satisfied, true, crossed.reason)
@@ -94,7 +95,7 @@ test('floor regress: a denial recorded before the probe still has to be crossed'
     boundaryClass: 'access',
     steps: [
       { id: 'control', arm: 'control', method: 'GET', route: '/api/admin/audit', status: 403, actor: viewer },
-      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/invoices/i1', status: 200, actor: admin, json: { id: 'i1' } },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/invoices/i1', status: 200, actor: peerViewer, json: { id: 'i1' } },
     ],
   })
   assert.equal(unrelated.satisfied, false, unrelated.reason)

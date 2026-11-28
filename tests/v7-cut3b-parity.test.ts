@@ -675,11 +675,17 @@ test('the no-fallback assertion refuses the legacy DSL for every wired authz pai
       `${vulnClass} must not reach verifyReplaySpec`,
     )
   }
+  // Graduated Track D Cut 1 families are wired and also refuse the legacy DSL.
+  for (const [category, recipe] of [
+    ['info_disclosure', 'disclosure'],
+    ['mass_assignment', 'persisted_mutation'],
+    ['csrf', 'persisted_mutation'],
+  ] as const) {
+    assert.equal(wiredRecipeForSpecKind('http_chain', category), recipe)
+    assert.throws(() => assertNotRecipeWiredLegacyCall({ kind: 'http_chain', category }))
+  }
   // Unmapped families stay legacy and stay silent.
   for (const [kind, category] of [
-    ['http_chain', 'info_disclosure'],
-    ['http_chain', 'mass_assignment'],
-    ['http_chain', 'csrf'],
     ['http_chain', 'path_traversal'],
     ['http_chain', 'graphql_bola'],
     ['rce_proof', 'ssti'],

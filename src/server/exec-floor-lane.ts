@@ -32,6 +32,8 @@ import {
   type ExecCoreServices,
 } from './exec-exchange.ts'
 import { graphLeadTargets } from './graph-leads.ts'
+import { bogusIdFor } from './floor-heuristics.ts'
+import { TYPED_RECIPE_ASSERTION, floorActorFor } from './floor-recipe-engine.ts'
 import { resolvePersonaIdentity } from './oracle-invariants.ts'
 import { resolveRunPersonas } from './persona-vault.ts'
 import { listEndpointsPaged } from './phase0-recon.ts'
@@ -690,29 +692,21 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
               const unauthorized = outcome.anomalies.find(a => a.type === 'unauthorized_access')
               if (outcome.verdict === 'signal' && unauthorized) {
                 const resourceId = typeof unauthorized.resourceId === 'string' ? unauthorized.resourceId : resource.resourceId
-                const objPath = item.idPath.replace('{{id}}', encodeURIComponent(resourceId))
+                const objPath = item.idPath.replace('{{id}}', encodeURIComponent(resourceId)), bogusPath = item.idPath.replace('{{id}}', encodeURIComponent(bogusIdFor(resourceId)))
+                const enginePersonas: EnginePersona[] = personas.map(p => ({ handle: p.handle, roleLabel: p.roleLabel, privilege: null }))
+                const ownerActor = floorActorFor(owner, enginePersonas), otherActor = floorActorFor(other, enginePersonas)
                 if (this.recordDeterministicFinding({
                   run: latest, assignment: claimed, asset,
                   spec: {
-                    ...baseReplaySpecFields(item.ep.origin, {
-                      title: `Cross-persona object access · ${item.ep.method} ${item.ep.pathTemplate.slice(0, 80)}`,
-                      category: 'broken-access-control', cwe: 'CWE-639', severity: 'high',
-                      severityRationale: `Persona ${owner} owns ${resourceId}; persona ${other} received HTTP ${String(unauthorized.status)} on the same object.`,
-                      impact: "Horizontal privilege escalation: one tenant can read another tenant's object by ID.",
-                      remediation: 'Enforce an ownership/tenant predicate on the object lookup before returning or mutating it.',
-                      recheckInstructions: 'Replay the owner control and the cross-persona probe after the fix.',
-                    }),
-                    kind: 'http_chain', spaCatchallControl: false,
-                    assertionsJq: '{ controlPassed: (.steps.ctrl.status == 200), confirmed: (.steps.prb.status == 200), observed: ("probe status " + (.steps.prb.status | tostring)), expected: "cross-persona probe denied" }',
+                    ...baseReplaySpecFields(item.ep.origin, { title: `Cross-persona object access · ${item.ep.method} ${item.ep.pathTemplate.slice(0, 80)}`, category: 'broken-access-control', cwe: 'CWE-639', severity: 'high', severityRationale: `Persona ${owner} owns ${resourceId}; persona ${other} received HTTP ${String(unauthorized.status)} on the same object.`, impact: "Horizontal privilege escalation: one tenant can read another tenant's object by ID.", remediation: 'Enforce an ownership/tenant predicate on the object lookup before returning or mutating it.', recheckInstructions: 'Replay the owner control and the cross-persona probe after the fix.' }),
+                    kind: 'http_chain', spaCatchallControl: false, assertionsJq: TYPED_RECIPE_ASSERTION,
+                    recipe: { recipeId: 'access_boundary', args: { origin: item.ep.origin, method: 'GET', pathAndQuery: objPath, vulnClass: 'bola', owner: ownerActor, probe: otherActor, denied: ownerActor, ...(bogusPath !== objPath ? { deniedPathAndQuery: bogusPath } : {}) } },
                     steps: [
                       { id: 'ctrl', role: 'control', description: `Owner ${owner} reads its own object`, request: { origin: item.ep.origin, method: 'GET', pathAndQuery: objPath, persona: owner, followRedirects: false } },
                       { id: 'prb', role: 'probe', description: `Persona ${other} replays the owner object id`, request: { origin: item.ep.origin, method: 'GET', pathAndQuery: objPath, persona: other, followRedirects: false } },
                     ],
                   },
-                  factData: {
-                    subkind: 'differential_anomaly', probeClass: 'authz_matrix', endpoint: item.ep.pathTemplate,
-                    resourceId, ownerPersona: owner, otherPersona: other, anomalies: [unauthorized],
-                  },
+                  factData: { subkind: 'differential_anomaly', probeClass: 'authz_matrix', endpoint: item.ep.pathTemplate, resourceId, ownerPersona: owner, otherPersona: other, anomalies: [unauthorized] },
                   factSummary: `Deterministic authz_matrix signal: ${other} reached ${owner}'s resource ${resourceId} at ${item.ep.method} ${item.ep.pathTemplate} (HTTP ${String(unauthorized.status)}).`,
                   exchangeIds: outcome.exchangeIds, secrets: currentSecrets(),
                 })) findingsCreated += 1
@@ -787,7 +781,7 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
               kind: 'sql_boolean_diff', targetOrigin: item.ep.origin, method, pathAndQuery,
               paramName: candidate.name, paramLocation: location, baselineValue, quoteStyle,
               ...(jsonBody ? { jsonBody } : {}),
-              assertionsJq: '{ controlPassed: true, confirmed: true, observed: "deterministic boolean differential", expected: "parameterized query" }',
+              assertionsJq: TYPED_RECIPE_ASSERTION,
               recipe: {
                 recipeId: 'boolean_or_timing',
                 args: {

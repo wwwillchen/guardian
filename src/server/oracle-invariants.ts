@@ -1453,17 +1453,15 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     isReadMethod(step.method) &&
     isSuccess(step.status) &&
     sameRoute(step, probe))
-  // An unauthenticated 401/403 login wall proves only that the route requires authentication,
-  // never that an authenticated caller (read OR mutation) crossed an authorization/ownership
-  // boundary. Without this check, pairing an anonymous 401 login wall with an authenticated
-  // same-tenant viewer 200 (and owner 200 control) falsely sets `boundaryControlDenied = true`
-  // and bypasses the same-tenant org-shared dismissal guard.
+  // Reject unauthenticated login-wall controls and lower-role denied peers (normal RBAC, not a crossing).
   const peerDenial = (control: ImpactStep, targetProbe: ImpactStep | undefined = probe): boolean => {
     const controlTenants = actorTenants(control.actor)
     const unauthenticated = control.actor.handle === null && controlTenants.size === 0
     const targetTenants = targetProbe ? actorTenants(targetProbe.actor) : probeTenants
     const targetAuthenticated = targetProbe !== undefined && (targetProbe.actor.handle !== null || targetTenants.size > 0)
     if (unauthenticated && targetAuthenticated) return false
+    const cRank = roleRank(control.actor.role), tRank = targetProbe ? roleRank(targetProbe.actor.role) : null
+    if (cRank !== null && tRank !== null && cRank < tRank) return false
     if (controlTenants.size === 0 || targetTenants.size === 0) return true
     return (targetProbe !== undefined && actorsShareTenant(control.actor, targetProbe.actor)) ||
       (mirrorCorroborated && declaredResourceTenant !== null && controlTenants.has(declaredResourceTenant) && !targetTenants.has(declaredResourceTenant))
@@ -4640,10 +4638,9 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     return !controlMutationIndexes.some(mutatedAt => mutatedAt < at && sameRoute(steps[mutatedAt]!, entry.step))
   })
   const peerSignal = boundarySignals.find(entry => {
-    // An owner denial is not a role-escalation control: the owner is the top of the role order and
-    // may be refused for an unrelated policy/MFA/session reason while a lower role is served.
     if (roleEscalation && entry.step.actor.role === 'owner') return false
-    const tenant = entry.step.actor.tenant ?? null
+    const tenant = entry.step.actor.tenant ?? null, sameOrNoTenant = tenant === null || probeActor?.tenant == null || tenant === probeActor.tenant
+    if (boundaryClass === 'access' && sameOrNoTenant && (roleRank(entry.step.actor.role) ?? 99) < (roleRank(probeActor?.role) ?? -1)) return false
     if (tenant === null || probeActor?.tenant == null) return true
     return tenant === probeActor.tenant ||
       (boundaryMirrorCorroborated && resourceTenant !== null && tenant === resourceTenant && resourceTenant !== probeActor.tenant)
