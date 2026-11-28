@@ -13,6 +13,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { stripTypeScriptTypes } from 'node:module'
 import type { Browser, BrowserContext, Page } from '@playwright/test'
 import { HARDENED_NODE_FLAGS } from './app.ts'
+import { runModeOf } from '../src/components/run-state.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 const CONSENT_PATH = join(REPO_ROOT, 'src', 'components', 'run', 'views', 'consent.tsx')
@@ -241,7 +242,7 @@ function loadConsentHelper<T>(consentSrc: string, name: string, preamble = ''): 
   }
   assert.notEqual(end, -1)
   const stripped = stripTypeScriptTypes(consentSrc.slice(start, end).replace(/^export\s+/, ''))
-  return new Function(`${preamble}\n${stripped}\nreturn ${name};`)() as T
+  return new Function('runModeOf', `${preamble}\n${stripped}\nreturn ${name};`)(runModeOf) as T
 }
 
 describe('Scope Review (consent.tsx) — Option 1 Sticky Action Bar & Compact Header', { timeout: 90_000 }, () => {
