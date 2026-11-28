@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "maxQuarantinedCases": 175,
+  "maxQuarantinedCases": 168,
   "maxKernelVerdictQuarantinedCases": 26,
   "entries": [
     {
@@ -86,33 +86,9 @@
       "expires": "2026-12-26"
     },
     {
-      "file": "tests/floor-regress.test.ts",
-      "testName": "floor: the discriminating baseline confirms on the concatenating twin via wired floor recipe",
-      "assertionLocation": "tests/floor-regress.test.ts:398:1",
-      "ownerStream": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
       "file": "tests/movea-retest-norm.test.ts",
       "testName": "H-5: verifyReplaySpec and retestReplaySpec default-deny recipe and agentScript envelopes when envelopeTrust is omitted",
       "assertionLocation": "tests/movea-retest-norm.test.ts:399:1",
-      "ownerStream": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/specs-recall.test.ts",
-      "testName": "credential inventory: the unentitled full secret confirms against the masked control",
-      "assertionLocation": "tests/specs-recall.test.ts:407:1",
-      "ownerStream": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/specs-recall.test.ts",
-      "testName": "privileged delete: the reserved live victim is removed and the bogus delete stays a no-op",
-      "assertionLocation": "tests/specs-recall.test.ts:604:1",
       "ownerStream": "cq-4-parity-corpus",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
@@ -380,22 +356,6 @@
       "expires": "2026-12-26"
     },
     {
-      "file": "tests/v5-verifier-guards.test.ts",
-      "testName": "guards: auth-bypass whose control is a login redirect still confirms via marker differential",
-      "assertionLocation": "tests/v5-verifier-guards.test.ts:260:1",
-      "ownerStream": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v5-verifier-guards.test.ts",
-      "testName": "guards: field-bound same-actor deterministic pattern still confirms when the origin matches",
-      "assertionLocation": "tests/v5-verifier-guards.test.ts:316:1",
-      "ownerStream": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
       "file": "tests/v6-auth.test.ts",
       "testName": "OIDC login traverses only allowlisted authOrigins, captures HttpOnly cookies + storage, and accepts TOTP",
       "assertionLocation": "tests/v6-auth.test.ts:395:1",
@@ -447,14 +407,6 @@
       "file": "tests/v6-sdk-helpers.test.ts",
       "testName": "proveRaceBurst reports h2 single-packet vs explicit HTTP/1.1 fallback",
       "assertionLocation": "tests/v6-sdk-helpers.test.ts:538:1",
-      "ownerStream": "v6-triage",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v6-verifier-harden.test.ts",
-      "testName": "boundary: a real MFA challenge with a pre/post access differential confirms",
-      "assertionLocation": "tests/v6-verifier-harden.test.ts:608:1",
       "ownerStream": "v6-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
@@ -705,14 +657,6 @@
       "file": "tests/v7-cut3e-retire.test.ts",
       "testName": "Cut 3e: bare browser_chain is retired while browser_sink recipe envelope confirms via ProofReceipt",
       "assertionLocation": "tests/v7-cut3e-retire.test.ts:56:1",
-      "ownerStream": "v7-triage",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v7-cut3f-retire.test.ts",
-      "testName": "cut3f: replay-verifier is a thin module > the assessment/receipt helpers live in the recipe engine while the VM stays thin",
-      "assertionLocation": "tests/v7-cut3f-retire.test.ts:57:3",
       "ownerStream": "v7-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"

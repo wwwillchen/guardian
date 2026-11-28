@@ -107,7 +107,7 @@ export interface ShellWorkspaceData {
 
 interface GlobalCommand {
   id: string
-  section: 'Navigation' | 'Projects' | 'Recent runs' | 'Actions'
+  section: 'Navigation' | 'Projects' | 'Recent runs' | 'Actions' | 'Suggestions'
   label: string
   sub?: string
   title?: string
@@ -117,6 +117,8 @@ interface GlobalCommand {
   /** Hosts and other code-like hints opt into mono; status words stay proportional. */
   rightMono?: boolean
   keys?: string[]
+  /** Runs without closing the palette (e.g. "Clear search"). */
+  keepOpen?: boolean
   run: () => void
 }
 
@@ -126,6 +128,71 @@ const SECTION_BIAS: Record<GlobalCommand['section'], number> = {
   Projects: 0.2,
   'Recent runs': 0.5,
   Actions: 0.7,
+  Suggestions: 1,
+}
+
+/** DOM ids shared by the combobox input, the listbox and its options. */
+export const PALETTE_LIST_ID = 'gp-list'
+export const paletteOptionId = (commandId: string) => `gp-opt-${commandId}`
+const paletteGroupId = (section: string) => `gp-group-${section.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+
+export interface PaletteGroup<T extends { section: string }> {
+  section: T['section']
+  headerId: string
+  entries: { item: T; index: number }[]
+}
+
+/** Contiguous runs of one section become one `role="group"`, keeping flat option indices for ↑/↓. */
+export function groupPaletteItems<T extends { section: string }>(items: readonly T[]): PaletteGroup<T>[] {
+  const groups: PaletteGroup<T>[] = []
+  items.forEach((item, index) => {
+    const last = groups[groups.length - 1]
+    if (last && last.section === item.section) last.entries.push({ item, index })
+    else groups.push({ section: item.section, headerId: paletteGroupId(item.section), entries: [{ item, index }] })
+  })
+  return groups
+}
+
+/** Polite live-region copy for the result list. */
+export function paletteAnnouncement(query: string, resultCount: number, fallbackCount: number): string {
+  if (query.trim() && resultCount === 0) {
+    return `No exact matches, ${plural(fallbackCount, 'fallback action')}`
+  }
+  return plural(resultCount, 'result')
+}
+
+/** Zero-match fallbacks so ↵ always does something useful. */
+function fallbackCommands(query: string, actions: {
+  createProject: () => void
+  openSettings: () => void
+  clearSearch: () => void
+}): GlobalCommand[] {
+  return [
+    {
+      id: 'fb.create-project',
+      section: 'Suggestions',
+      label: `Create project “${query}”`,
+      title: 'Create a new project',
+      icon: 'plus',
+      run: actions.createProject,
+    },
+    {
+      id: 'fb.settings',
+      section: 'Suggestions',
+      label: 'Search settings',
+      title: 'Open model settings',
+      icon: 'sliders',
+      run: actions.openSettings,
+    },
+    {
+      id: 'fb.clear',
+      section: 'Suggestions',
+      label: 'Clear search',
+      icon: 'x',
+      keepOpen: true,
+      run: actions.clearSearch,
+    },
+  ]
 }
 
 function Highlight({ text, q }: { text: string; q: string }) {
@@ -178,6 +245,7 @@ export function GlobalPalette({
   const [q, setQ] = useState(prefill)
   const [idx, setIdx] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (open) {
@@ -286,7 +354,7 @@ export function GlobalPalette({
     return out
   }, [data, now, navigate, onOpenNewProject, onOpenHelp, onOpenDevices, theme, toggleTheme])
 
-  const items = useMemo(() => {
+  const matches = useMemo(() => {
     const query = q.trim().toLowerCase()
     if (!query) {
       return [
@@ -311,7 +379,22 @@ export function GlobalPalette({
     return SECTION_ORDER.flatMap(sec => scored.filter(c => c.section === sec).slice(0, 8))
   }, [commands, q])
 
+  const trimmed = q.trim()
+  const fallbacks = useMemo(() => (trimmed && matches.length === 0
+    ? fallbackCommands(trimmed, {
+        createProject: onOpenNewProject,
+        openSettings: () => { void navigate({ to: '/settings', search: {} }) },
+        clearSearch: () => {
+          setQ('')
+          setIdx(0)
+          inputRef.current?.focus()
+        },
+      })
+    : []), [trimmed, matches.length, onOpenNewProject, navigate])
+  const items = matches.length > 0 ? matches : fallbacks
+
   const cur = Math.min(idx, Math.max(0, items.length - 1))
+  const activeItem = items[cur]
 
   useEffect(() => {
     if (!open) return
@@ -321,11 +404,10 @@ export function GlobalPalette({
   const runItem = (i: number) => {
     const it = items[i]
     if (!it) return
-    onClose()
+    if (!it.keepOpen) onClose()
     it.run()
   }
 
-  let lastSection = ''
   return <Dialog open={open} onOpenChange={next => { if (!next) onClose() }}>
     <DialogContent
       instant
@@ -333,15 +415,28 @@ export function GlobalPalette({
       className="mb-auto mt-[10vh] max-w-[620px] overflow-hidden rounded-2xl border border-line-2 bg-raise p-0 shadow-popover [&_svg]:block [&_svg]:flex-none"
     >
       <DialogTitle className="sr-only">Command palette</DialogTitle>
-      <div className="flex h-[50px] items-center gap-2.5 border-b border-line px-4 text-fg-subtle">
+      {/* ARIA 1.1 combobox: the row owns the popup, the field keeps its textbox
+          role and drives the listbox through aria-activedescendant. */}
+      <div
+        className="flex h-[50px] items-center gap-2.5 border-b border-line px-4 text-fg-subtle"
+        role="combobox"
+        aria-haspopup="listbox"
+        aria-expanded="true"
+        aria-controls={PALETTE_LIST_ID}
+        aria-label="Command palette search"
+      >
         <Icon name="search" />
         <input
+          ref={inputRef}
           autoFocus
           value={q}
           placeholder="Jump to a project, run, settings, or action…"
           autoComplete="off"
           spellCheck={false}
           aria-label="Search workspace"
+          aria-autocomplete="list"
+          aria-controls={PALETTE_LIST_ID}
+          aria-activedescendant={activeItem ? paletteOptionId(activeItem.id) : undefined}
           className="h-auto min-w-0 flex-1 rounded-none border-0 bg-transparent p-0 text-[14.5px] text-fg shadow-none outline-none placeholder:text-fg-subtle focus:shadow-none focus:outline-none"
           onChange={e => { setQ(e.target.value); setIdx(0) }}
           onKeyDown={e => {
@@ -364,62 +459,81 @@ export function GlobalPalette({
           {data.workspace.name}
         </span>
       </div>
+      <div role="status" aria-live="polite" className="sr-only" data-slot="palette-announcement">
+        {paletteAnnouncement(q, matches.length, fallbacks.length)}
+      </div>
       {/* min-h = max-h: the panel never collapses under the cursor while typing. */}
-      <div className="h-[400px] max-h-[calc(80vh-100px)] overflow-auto p-1.5" ref={listRef} role="listbox">
-        {items.length === 0 && (
-          <div className="p-7 text-center text-[12.5px] text-fg-subtle">No matches for “{q}”</div>
+      <div className="h-[400px] max-h-[calc(80vh-100px)] overflow-auto p-1.5" ref={listRef}>
+        {matches.length === 0 && trimmed && (
+          <div className="px-2.5 pb-1 pt-3 text-[12.5px] text-fg-subtle" data-slot="palette-no-match">No matches for “{trimmed}”</div>
         )}
-        {items.map((it, i) => {
-          const head = it.section !== lastSection
-            ? <div className="px-2.5 pb-1 pt-2 text-[11.5px] font-medium text-fg-subtle">{it.section}</div>
-            : null
-          lastSection = it.section
-          const isCurrent = i === cur
-          return <div key={it.id}>
-            {head}
-            <div
-              className={cn(
-                'flex h-9 cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-fg-muted',
-                isCurrent && 'bg-press',
-              )}
-              data-active={isCurrent ? 'true' : undefined}
-              role="option"
-              aria-selected={isCurrent}
-              title={it.title ?? it.label}
-              onMouseMove={() => { if (!isCurrent) setIdx(i) }}
-              onClick={() => runItem(i)}
-            >
-              <span className="inline-flex size-3.5 flex-none items-center justify-center">
-                {typeof it.icon === 'string' ? <Icon name={it.icon as IconName} /> : it.icon}
-              </span>
-              <span className="min-w-0 flex-1 truncate text-fg">
-                <Highlight text={it.label} q={q.trim()} />
-              </span>
-              {it.keys
-                ? <span className="flex-none text-[12px] text-fg-subtle"><KbdGroup keys={it.keys} /></span>
-                : it.right
-                  ? <span
-                      className={cn(
-                        'min-w-0 max-w-[40%] truncate whitespace-nowrap text-[12px] text-fg-subtle',
-                        it.rightMono ? 'font-mono' : 'tabular-nums',
-                      )}
-                      title={it.rightTitle}
-                      suppressHydrationWarning
-                    >
-                      {it.right}
-                    </span>
-                  : null}
+        <div id={PALETTE_LIST_ID} role="listbox" aria-label="Command palette results">
+          {groupPaletteItems(items).map(group => <div key={group.section} role="group" aria-labelledby={group.headerId}>
+            <div id={group.headerId} className="px-2.5 pb-1 pt-2 text-[11.5px] font-medium text-fg-subtle" aria-hidden="true">
+              {group.section}
             </div>
-          </div>
-        })}
+            {group.entries.map(({ item, index }) => <PaletteOption
+              key={item.id}
+              item={item}
+              query={trimmed}
+              active={index === cur}
+              onHover={() => { if (index !== cur) setIdx(index) }}
+              onRun={() => runItem(index)}
+            />)}
+          </div>)}
+        </div>
       </div>
       <div className="flex items-center gap-4 border-t border-line bg-sunk px-3.5 py-2 text-[11.5px] text-fg-subtle">
         <span className="inline-flex items-center gap-1.5"><Kbd>↑</Kbd><Kbd>↓</Kbd> navigate</span>
-        <span className="inline-flex items-center gap-1.5"><Kbd>↵</Kbd> open</span>
+        <span className="inline-flex items-center gap-1.5"><Kbd>↵</Kbd> {activeItem?.keepOpen ? 'run' : 'open'}</span>
         <span className="inline-flex items-center gap-1.5"><Kbd>esc</Kbd> close</span>
       </div>
     </DialogContent>
   </Dialog>
+}
+
+/** One option row. The highlight is instant (no transition): it tracks ↑/↓ and the pointer 1:1. */
+function PaletteOption({ item, query, active, onHover, onRun }: {
+  item: GlobalCommand
+  query: string
+  active: boolean
+  onHover: () => void
+  onRun: () => void
+}) {
+  return <div
+    id={paletteOptionId(item.id)}
+    className={cn(
+      'flex h-9 cursor-pointer items-center gap-2.5 rounded-[7px] px-2.5 text-fg-muted',
+      active && 'bg-press',
+    )}
+    data-active={active ? 'true' : undefined}
+    role="option"
+    aria-selected={active}
+    title={item.title ?? item.label}
+    onMouseMove={onHover}
+    onClick={onRun}
+  >
+    <span className="inline-flex size-3.5 flex-none items-center justify-center">
+      {typeof item.icon === 'string' ? <Icon name={item.icon as IconName} /> : item.icon}
+    </span>
+    <span className="min-w-0 flex-1 truncate text-fg">
+      {item.section === 'Suggestions' ? item.label : <Highlight text={item.label} q={query} />}
+    </span>
+    {item.keys
+      ? <span className="flex-none text-[12px] text-fg-subtle"><KbdGroup keys={item.keys} /></span>
+      : item.right
+        ? <span
+            className={cn(
+              'min-w-0 max-w-[40%] truncate whitespace-nowrap text-[12px] text-fg-subtle',
+              item.rightMono ? 'font-mono' : 'tabular-nums',
+            )}
+            title={item.rightTitle}
+            suppressHydrationWarning
+          >
+            {item.right}
+          </span>
+        : null}
+  </div>
 }
 
 const GLOBAL_SHORTCUTS: [string, [string, string][]][] = [

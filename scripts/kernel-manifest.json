@@ -120,7 +120,6 @@
       ],
       "matchedExports": [
         "assessBflaImpact",
-        "assessHttpChainEndpointBinding",
         "assessHttpChainProofStrength",
         "assessRetestHealth"
       ],
@@ -306,13 +305,9 @@
     {
       "file": "src/server/replay-verifier.ts",
       "reasons": [
-        "confirmation_entrypoint",
-        "export_signature"
+        "confirmation_entrypoint"
       ],
       "matchedExports": [
-        "assessBflaImpact",
-        "assessHttpChainEndpointBinding",
-        "assessHttpChainProofStrength",
         "retestReplaySpec",
         "verifyReplaySpec"
       ],

@@ -15,7 +15,7 @@ import type { BrokerExchangeResult, Grant, RequestBroker } from '../src/server/b
 import type { ProbeDifferentialRequest } from '../src/server/probes/context.ts'
 import { probeDifferential } from '../src/server/surface-engine.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
-import type { EngineHypothesis } from '../src/server/deterministic-specs.ts'
+import type { EngineHypothesis } from '../src/server/floor-heuristics.ts'
 import {
   planFloorRecipe,
   recipeSpecRecord,

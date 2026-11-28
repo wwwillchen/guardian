@@ -268,7 +268,12 @@ const replayBase = z.object({
   impact: z.string().trim().min(5).max(1200),
   remediation: z.string().trim().min(5).max(1500),
   recheckInstructions: z.string().trim().min(5).max(1000),
-  assertionsJq: z.string().trim().min(1).max(4096),
+  /**
+   * @deprecated Legacy jq assertion retained as optional strictly for historical DB rows.
+   * Active floor recipes, agent scripts, and typed zero-jq runners confirm via ProofReceipts and
+   * Track A2 Tier-1 primitives (`Verified Replay Spec` currency), never via jq execution.
+   */
+  assertionsJq: z.string().trim().min(1).max(4096).optional(),
   requireControlNonError: z.boolean().optional(),
   /**
    * Denied-control evidence path: a control that is *supposed* to be denied (cross-tenant 404/403)
@@ -897,4 +902,93 @@ export function replaySpecOrigins(spec: DeclarativeReplaySpec): string[] {
     origins.add(spec.targetOrigin)
   }
   return [...origins]
+}
+
+export type VerifiedReplaySpecCurrency = 'floor_recipe' | 'agent_script' | 'typed_runner' | 'legacy'
+export type VerifiedReplaySpecTier = 'runtime' | 'static' | 'unverified'
+
+export interface VerifiedReplaySpecSummary {
+  currency: VerifiedReplaySpecCurrency
+  verificationTier: VerifiedReplaySpecTier
+  specKind: string | null
+  recipeId?: (typeof floorRecipeIds)[number]
+  proofKind?: string
+  proofRuntime?: string
+  scriptSha256?: string
+}
+
+/** Canonical allowlist mapping declarative spec kinds to the floor recipes permitted to confirm them. */
+export const ALLOWED_RECIPES_BY_SPEC_KIND: Readonly<Record<string, ReadonlySet<string>>> = {
+  browser_chain: new Set(['browser_sink']),
+  sql_boolean_diff: new Set(['boolean_or_timing']),
+  sql_time_diff: new Set(['boolean_or_timing']),
+  race_burst: new Set(['conserved_balance', 'race_burst']),
+  http_chain: new Set([
+    'access_boundary', 'persisted_mutation', 'boolean_or_timing', 'oob_callback',
+    'race_burst', 'disclosure', 'redirect', 'injection_fingerprint', 'conserved_balance',
+  ]),
+}
+
+export function isRecipeAllowedForSpecKind(specKind: string, recipeId: string): boolean {
+  const allowed = ALLOWED_RECIPES_BY_SPEC_KIND[specKind]
+  return Boolean(allowed && allowed.has(recipeId))
+}
+
+const ZERO_JQ_TYPED_RUNNER_KINDS: ReadonlySet<string> = new Set([
+  'static_ast_proof',
+  'rce_proof',
+  'cache_differential',
+  'auth_protocol_proof',
+])
+
+/**
+ * Project any persisted replay spec (floor recipe, agent script, or zero-jq typed runner) onto
+ * the unified `Verified Replay Spec` currency shared across floor and agentic exports.
+ *
+ * Fail-closed: only schema-valid specs (or parsed `agentScript` envelopes) with allowlisted
+ * recipe pairings are promoted out of `legacy`.
+ */
+export function summarizeVerifiedReplaySpec(
+  spec: unknown,
+  meta?: { proofKind?: string | null; proofRuntime?: string | null; proofScriptSha256?: string | null },
+): VerifiedReplaySpecSummary {
+  const rec = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec as Record<string, unknown> : null
+  const rawSpecKind = typeof rec?.kind === 'string' && rec.kind.trim() ? rec.kind.trim() : null
+  const parsedSpec = declarativeReplaySpecSchema.safeParse(spec)
+  const specKind = parsedSpec.success ? parsedSpec.data.kind : rawSpecKind
+  const parsedRecipe = rec?.recipe ? floorRecipeEnvelopeSchema.safeParse(rec.recipe) : null
+  if (parsedSpec.success && parsedRecipe?.success && isRecipeAllowedForSpecKind(parsedSpec.data.kind, parsedRecipe.data.recipeId)) {
+    return {
+      currency: 'floor_recipe',
+      verificationTier: 'runtime',
+      specKind: parsedSpec.data.kind,
+      recipeId: parsedRecipe.data.recipeId,
+      proofKind: meta?.proofKind ?? 'floor_recipe',
+    }
+  }
+  const parsedScript = rec?.agentScript ? agentScriptProofEnvelopeSchema.safeParse(rec.agentScript) : null
+  if (parsedScript?.success) {
+    return {
+      currency: 'agent_script',
+      verificationTier: 'runtime',
+      specKind,
+      proofKind: 'agent_script',
+      proofRuntime: parsedScript.data.runtime,
+      scriptSha256: parsedScript.data.scriptSha256,
+    }
+  }
+  if (parsedSpec.success && ZERO_JQ_TYPED_RUNNER_KINDS.has(parsedSpec.data.kind)) {
+    return {
+      currency: 'typed_runner',
+      verificationTier: parsedSpec.data.kind === 'static_ast_proof' ? 'static' : 'runtime',
+      specKind: parsedSpec.data.kind,
+      ...(meta?.proofKind ? { proofKind: meta.proofKind } : {}),
+    }
+  }
+  return {
+    currency: 'legacy',
+    verificationTier: 'unverified',
+    specKind,
+    ...(meta?.proofKind ? { proofKind: meta.proofKind } : {}),
+  }
 }

@@ -37,7 +37,9 @@ import {
   extractSpecDedupeFields,
 } from '../src/server/dedupe.ts'
 import { Execution } from '../src/server/execution.ts'
-import { assessBflaImpact, buildInlineVerifyFeedback } from '../src/server/replay-verifier.ts'
+import { assessBflaImpact } from '../src/server/floor-recipe-engine.ts'
+import { wiredRecipeForSpecKind } from '../src/server/floor-recipes.ts'
+import { buildInlineVerifyFeedback } from '../src/server/replay-verifier.ts'
 import { templateIdsForCves } from '../src/server/cve-broker.ts'
 import type { BrokerExchangeResult } from '../src/server/broker.ts'
 import { loadSkill, listSkills, selectPreInjectionSkills } from '../src/server/skills.ts'
@@ -937,10 +939,10 @@ test('M1 precision: object-level BOLA (CWE-639) is not gated by the BFLA impact 
 })
 
 test('M1 precision: BFLA gate feeds the verdict and survives feedback enrichment', () => {
-  assert.ok(/const bflaImpact = assessBflaImpact\(spec, stepsOut\)/.test(
-    readFileSync(join(repoRoot, 'src/server/replay-verifier.ts'), 'utf8')))
-  assert.ok(/forcedInconclusiveReason = bflaImpact\.reason/.test(
-    readFileSync(join(repoRoot, 'src/server/replay-verifier.ts'), 'utf8')))
+  // Track D Cut 2: the declarative jq VM that consumed `bflaImpact` is deleted; the BFLA gate now
+  // feeds the typed floor recipe (access_boundary/persisted_mutation) and its Tier-1 authorization
+  // primitive. Pin the typed recipe wiring instead of a removed verifier call site.
+  assert.equal(wiredRecipeForSpecKind('http_chain', 'bfla'), 'access_boundary')
   const feedback = buildInlineVerifyFeedback(
     { kind: 'http_chain' },
     {

@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createProject, syncGithubRepositories, workspaceData } from '../actions.ts'
 import { FormError, useAction } from '../components/common.tsx'
 import {
@@ -10,15 +10,24 @@ import { fmtN, host, plural } from '../components/run/format.ts'
 import { StatusGlyph } from '../components/run/glyphs.tsx'
 import { Icon } from '../components/run/icons.tsx'
 import { PHASE_LABEL, runStatusLabel } from '../components/run/meta.ts'
-import { formatFullDateTime, formatRelativeTime, useNow, useShell } from '../components/shell/AppShell.tsx'
+import {
+  formatFullDateTime,
+  formatRelativeTime,
+  middleTruncate,
+  projectDisambiguators,
+  useNow,
+  useShell,
+} from '../components/shell/AppShell.tsx'
 import { Badge } from '../components/ui/badge.tsx'
 import { Button, buttonVariants } from '../components/ui/button.tsx'
 import { Card } from '../components/ui/card.tsx'
 import { Checkbox } from '../components/ui/checkbox.tsx'
 import { Dialog, DialogContent, DialogTitle } from '../components/ui/dialog.tsx'
 import { Disclosure, DisclosureContent, DisclosureTrigger } from '../components/ui/disclosure.tsx'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../components/ui/dropdown-menu.tsx'
 import { EmptyState } from '../components/ui/empty-state.tsx'
 import { Input, NativeSelect, Textarea } from '../components/ui/input.tsx'
+import { HintTooltip } from '../components/ui/tooltip.tsx'
 import type { RunStatus } from '../domain.ts'
 import { cn } from '../lib/cn.ts'
 import { isCanonicalRunStatus, isTerminalRunStatus } from '../server/run-status.ts'
@@ -307,19 +316,21 @@ function ModelPoolBanner({ title, body, cta }: { title: string; body: string; ct
   )
 }
 
+// Trailing 72px column holds the persistent quiet row actions (never an overlay on the metrics).
 const PROJECT_GRID_COLS =
-  'grid-cols-[minmax(200px,1.45fr)_minmax(160px,1.15fr)_minmax(170px,1fr)_150px] max-[960px]:grid-cols-[minmax(170px,1.3fr)_minmax(130px,1fr)_140px] max-[720px]:grid-cols-[minmax(0,1fr)_auto]'
+  'grid-cols-[minmax(200px,1.45fr)_minmax(160px,1.15fr)_minmax(170px,1fr)_150px_72px] max-[960px]:grid-cols-[minmax(170px,1.3fr)_minmax(130px,1fr)_140px_72px] max-[720px]:grid-cols-[minmax(0,1fr)_auto]'
 
 type WorkspaceProject = Awaited<ReturnType<typeof workspaceData>>['projects'][number]
 
-function ProjectNameLink({ project }: { project: WorkspaceProject }) {
+function ProjectNameLink({ project, disambiguator }: { project: WorkspaceProject; disambiguator?: string }) {
   const { base, qualifier } = splitProjectNameQualifier(project.name)
   return (
     <Link
       to="/projects/$projectId"
       params={{ projectId: project.id }}
-      className="flex min-w-0 items-baseline gap-1 font-medium text-fg decoration-line-strong underline-offset-2 hover:underline"
-      title={project.name}
+      className="flex min-w-0 items-baseline gap-1 font-medium text-fg decoration-line-strong underline-offset-2 hover:underline group-data-[active]/row:focus-visible:outline-none"
+      title={[project.name, disambiguator].filter(Boolean).join(' — ')}
+      data-slot="project-name-link"
     >
       <span className="min-w-[2ch] truncate">{base}</span>
       {qualifier && (
@@ -327,7 +338,63 @@ function ProjectNameLink({ project }: { project: WorkspaceProject }) {
           {qualifier}
         </span>
       )}
+      {/* Namesakes: a quiet host / short-id suffix, middle-truncated so its distinguishing tail survives. */}
+      {disambiguator && (
+        <span className="ml-1 max-w-full flex-none truncate font-mono text-[11.5px] font-normal text-fg-subtle" data-slot="project-name-disambiguator">
+          {middleTruncate(disambiguator, 32)}
+        </span>
+      )}
     </Link>
+  )
+}
+
+const ROW_ACTION_BTN = cn(buttonVariants({ variant: 'ghost', size: 'icon' }), 'size-[26px] text-fg-subtle hover:text-fg')
+
+/** Persistent quiet actions: present at 45% opacity, full on row hover / focus / keyboard-active, no movement. */
+function ProjectRowActions({ project }: { project: WorkspaceProject }) {
+  const navigate = useNavigate()
+  const latest = project.latestRun
+  return (
+    <div
+      data-slot="project-row-actions"
+      className="flex items-center justify-end gap-1 opacity-45 transition-[opacity,translate] duration-[var(--d1)] ease-kovo group-hover/row:opacity-100 group-focus-within/row:opacity-100 group-data-[active]/row:opacity-100 max-[720px]:hidden"
+    >
+      <HintTooltip label="New run" shortcut="R">
+        <Link
+          to="/projects/$projectId"
+          params={{ projectId: project.id }}
+          search={{ newRun: '1' }}
+          className={ROW_ACTION_BTN}
+          aria-label={`New run for ${project.name}`}
+          data-slot="project-row-new-run"
+        >
+          <Icon name="play" />
+        </Link>
+      </HintTooltip>
+      <DropdownMenu>
+        <HintTooltip label="More actions">
+          <DropdownMenuTrigger className={ROW_ACTION_BTN} aria-label={`More actions for ${project.name}`}>
+            <Icon name="dots" />
+          </DropdownMenuTrigger>
+        </HintTooltip>
+        <DropdownMenuContent>
+          <DropdownMenuItem onClick={() => void navigate({ to: '/projects/$projectId', params: { projectId: project.id } })}>
+            Open project
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={() => void navigate({ to: '/projects/$projectId', params: { projectId: project.id }, search: { newRun: '1' } })}>
+            New run
+          </DropdownMenuItem>
+          {latest && (
+            <DropdownMenuItem onClick={() => void navigate({ to: '/runs/$runId', params: { runId: latest.id }, search: {} })}>
+              Open latest run
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem onClick={() => void navigate({ to: '/projects/$projectId', params: { projectId: project.id }, search: { tab: 'runs' } })}>
+            All runs
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
   )
 }
 
@@ -358,24 +425,37 @@ function ProjectLatestRunCell({ latest, now }: { latest: NonNullable<WorkspacePr
   )
 }
 
-function ProjectRow({ project, now, onOpen }: { project: WorkspaceProject; now: number; onOpen: () => void }) {
+function ProjectRow({ project, now, active, disambiguator, onOpen, onFocusRow }: {
+  project: WorkspaceProject
+  now: number
+  active: boolean
+  disambiguator?: string
+  onOpen: () => void
+  onFocusRow: () => void
+}) {
   const seedHosts = project.seeds.map(host)
   const { summary: hostSummary, extra: extraHosts } = summarizeSeedHosts(seedHosts, project.hostCount)
   const latest = project.latestRun
   return (
     <div
       data-slot="project-row"
+      data-active={active ? '' : undefined}
+      // Highlights are instant (no transition): j/k and the pointer move them many times a session.
       className={cn(
-        'group/row relative grid min-h-11 cursor-pointer items-center gap-3 border-b border-line px-[18px] py-1.5 transition-colors duration-[var(--d1)] hover:bg-hover',
+        'group/row relative grid min-h-11 scroll-mt-8 cursor-pointer items-center gap-3 border-b border-line px-[18px] py-1.5 hover:bg-hover',
+        'data-[active]:bg-hover data-[active]:shadow-[inset_2px_0_0_var(--accent)]',
         PROJECT_GRID_COLS,
       )}
+      onFocus={onFocusRow}
       onClick={e => {
+        // Portalled menu items bubble through React but are not DOM children of the row.
+        if (!e.currentTarget.contains(e.target as Node)) return
         if ((e.target as HTMLElement).closest('a, button')) return
         onOpen()
       }}
     >
       <div className="flex min-w-0 items-center gap-2">
-        <ProjectNameLink project={project} />
+        <ProjectNameLink project={project} disambiguator={disambiguator} />
         {project.environment === 'local-lab' && <Badge variant="warn">Local Lab</Badge>}
       </div>
 
@@ -392,7 +472,7 @@ function ProjectRow({ project, now, onOpen }: { project: WorkspaceProject; now: 
         {latest ? <ProjectLatestRunCell latest={latest} now={now} /> : <span className="text-fg-subtle">No runs yet</span>}
       </div>
 
-      <div className="flex items-center justify-end gap-2 whitespace-nowrap text-[12px] tabular-nums text-fg-muted transition-opacity duration-[var(--d1)] group-hover/row:opacity-0 [@media(hover:hover)]:group-focus-within/row:opacity-0">
+      <div className="flex items-center justify-end gap-2 whitespace-nowrap text-[12px] tabular-nums text-fg-muted" data-slot="project-row-metrics">
         <span className={project.runCount > 0 ? '' : 'text-fg-subtle'}>
           {plural(project.runCount, 'run')}
         </span>
@@ -402,28 +482,86 @@ function ProjectRow({ project, now, onOpen }: { project: WorkspaceProject; now: 
         </span>
       </div>
 
-      <div
-        data-slot="project-row-actions"
-        className="pointer-events-none absolute right-[18px] top-1/2 flex -translate-y-1/2 translate-x-1 items-center gap-[5px] bg-[linear-gradient(90deg,transparent,var(--row-h)_22px)] pl-7 opacity-0 transition-[opacity,translate] duration-[var(--d2)] ease-kovo group-hover/row:pointer-events-auto group-hover/row:translate-x-0 group-hover/row:opacity-100 group-focus-within/row:pointer-events-auto group-focus-within/row:translate-x-0 group-focus-within/row:opacity-100 [@media(hover:none)]:hidden"
-      >
-        <Link
-          to="/projects/$projectId"
-          params={{ projectId: project.id }}
-          className={buttonVariants({ variant: 'outline' })}
-        >
-          Open
-        </Link>
-        <Link
-          to="/projects/$projectId"
-          params={{ projectId: project.id }}
-          search={{ newRun: '1' }}
-          className={buttonVariants({ variant: 'default' })}
-        >
-          New run
-        </Link>
-      </div>
+      <ProjectRowActions project={project} />
     </div>
   )
+}
+
+/** Window-level keys must never act while the user types or an overlay owns the keyboard. */
+function rowNavBlocked(e: KeyboardEvent): boolean {
+  if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return true
+  const target = e.target
+  if (target instanceof HTMLElement) {
+    if (target.isContentEditable || target.closest('input, textarea, select, [contenteditable="true"]')) return true
+  }
+  return Boolean(document.querySelector('[role="dialog"], [role="alertdialog"], [data-slot="dialog-content"], [role="menu"]'))
+}
+
+/** Next active row for j/k (always) and ↑/↓ (once row navigation is engaged); null = not a nav key. */
+function rowNavStep(key: string, active: number, count: number): number | null {
+  if (count === 0) return null
+  const engaged = active >= 0
+  if (key === 'j' || (engaged && key === 'ArrowDown')) return engaged ? Math.min(count - 1, active + 1) : 0
+  if (key === 'k' || (engaged && key === 'ArrowUp')) return engaged ? Math.max(0, active - 1) : 0
+  return null
+}
+
+/** AppShell's G-chord window: keys right after `g` belong to the chord, not the table. */
+const G_CHORD_MS = 800
+
+/**
+ * Roving active row for the projects table: j/k (and ↑/↓ once engaged) move
+ * it instantly, Enter opens the project, R opens New run. The active row's
+ * name link takes focus so screen readers follow and Enter stays native.
+ */
+function useProjectRowNav(rows: readonly WorkspaceProject[], onOpen: (p: WorkspaceProject) => void, onNewRun: (p: WorkspaceProject) => void) {
+  const [active, setActive] = useState(-1)
+  const listRef = useRef<HTMLDivElement>(null)
+  const keyboardMoveRef = useRef(false)
+  const activeRef = useRef(active)
+  activeRef.current = active
+
+  useEffect(() => {
+    let lastG = Number.NEGATIVE_INFINITY
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (rowNavBlocked(e)) return
+      if (e.key === 'g') { lastG = e.timeStamp; return }
+      if (e.timeStamp - lastG < G_CHORD_MS) return
+      const current = activeRef.current
+      const next = rowNavStep(e.key, current, rows.length)
+      if (next !== null) {
+        e.preventDefault()
+        keyboardMoveRef.current = true
+        setActive(next)
+        return
+      }
+      const project = rows[current]
+      if (!project) return
+      const onControl = e.target instanceof HTMLElement && Boolean(e.target.closest('a, button, [role="button"]'))
+      if (e.key === 'Enter' && !onControl) {
+        e.preventDefault()
+        onOpen(project)
+      } else if (e.key === 'r') {
+        e.preventDefault()
+        onNewRun(project)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [rows, onOpen, onNewRun])
+
+  useEffect(() => {
+    if (!keyboardMoveRef.current || active < 0) return
+    keyboardMoveRef.current = false
+    const row = listRef.current?.querySelectorAll<HTMLElement>('[data-slot=project-row]')[active]
+    row?.querySelector<HTMLElement>('[data-slot=project-name-link]')?.focus({ preventScroll: true })
+    row?.scrollIntoView({ block: 'nearest' })
+  }, [active])
+
+  // A new filter result starts unengaged; a shrinking list clamps.
+  useEffect(() => { setActive(-1) }, [rows])
+
+  return { active: active < rows.length ? active : -1, setActive, listRef }
 }
 
 function Workspace() {
@@ -457,6 +595,18 @@ function Workspace() {
       p.seeds.some(s => host(s).toLowerCase().includes(q)),
     )
   }, [projects, filter])
+
+  const disambiguators = useMemo(
+    () => projectDisambiguators(projects.map(p => ({ id: p.id, name: p.name, hosts: p.seeds.map(host) }))),
+    [projects],
+  )
+  const openProject = useCallback((p: WorkspaceProject) => {
+    void navigate({ to: '/projects/$projectId', params: { projectId: p.id } })
+  }, [navigate])
+  const openNewRun = useCallback((p: WorkspaceProject) => {
+    void navigate({ to: '/projects/$projectId', params: { projectId: p.id }, search: { newRun: '1' } })
+  }, [navigate])
+  const rowNav = useProjectRowNav(visibleProjects, openProject, openNewRun)
 
   return <main className="flex min-h-0 flex-1 flex-col">
     <header className="sticky top-0 z-10 flex h-11 min-w-0 flex-none items-center gap-2.5 border-b border-line bg-panel px-[18px] max-[720px]:h-auto max-[720px]:min-h-11 max-[720px]:flex-wrap max-[720px]:gap-y-2 max-[720px]:px-3.5 max-[720px]:py-2">
@@ -541,7 +691,7 @@ function Workspace() {
         </div>
       </div>
     ) : (
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div className="min-h-0 flex-1 overflow-auto" ref={rowNav.listRef}>
         {visibleProjects.length > 0 && (
           <div
             className={cn(
@@ -554,6 +704,7 @@ function Workspace() {
             <span className="max-[960px]:hidden">Seed host(s)</span>
             <span className="max-[720px]:hidden">Latest run</span>
             <span className="text-right">Runs / Findings</span>
+            <span className="max-[720px]:hidden"><span className="sr-only">Actions</span></span>
           </div>
         )}
 
@@ -569,12 +720,15 @@ function Workspace() {
               </>
             )}
           />
-        ) : visibleProjects.map(project => (
+        ) : visibleProjects.map((project, index) => (
           <ProjectRow
             key={project.id}
             project={project}
             now={now}
-            onOpen={() => void navigate({ to: '/projects/$projectId', params: { projectId: project.id } })}
+            active={index === rowNav.active}
+            disambiguator={disambiguators.get(project.id)}
+            onOpen={() => openProject(project)}
+            onFocusRow={() => rowNav.setActive(index)}
           />
         ))}
       </div>
