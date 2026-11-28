@@ -1,0 +1,136 @@
+{
+  "id": "s1-derived-cap-control-unknown-principal-neon-fp",
+  "side": "fp",
+  "archetype": "derived-capability-unknown-control-boundary",
+  "description": "R3-05 Neon independent bypass case (Class B1/B3): a tenant-b member exchanges a session that mints a derived capability with NO server-bound tenant marker (unknown principal). Using that unknown derived credential as a 403 denied control paired with an entitled tenant-a member reading its own org payout (200) must never confirm as a peer denial or actor differential in evaluateClaims, proofReceipt, or agentScriptReceipt.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Own-tenant payout read paired with unknown derived-credential denial",
+    "impact": "Entitled tenant-a member reads its own payout while an unknown derived capability receives 403.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Payout read behind unknown derived-credential 403 control"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true,
+    "agentScriptReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "claimedDelta": "Entitled member read its own org payout while an unknown derived credential was denied.",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/v1/orgs/tenant-a/payouts/7731"
+  },
+  "personas": [
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    },
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "mint",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/sessions/exchange",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"token\":\"parity-derived-token-8a1f\",\"role\":\"member\"}",
+      "requestJson": {
+        "grant": "exchange"
+      },
+      "emittedCapabilities": [
+        "cap:hop_1:token"
+      ]
+    },
+    {
+      "id": "ctl_cap",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/payouts/7731",
+      "persona": null,
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}",
+      "actorCapability": "cap:hop_1:token",
+      "actorCapabilitySourcePersona": "member_b",
+      "requestHeaders": {
+        "authorization": "Bearer parity-derived-token-8a1f"
+      }
+    },
+    {
+      "id": "prb_a",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/payouts/7731",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"7731\",\"tenantId\":\"tenant-a\",\"status\":\"settled\",\"amountCents\":120000,\"owner_id\":\"usr_a1\"}"
+    }
+  ],
+  "claims": [
+    {
+      "kind": "boundary",
+      "boundaryClass": "access",
+      "controlExchangeId": "ctl_cap",
+      "probeExchangeId": "prb_a"
+    }
+  ]
+}

@@ -634,7 +634,8 @@ test('R2-H-8: capability-injected Authorization/Cookie stamps source-capability 
   const fExplicit = factLog.getExchange(explicitId)!
   assert.equal(fExplicit.actor, tokHandle, 'must record capability handle, never base member_b')
   assert.equal(fExplicit.actorRole, 'admin', 'must stamp source-capability role (admin)')
-  assert.equal(fExplicit.actorTenant, 'acme', 'must stamp source-capability tenant (acme)')
+  // R3-05 B1: the minting response binds no tenant, so the derived credential's principal tenant is UNKNOWN (never the minter's 'acme').
+  assert.equal(fExplicit.actorTenant, null, 'must not inherit the minter tenant (server-bound tenant unknown)')
   assert.equal(fExplicit.actorRoleLabel, 'admin (acme)')
   assert.equal(fExplicit.ambientAuth, 'bearer')
   assert.equal(JSON.stringify(fExplicit.requestHeaders).includes('[redacted:cap:'), false)
@@ -642,14 +643,14 @@ test('R2-H-8: capability-injected Authorization/Cookie stamps source-capability 
   const fCookie = factLog.getExchange(cookieId)!
   assert.equal(fCookie.actor, ckHandle, 'must record cookie capability handle, never base member_b')
   assert.equal(fCookie.actorRole, 'admin')
-  assert.equal(fCookie.actorTenant, 'acme')
+  assert.equal(fCookie.actorTenant, null)
   assert.equal(fCookie.actorRoleLabel, 'admin (acme)')
   assert.equal(fCookie.ambientAuth, 'cookie')
 
   const fJwt = factLog.getExchange(jwtId)!
   assert.equal(fJwt.actor, jwtHandle, 'must record derived JWT handle, never base member_b')
   assert.equal(fJwt.actorRole, 'admin', 'derived JWT must inherit source admin role provenance')
-  assert.equal(fJwt.actorTenant, 'acme', 'derived JWT must inherit source acme tenant provenance')
+  assert.equal(fJwt.actorTenant, null, 'derived JWT must not inherit the minter tenant (server-bound tenant unknown)')
 })
 
 test('R2-H-22 & R2-H-27: DooD scratch dir mounts cleanly via resolveDoodMountArg and oversized op is not echoed', async (t) => {

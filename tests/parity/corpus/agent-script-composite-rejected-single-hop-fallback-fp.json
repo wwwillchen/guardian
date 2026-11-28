@@ -1,0 +1,204 @@
+{
+  "id": "agent-script-composite-rejected-single-hop-fallback-fp",
+  "side": "fp",
+  "archetype": "agent-script-composite-rejected-fallback",
+  "description": "A1 (paygrid FP #1 shape): the script's export probe authenticates with a derived session minted by a tenant-b member, creates a 202 job handle on the tenant-a org, and cites a tenant-a listing readback; the host REJECTED the script's CompositeProofReceipt (terminal_impact_unproven) and the script omitted its composite_receipt claim. A single-hop receipt built from the remaining claims must never fall back to a confirmation.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Org-scoped export job created by tenant member",
+    "impact": "Creates a queued export job handle on the member's own organization.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Export job handle obtained after rejected composite chain"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false,
+    "agentScriptReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "agentScriptExpectedReason": "composite_receipt: a host-recorded CompositeProofReceipt rejection is final",
+  "compositeRejected": {
+    "chainId": "agent-script-export-chain",
+    "terminalVulnClass": "bola",
+    "failedStage": "terminal_impact",
+    "rejectedBy": "terminal_impact_unproven"
+  },
+  "personas": [
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    },
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "redeem",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/invites/redeem",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"session\":{\"token\":\"parity-derived-session-71ce\",\"tenantId\":\"tenant-a\",\"role\":\"member\"}}",
+      "requestJson": {
+        "code": "inv-code-7"
+      },
+      "emittedCapabilities": [
+        "cap:hop_1:session"
+      ]
+    },
+    {
+      "id": "before",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"exports\":[]}"
+    },
+    {
+      "id": "ctl_viewer",
+      "arm": "control",
+      "role": "control",
+      "method": "POST",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": "viewer_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}",
+      "requestJson": {
+        "format": "csv"
+      }
+    },
+    {
+      "id": "prb_create",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": null,
+      "status": 202,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"jobId\":\"job_41\",\"status\":\"queued\"}",
+      "requestJson": {
+        "format": "csv"
+      },
+      "actorCapability": "cap:hop_1:session",
+      "actorCapabilitySourcePersona": "member_b",
+      "consumedCapabilities": [
+        "cap:hop_1:session"
+      ],
+      "requestHeaders": {
+        "authorization": "Bearer parity-derived-session-71ce"
+      }
+    },
+    {
+      "id": "rb_list",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"exports\":[{\"id\":\"job_41\",\"tenantId\":\"tenant-a\",\"status\":\"ready\",\"rows\":3}]}"
+    }
+  ],
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_create",
+      "beforeExchangeId": "before",
+      "afterExchangeId": "rb_list",
+      "controlExchangeIds": [
+        "ctl_viewer"
+      ]
+    }
+  ],
+  "composite": {
+    "chainId": "agent-script-export-chain",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "none",
+    "claimedDelta": "Member obtained an org export job handle; no terminal data was fetched.",
+    "singleHop": true,
+    "terminalExchangeId": "prb_create",
+    "preChainControlIds": [
+      "before",
+      "ctl_viewer"
+    ],
+    "postChainReadbackIds": [
+      "rb_list"
+    ],
+    "attackerPersonas": [
+      "member_b"
+    ],
+    "expectedFailedStage": "terminal_impact"
+  }
+}

@@ -1,0 +1,170 @@
+{
+  "id": "single-hop-own-resource-transition-business-logic-fp",
+  "side": "fp",
+  "archetype": "single-hop-own-resource-transition",
+  "description": "A3/B4: an entitled tenant-a writer repeats an equal-magnitude transition on its own resource with before/mid/after readbacks; the only 'refusal' is a 409 on a fabricated sibling object id the host never observed exist, which cannot serve as a refusal or boundary control.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "business_logic"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-840",
+    "category": "business-logic",
+    "title": "Repeated credit transition on own order",
+    "impact": "Applies the same credit transition twice to an owned order.",
+    "claimedImpact": "business_logic",
+    "claimedBoundary": "other",
+    "vulnClass": "business_logic"
+  },
+  "freeTextLabel": {
+    "title": "Repeated business transition on owned resource"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true,
+    "agentScriptReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "agentScriptExpectedReason": "require a host-recorded refusal/boundary control",
+  "proofReceipt": {
+    "vulnClass": "business_logic",
+    "claimedDelta": "Owner applied the same credit transition twice to its own order.",
+    "targetMethod": "PATCH",
+    "targetPathAndQuery": "/v1/orders/1042/credit"
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "fab",
+      "arm": "control",
+      "role": "control",
+      "method": "PATCH",
+      "pathAndQuery": "/v1/orders/990001/credit",
+      "persona": "member_a",
+      "status": 409,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"conflict\"}",
+      "requestJson": {
+        "amount": 5
+      }
+    },
+    {
+      "id": "before",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orders/1042",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"1042\",\"tenantId\":\"tenant-a\",\"balance\":10,\"status\":\"open\"}"
+    },
+    {
+      "id": "prb1",
+      "arm": "probe",
+      "role": "probe",
+      "method": "PATCH",
+      "pathAndQuery": "/v1/orders/1042/credit",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"ok\":true}",
+      "requestJson": {
+        "amount": 5
+      }
+    },
+    {
+      "id": "mid",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orders/1042",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"1042\",\"tenantId\":\"tenant-a\",\"balance\":15,\"status\":\"open\"}"
+    },
+    {
+      "id": "prb2",
+      "arm": "probe",
+      "role": "probe",
+      "method": "PATCH",
+      "pathAndQuery": "/v1/orders/1042/credit",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"ok\":true}",
+      "requestJson": {
+        "amount": 5
+      }
+    },
+    {
+      "id": "after",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orders/1042",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"1042\",\"tenantId\":\"tenant-a\",\"balance\":20,\"status\":\"open\"}"
+    }
+  ],
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "business_logic",
+      "probeExchangeId": "prb1",
+      "beforeExchangeId": "before",
+      "afterExchangeId": "after",
+      "controlExchangeIds": [
+        "fab",
+        "mid",
+        "prb2"
+      ]
+    }
+  ]
+}

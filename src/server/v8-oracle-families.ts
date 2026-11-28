@@ -10,7 +10,7 @@
  * non-monotonic timestamps, or hardened responses always fail closed (`satisfied: false`).
  */
 
-import { ROLE_RANK, isReadMethod, normalizeRole, resolvePersonaIdentity, routeFamily, stepReadsState, type ImpactAssessment, type RoleName } from './oracle-invariants.ts'
+import { ROLE_RANK, flattenJson, isReadMethod, normalizeRole, resolvePersonaIdentity, routeFamily, stepReadsState, type ImpactAssessment, type RoleName } from './oracle-invariants.ts'
 import type { HydratableEntry } from './v8-oracle-hydrate.ts'
 import { resolveTerminalContractKind } from './oracle-spec.ts'
 export { resolveCompositeTerminalContract } from './oracle-spec.ts'
@@ -244,6 +244,21 @@ function isVerifiedSessionGrant(val: unknown, status?: number | null, method?: s
   for (const [k, v] of Object.entries(t)) { const lk = k.trim().toLowerCase(); if (SESSION_DISQ_RE.test(lk) || ((lk === 'verified' || lk === 'active' || lk === 'ok' || lk === 'success') && v === false) || ((lk === 'revoked' || lk === 'pending' || lk === 'queued') && v === true) || ((lk === 'status' || lk === 'state') && typeof v === 'string' && /^(?:queued|pending|processing|accepted|unverified|denied|failed|error|rejected)$/i.test(v.trim()))) return false; if (SESSION_TOK_RE.test(lk) && typeof v === 'string' && v.trim().length >= 4) hasTok = true; if (SESSION_AUTH_RE.test(lk) && ((typeof v === 'string' && v.trim().length > 0) || (Array.isArray(v) && v.length > 0))) hasAuth = true }
   return hasTok && hasAuth
 }
+/** B1: server-bound tenant of a credential minted by a host-observed session-grant response (exactly one tenant marker), else null (unknown principal). */
+export function serverBoundGrantTenant(body: string | undefined, status: number | null | undefined, method: string | undefined): string | null {
+  const val = parseJsonOrBody(undefined, body)
+  if (!isVerifiedSessionGrant(val, status, method)) return null
+  const tenants = extractTenantMarkers(val, body)
+  return tenants.size === 1 ? [...tenants][0]! : null
+}
+const LIFECYCLE_STATE_KEY_RE = /^(?:status|state|workflow[_-]?status|workflow[_-]?state|approval[_-]?status|approval[_-]?state|lifecycle[_-]?state|lifecycle[_-]?status|stage|phase)$/i, INTERMEDIATE_STATE_VAL_RE = /^(?:draft|queued|pending(?:[_-](?:approval|review|verification|settlement|execution|processing))?|awaiting[_-](?:approval|review|verification|settlement|confirmation)|unapproved|unverified|scheduled|enqueued|staged|initiated|requested|submitted|processing|in[_-]progress|accepted|primed)$/i, FINALIZED_STATE_VAL_RE = /^(?:approved|settled|paid|disbursed|released|completed|fulfilled|captured|executed|published|active|confirmed|verified|granted|promoted|revoked|deleted|voided|refunded)$/i, UNAPPROVED_BOOL_KEY_RE = /^(?:requires[_-]?approval|needs[_-]?approval|pending[_-]?approval|is[_-]?draft)$/i, TERMINAL_BOOL_KEY_RE = /^(?:approved|settled|disbursed|verified|finalized|published|executed)$/i, COLLECTION_COUNT_KEY_RE = /^(?:count|total_?count|length|size|updated_?at|version)$/i
+/** Shared intermediate-lifecycle state detector (C1/C2): pending/draft/queued objects without finalized state or pre-existing mutation. */
+export function intermediateLifecycleState(json: unknown, status?: number | null, beforeFlat?: Map<string, string>): { state: string | null; existingMutated: boolean } {
+  if (!json || typeof json !== 'object') return { state: null, existingMutated: false }; let state: string | null = null, existingMutated = false
+  for (const [path, rawVal] of flattenJson(json)) { const existed = Boolean(beforeFlat?.has(path)); if (existed && beforeFlat!.get(path) === rawVal) continue; const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase(), val = rawVal.trim(); if (LIFECYCLE_STATE_KEY_RE.test(leaf)) { if (FINALIZED_STATE_VAL_RE.test(val)) return { state: null, existingMutated }; if (!state && INTERMEDIATE_STATE_VAL_RE.test(val)) state = val.toLowerCase() } else if (!state && ((UNAPPROVED_BOOL_KEY_RE.test(leaf) && val.toLowerCase() === 'true') || ((status === 201 || status === 202) && TERMINAL_BOOL_KEY_RE.test(leaf) && val.toLowerCase() === 'false'))) state = 'unapproved'; else if (existed && !COLLECTION_COUNT_KEY_RE.test(leaf)) existingMutated = true }
+  return { state, existingMutated }
+}
+
 /** Universal structural & differential stub/ack/enqueue detector (language-agnostic). */
 export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string, _route?: string | null, baselineJson?: unknown, hasDeniedControl = false): boolean {
   let val = json; const trimmed = typeof body === 'string' ? body.trim() : ''
@@ -866,7 +881,9 @@ export function evaluateOwnScopeTerminalGuard(p: OwnScopeGuardParams): string | 
   const term = p.termEx, cleanPath = normalizeGuardPath(term.step.route ?? term.step.pathAndQuery), reads = stepReadsState(term.step)
   const termActor = guardActorOf(term), ctrlActor = p.terminalCtrl ? guardActorOf(p.terminalCtrl) : null
   const own = new Set<string>([...p.attackerTenants].map(normKey).filter(Boolean))
-  const labels = [term.actorRoleLabel, termActor ? p.personaRoleLabels?.[termActor] : undefined, ctrlActor ? p.personaRoleLabels?.[ctrlActor] : undefined, ...(p.upstreamEntries ?? []).flatMap(u => { const a = guardActorOf(u); return [u.actorRoleLabel, a ? p.personaRoleLabels?.[a] : undefined] })]
+  // B1: a derived (capability) actor's role label is inherited from its MINTER, so it never contributes the attacker's own tenants.
+  const isCapActor = (a: string | null | undefined): boolean => Boolean(a?.startsWith('cap:'))
+  const labels = [isCapActor(termActor) ? undefined : term.actorRoleLabel, termActor ? p.personaRoleLabels?.[termActor] : undefined, ctrlActor && !isCapActor(ctrlActor) ? p.personaRoleLabels?.[ctrlActor] : undefined, ...(p.upstreamEntries ?? []).flatMap(u => { const a = guardActorOf(u); return isCapActor(a) ? [] : [u.actorRoleLabel, a ? p.personaRoleLabels?.[a] : undefined] })]
   for (const lbl of labels) { const m = lbl ? SLUG_LABEL_RE.exec(lbl) : null; if (m?.[1]) own.add(m[1].toLowerCase()) }
   const segs = cleanPath.split('/').filter(Boolean), lastSeg = segs[segs.length - 1] ?? ''
   const scopeIdx = segs.findIndex(s => TENANT_SCOPE_SEG_RE.test(s)), scopeTenant = scopeIdx >= 0 ? segs[scopeIdx + 1] ?? null : null
@@ -960,18 +977,28 @@ function normalizedReadbackRoute(e: HydratableEntry): string {
   const pairs = [...new URLSearchParams(qs).entries()].map(([k, v]) => [k.trim().toLowerCase(), v.trim().toLowerCase()] as const).sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]))
   return pairs.length > 0 ? `${cleanP}?${pairs.map(([k, v]) => `${k}=${v}`).join('&')}` : cleanP
 }
-/** True when an earlier same-route/method/actor 2xx readback has IDENTICAL normalized state (zero persisted delta). */
-export function isZeroDeltaPostMutationReadback(rb: HydratableEntry, termEx: HydratableEntry | undefined, entriesById: ReadonlyMap<string, HydratableEntry>): boolean {
+/** Readback `rb`'s state fingerprint plus those of every earlier (pre-probe) same-route/method/actor 2xx baseline read; null when `rb` has no fingerprintable state. */
+function preProbeBaselineFingerprints(rb: HydratableEntry, termEx: HydratableEntry | undefined, entriesById: ReadonlyMap<string, HydratableEntry>): { rbFp: string; baselines: Array<string | null> } | null {
   const rbFp = readbackStateFingerprint(rb.step.json, rb.step.body), rbRoute = normalizedReadbackRoute(rb)
-  if (!rbFp || !rbRoute) return false
-  const rbMeth = rb.step.method.toUpperCase(), rbActor = normKey(guardActorOf(rb))
+  if (!rbFp || !rbRoute) return null
+  const rbMeth = rb.step.method.toUpperCase(), rbActor = normKey(guardActorOf(rb)), baselines: Array<string | null> = []
   const cutoff = typeof termEx?.timestampMs === 'number' && Number.isFinite(termEx.timestampMs) ? termEx.timestampMs : (typeof rb.timestampMs === 'number' && Number.isFinite(rb.timestampMs) ? rb.timestampMs : null)
   for (const pre of entriesById.values()) {
     if (pre.exchangeId === rb.exchangeId || pre.exchangeId === termEx?.exchangeId || !isOk(pre.step.status) || !stepReadsState(pre.step) || pre.step.method.toUpperCase() !== rbMeth) continue
     if (cutoff !== null && (typeof pre.timestampMs !== 'number' || !Number.isFinite(pre.timestampMs) || pre.timestampMs >= cutoff)) continue
-    if (normalizedReadbackRoute(pre) === rbRoute && normKey(guardActorOf(pre)) === rbActor && readbackStateFingerprint(pre.step.json, pre.step.body) === rbFp) return true
+    if (normalizedReadbackRoute(pre) === rbRoute && normKey(guardActorOf(pre)) === rbActor) baselines.push(readbackStateFingerprint(pre.step.json, pre.step.body))
   }
-  return false
+  return { rbFp, baselines }
+}
+/** True when an earlier same-route/method/actor 2xx readback has IDENTICAL normalized state (zero persisted delta). */
+export function isZeroDeltaPostMutationReadback(rb: HydratableEntry, termEx: HydratableEntry | undefined, entriesById: ReadonlyMap<string, HydratableEntry>): boolean {
+  const b = preProbeBaselineFingerprints(rb, termEx, entriesById)
+  return Boolean(b && b.baselines.includes(b.rbFp))
+}
+/** C1: `rb` brackets the probe with a host-observed persisted delta — a pre-probe same-route/method/actor baseline read exists and EVERY such baseline differs from `rb`. */
+export function hasBracketingBaselineDelta(rb: HydratableEntry, termEx: HydratableEntry | undefined, entriesById: ReadonlyMap<string, HydratableEntry>): boolean {
+  const b = preProbeBaselineFingerprints(rb, termEx, entriesById)
+  return Boolean(b && b.baselines.some(fp => fp !== null) && !b.baselines.includes(b.rbFp))
 }
 /** First valid post-mutation readback with a non-zero persisted delta; `rejectedZeroDelta` when only zero-delta candidates exist. */
 export function selectVerifiedPostMutationReadback<T extends HydratableEntry>(postChainIds: readonly string[], termEx: T | undefined, entriesById: ReadonlyMap<string, T>, isCrossTenantCls: boolean, isOwnTenantOnly: (e: T) => boolean, hasEntryBody: (e: T) => boolean, isStubEntry: (e: T) => boolean): { postMutRb: T | undefined; rejectedZeroDelta: boolean } {

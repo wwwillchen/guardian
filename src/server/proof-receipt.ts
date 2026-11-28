@@ -49,7 +49,7 @@ import {
   assessImpactEvidence,
   assessInjectionImpact,
   assessStatusOnlyDivergence,
-  hasForeignTenantOrOwnerDisclosure,
+  deniedControlTenantCompatible, flattenJson, hasForeignTenantOrOwnerDisclosure, isDeniedControlStatus, isUnknownDerivedPrincipal,
   isObjectScopedRequest,
   knownOracleEvent,
   routeFamily,
@@ -83,7 +83,7 @@ import {
 import { evaluateMustBeNonPublicStage } from './proof-kernel/publicness.ts'
 export { normalizeRequestCarrier }
 export type { NormalizedRequestCarrier, RequestCarrierInput }
-import { isJobOrHandleStub } from './v8-oracle-families.ts'
+import { extractTenantMarkers, hasBracketingBaselineDelta, intermediateLifecycleState, isJobOrHandleStub, selectVerifiedPostMutationReadback } from './v8-oracle-families.ts'
 import { deriveBooleanRemediationCode, deriveImpactRemediationCode, type OracleFailureCode } from './retry-governor.ts'
 import { assessSignedUrlMintDifferential, type SignedUrlMintExchange } from './verify-support.ts'
 import {
@@ -553,22 +553,13 @@ export interface ReceiptVerification {
 }
 
 /** Classify a receipt's vulnerability label via the authoritative `OracleSpec` registry (`R3-13`). */
-export function receiptRuleFor(vulnClass: string, receipt?: { readonly oobEventIds: readonly string[] }): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
-  const { rule, impactClass } = resolveReceiptRule(vulnClass, receipt)
-  return impactClass ? { rule, impactClass } : { rule }
-}
+export function receiptRuleFor(vulnClass: string, receipt?: { readonly oobEventIds: readonly string[] }): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } { const { rule, impactClass } = resolveReceiptRule(vulnClass, receipt); return impactClass ? { rule, impactClass } : { rule } }
 
-function reject(receipt: Pick<HostSanitizedReceipt, 'vulnClass' | 'claimedDelta'>, rule: ReceiptVerification['rule'], reason: string, failureCode: OracleFailureCode = 'oracle_disagreement'): ReceiptVerification {
-  return { confirmed: false, vulnClass: receipt.vulnClass, rule, failureCode, reason, observed: receipt.claimedDelta, expected: 'host-recorded evidence that substantiates the claimed delta' }
-}
+function reject(receipt: Pick<HostSanitizedReceipt, 'vulnClass' | 'claimedDelta'>, rule: ReceiptVerification['rule'], reason: string, failureCode: OracleFailureCode = 'oracle_disagreement'): ReceiptVerification { return { confirmed: false, vulnClass: receipt.vulnClass, rule, failureCode, reason, observed: receipt.claimedDelta, expected: 'host-recorded evidence that substantiates the claimed delta' } }
 
-function normalizePath(value: string | undefined): string {
-  return (value ?? '').split('?')[0].split('#')[0].replace(/\/+$/, '').toLowerCase()
-}
+function normalizePath(value: string | undefined): string { return (value ?? '').split('?')[0].split('#')[0].replace(/\/+$/, '').toLowerCase() }
 
-function routeOf(step: ImpactStep): string {
-  return normalizePath(step.route ?? step.pathAndQuery ?? '')
-}
+function routeOf(step: ImpactStep): string { return normalizePath(step.route ?? step.pathAndQuery ?? '') }
 
 function headerValue(headers: Record<string, string> | null | undefined, name: string): string | null {
   if (!headers) return null
@@ -578,21 +569,11 @@ function headerValue(headers: Record<string, string> | null | undefined, name: s
   return null
 }
 
-function locationOf(step: ImpactStep): string | null {
-  return headerValue(step.responseHeaders, 'location')
-}
+function locationOf(step: ImpactStep): string | null { return headerValue(step.responseHeaders, 'location') }
 
-function hostOf(value: string | null, base?: string | null): string | null {
-  if (!value) return null
-  try { return new URL(value, base ?? 'http://kovo.invalid').host.toLowerCase() } catch { return null }
-}
+function hostOf(value: string | null, base?: string | null): string | null { if (!value) return null; try { return new URL(value, base ?? 'http://kovo.invalid').host.toLowerCase() } catch { return null } }
 
-interface InlineWebhookSignature {
-  valid: boolean
-  delivery: string
-  keyField: string
-  signatureField: string
-}
+interface InlineWebhookSignature { valid: boolean; delivery: string; keyField: string; signatureField: string }
 
 /** Recompute an inline-key webhook HMAC strictly from the host-recorded request body. */
 function inlineWebhookSignature(step: ImpactStep): InlineWebhookSignature | null {
@@ -1394,7 +1375,7 @@ export function verifyReceipt(
   if (
     (impactClass === 'authorization' || impactClass === 'bfla' || impactClass === 'disclosure' ||
       impactClass === 'business_logic' || impactClass === 'mass_assignment' || impactClass === 'csrf') &&
-    isPureJobOrHandleStubChain(steps)
+    isUnverifiedTargetProbeStub(receipt, citedEntries)
   ) {
     return reject(
       receipt,
@@ -1493,7 +1474,7 @@ export function verifyReceipt(
       Boolean(s.actor.handle) ||
       Boolean(s.actor.tenant) ||
       Boolean(headerValue(s.requestHeaders, 'authorization') || headerValue(s.requestHeaders, 'cookie'))
-    const deniedCtrls = steps.filter(s => s.arm === 'control' && (s.status === 401 || s.status === 403))
+    const deniedCtrls = steps.filter(s => s.arm === 'control' && isDeniedControlStatus(s.status))
     const okAuthProbes = steps.filter(s => s.arm === 'probe' && is2xxStatus(s.status) && stepHasAuth(s))
     // Require an authenticated DENIED peer control on a compatible route (same tenant or
     // untenant-scoped) — never an unauthenticated 401 login wall paired with an authenticated 200
@@ -1501,10 +1482,10 @@ export function verifyReceipt(
     const hasAuthDeniedCtrl = deniedCtrls.some(c =>
       controlHasIdentityAuth(c) &&
       okAuthProbes.some(p => {
-        const ct = c.actor.tenant?.toLowerCase() ?? null
-        const pt = p.actor.tenant?.toLowerCase() ?? null
-        const tenantCompatible = !ct || !pt || ct === pt
-        if (!tenantCompatible) return false
+        // B3: the ONE shared denied-control predicate (401/403/404): a cross-tenant denial or an unknown derived
+        // principal is tenant isolation, never a peer denial, on every confirmation path.
+        if (!deniedControlTenantCompatible(c, p)) return false
+        // Route-family compatibility is still required for an authenticated peer denial.
         const cf = routeFamily(c.route ?? c.pathAndQuery ?? '')
         const pf = routeFamily(p.route ?? p.pathAndQuery ?? '')
         return cf !== '' && pf !== '' && (cf === pf || cf.startsWith(`${pf}/`) || pf.startsWith(`${cf}/`))
@@ -1546,7 +1527,7 @@ export function verifyReceipt(
         visit(obj, 0)
         // A same-tenant org-shared record (`tenant_id === probe.tenant`) carrying a peer's `owner`
         // field is not foreign-owner disclosure without an authenticated boundary denial.
-        return foundForeignTenant || (!foundOwnTenant && !pt && foundForeignOwner)
+        return foundForeignTenant || (!foundOwnTenant && !pt && foundForeignOwner && !isUnknownDerivedPrincipal(p.actor))
       })
       if (!hasForeign) {
         return reject(
@@ -4136,6 +4117,25 @@ export function buildOobReceipt(input: {
  * True when every 2xx probe step is a job/handle/ack stub (`isJobOrHandleStub`) and no subsequent
  * non-stub readback step (GET/HEAD/OPTIONS) exposes substantive terminal state.
  */
+const CROSS_TENANT_LABEL_RE = /cross[_-]?tenant|tenant[_-]?(?:isolation|bleed|leak|export)|dual[_-]?tenant|(?:^|[_-])(?:idor|bola)(?:[_-]|$)/i
+
+/**
+ * C1: the receipt's TARGET probe (its mutating 2xx probe, else the 2xx probe on the receipt target path, else the first
+ * 2xx probe) is an intermediate stub cleared only by a verified post-mutation readback on its own resource tree or bracketed by a pre-probe baseline delta — never an unbracketed sibling read.
+ */
+export function isUnverifiedTargetProbeStub(receipt: Pick<ProofReceipt, 'vulnClass' | 'target'>, cited: readonly ReceiptTranscriptEntry[]): boolean {
+  const ok = cited.filter(e => e.step.arm === 'probe' && is2xxStatus(e.step.status)), targetPath = normalizePath(receipt.target.pathAndQuery)
+  const target = ok.find(e => stepMutatesState(e.step)) ?? ok.find(e => targetPath !== '' && routeOf(e.step) === targetPath) ?? ok[0]
+  const hasBody = (e: ReceiptTranscriptEntry): boolean => e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0), isJobStub = (e: ReceiptTranscriptEntry): boolean => isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
+  if (!target || (!isJobStub(target) && !(/^(?:POST|PUT)$/i.test(target.step.method) && intermediateLifecycleState(parseStepJson(target.step), target.step.status).state !== null))) return false
+  const hydrated = new Map(cited.map((e, idx) => [e.exchangeId, { ...e, timestampMs: typeof e.seq === 'number' ? e.seq : idx }]))
+  const probeTenants = new Set([target.step.actor.tenant?.toLowerCase(), ...(target.step.actor.tenants ?? []).map(t => t.toLowerCase())].filter((t): t is string => Boolean(t))), ownTenantOnly = (e: ReceiptTranscriptEntry): boolean => { const ts = extractTenantMarkers(e.step.json, e.step.body); return ts.size > 0 && probeTenants.size > 0 && [...ts].every(t => probeTenants.has(t)) }
+  const termHyd = hydrated.get(target.exchangeId)!, tf = routeFamily(routeOf(target.step)), sameTree = (e: ReceiptTranscriptEntry): boolean => { const f = routeFamily(routeOf(e.step)); return f !== '' && tf !== '' && (f === tf || f.startsWith(`${tf}/`) || tf.startsWith(`${f}/`)) }
+  const isRbStub = (e: ReceiptTranscriptEntry & { timestampMs: number }): boolean => { if (isJobStub(e)) return true; const pre = [...hydrated.values()].reverse().find(p => p.exchangeId !== e.exchangeId && p.timestampMs < termHyd.timestampMs && is2xxStatus(p.step.status) && !stepMutatesState(p.step) && routeOf(p.step) === routeOf(e.step)), pj = pre ? parseStepJson(pre.step) : undefined, lc = intermediateLifecycleState(parseStepJson(e.step), e.step.status, pj && typeof pj === 'object' ? flattenJson(pj) : new Map()); return Boolean(lc.state && !lc.existingMutated) }
+  const later = [...hydrated.values()].filter(e => e.exchangeId !== target.exchangeId && e.timestampMs > termHyd.timestampMs && (sameTree(e) || hasBracketingBaselineDelta(e, termHyd, hydrated))).map(e => e.exchangeId)
+  return !selectVerifiedPostMutationReadback(later, termHyd, hydrated, CROSS_TENANT_LABEL_RE.test(receipt.vulnClass), ownTenantOnly, hasBody, e => hasBody(e) && isRbStub(e)).postMutRb
+}
+
 export function isPureJobOrHandleStubChain(steps: readonly ImpactStep[]): boolean {
   const okProbes: Array<{ step: ImpactStep; idx: number }> = []
   for (let i = 0; i < steps.length; i += 1) {

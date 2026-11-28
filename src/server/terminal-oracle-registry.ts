@@ -17,6 +17,7 @@ import {
   singleReceiptToComposite,
   verifyCompositeReceipt,
   verifyHostRecordSignature,
+  type CompositeOracleEvaluator,
   type CompositeProofReceipt,
   type CompositeReceiptVerification,
   type CompositeVerifyOptions,
@@ -131,6 +132,12 @@ export interface TerminalOraclePolicyContext {
   compositeOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
   /** Host-configured Tier-2 skeptic policy judge (fail-closed; only consulted when Tier-1 terminal impact is undecided). */
   policyJudge?: PolicyJudgeOptions
+  /**
+   * B2: set ONLY by `verifyCompositeReceipt` when it evaluates a terminal proof embedded in a >= 2-hop DAG whose
+   * attacker-provenance stage already validated every derived capability's minting hop. A bare single-hop
+   * receipt never carries it, so a capability-authenticated single-hop authorization probe fails closed.
+   */
+  derivedCredentialProvenance?: 'composite_dag'
   /** R3-17: Environment mode enforced by budgeted publicness replay stage (defaults to `'prod_readonly'`). */
   environmentMode?: PublicnessReplayEnvironmentMode
   /** R3-17: Optional per-run finite budget ledger for active publicness replay checks. */
@@ -420,15 +427,45 @@ function runSingleHopPreOracleStages(
   return null
 }
 
+const DERIVED_CREDENTIAL_BOUNDARY_IMPACTS: ReadonlySet<string> = new Set(['authorization', 'bfla', 'disclosure', 'business_logic', 'mass_assignment'])
+
+/**
+ * B2: an authorization-boundary single-hop receipt whose succeeding probe authenticated with a derived
+ * (capability-sealed) credential cannot confirm on its own: the boundary crossing, if any, belongs to the
+ * hop that MINTED the credential, which only a composite DAG with verified minting provenance can attribute.
+ */
+function derivedCredentialSingleHopError(
+  receipt: ProofReceipt,
+  transcript: HostSignedTranscript,
+  rule: ReceiptVerification['rule'],
+  impactClass: string | undefined,
+): string | null {
+  const boundaryRule = rule === 'auth_bypass' || (rule === 'impact' && impactClass !== undefined && DERIVED_CREDENTIAL_BOUNDARY_IMPACTS.has(impactClass))
+  if (!boundaryRule) return null
+  const cited = new Set(receipt.exchangeIds)
+  const capProbe = (transcript.entries ?? []).find(e => {
+    if (!cited.has(e.exchangeId) || e.step.arm !== 'probe') return false
+    const status = e.step.status
+    if (typeof status !== 'number' || status < 200 || status >= 300) return false
+    const actor = e.actorPersona ?? e.step.actor.handle ?? ''
+    return actor.startsWith('cap:')
+  })
+  return capProbe
+    ? `derived_credential_requires_composite: probe "${capProbe.exchangeId}" authenticated with a derived capability credential; the boundary crossing belongs to the minting hop and must be proven by a multi-hop CompositeProofReceipt with verified minting provenance.`
+    : null
+}
+
 function defaultSingleHopHandler(
   factLog: HostFactLog,
   receipt: ProofReceipt,
   transcript: HostSignedTranscript,
   policy: TerminalOraclePolicyContext,
 ): ReceiptVerification {
-  const { rule, spec } = resolveReceiptRule(receipt.vulnClass, receipt)
+  const { rule, spec, impactClass } = resolveReceiptRule(receipt.vulnClass, receipt)
   const effectiveRule: ReceiptVerification['rule'] = rule
-  const custodyErr = checkHostCustodySignatures(receipt, transcript, policy)
+  // Host signatures cover the ORIGINAL host-recorded entries; arm/evidence-role overrides are later host
+  // projections, so custody is always verified against the un-overridden signed projection.
+  const custodyErr = checkHostCustodySignatures(receipt, factLog.toHostSignedTranscript(), policy)
   if (custodyErr) {
     return {
       confirmed: false,
@@ -443,6 +480,21 @@ function defaultSingleHopHandler(
     ...policy,
     strictHostDerivation: true,
   })
+  const derivedErr = policy.derivedCredentialProvenance === 'composite_dag'
+    ? null
+    : derivedCredentialSingleHopError(canonicalReceipt, transcript, effectiveRule, impactClass)
+  if (derivedErr) {
+    return {
+      confirmed: false,
+      vulnClass: receipt.vulnClass,
+      rule: effectiveRule,
+      failureCode: 'oracle_disagreement',
+      reason: derivedErr,
+      observed: receipt.claimedDelta,
+      expected: 'a multi-hop CompositeProofReceipt whose DAG validates the derived credential minting hop',
+      evidence: { rejectedBy: 'derived_credential_requires_composite' },
+    }
+  }
   if (effectiveRule !== 'none') {
     const stageRejection = runSingleHopPreOracleStages(spec, canonicalReceipt, transcript, policy, effectiveRule)
     if (stageRejection) return stageRejection
@@ -586,6 +638,11 @@ const tier2ResultFields = (c: CompositeReceiptVerification): Pick<TerminalOracle
  * undecided; its fail-closed clamping (`needs_review`, never `confirmed` without repo or refusal
  * proof) is authoritative.
  */
+function isDecidedTerminalUnprovenRejection(composite: Pick<CompositeReceiptVerification, 'rejectedBy' | 'missingEvidence'>): boolean {
+  return composite.rejectedBy === 'terminal_impact_unproven'
+    || (composite.missingEvidence ?? []).some(item => item.startsWith('terminal_impact_unproven'))
+}
+
 function withTier2PolicyJudge(policy: TerminalOraclePolicyContext, transcript: HostSignedTranscript, rawReceipt: unknown, composite: CompositeReceiptVerification): CompositeReceiptVerification {
   const parsed = compositeProofReceiptSchema.safeParse(rawReceipt)
   if (!parsed.success) return composite
@@ -596,6 +653,9 @@ function withTier2PolicyJudge(policy: TerminalOraclePolicyContext, transcript: H
   }
   const judge = policy.policyJudge ?? policy.compositeOptions?.policyJudge
   if (!judge || composite.failedStage !== 'terminal_impact') return composite
+  // A5: Tier-2 adjudicates ONLY undecided terminal impact. A Tier-1 `terminal_impact_unproven` verdict (intermediate
+  // stub/handle, own-scope, own-tenant-only, missing terminal evidence) is a decided rejection the judge can never flip.
+  if (isDecidedTerminalUnprovenRejection(composite)) return composite
   const citedExchangeIds = [...receipt.hops.flatMap(h => h.exchangeIds), ...receipt.terminalImpact.preChainControlExchangeIds, ...receipt.terminalImpact.postChainReadbackExchangeIds]
   const decision = evaluatePolicyJudge({ ...judge, vulnClass: composite.terminalVulnClass, exchanges: transcript.entries ?? [], citedExchangeIds, ...(signingKey ? { signingKey } : {}) })
   const compiledPredicate = decision.confirmed && signingKey ? compileVerifyFixPredicate(receipt, transcript, { confirmed: true, signingKey, vulnClass: composite.terminalVulnClass, policyJudgeDecision: decision }) : null
@@ -604,6 +664,27 @@ function withTier2PolicyJudge(policy: TerminalOraclePolicyContext, transcript: H
     ...(decision.confirmed ? { failedStage: undefined, rejectedBy: null, missingEvidence: [] } : {}),
     reason: `Tier-2 policy judge ${decision.verdict}: ${decision.reason} (Tier-1: ${composite.reason})`.slice(0, 600),
     ...(compiledPredicate ? { compiledPredicate } : {}),
+  }
+}
+
+/** Leaf verification surfaced by a 1-node envelope: a composite-gate rejection never surfaces a stale `confirmed: true` leaf. */
+function envelopeSingleHopVerification(compRes: CompositeReceiptVerification, canonical: ProofReceipt, rule: ReceiptVerification['rule']): ReceiptVerification {
+  const leaf: ReceiptVerification = compRes.terminalVerification ?? {
+    confirmed: compRes.confirmed,
+    vulnClass: canonical.vulnClass,
+    rule,
+    reason: compRes.reason,
+    observed: canonical.claimedDelta,
+    expected: 'host-custody verified single-hop composite envelope',
+    ...(compRes.evidence ? { evidence: compRes.evidence } : {}),
+  }
+  if (compRes.confirmed || !leaf.confirmed) return leaf
+  return {
+    ...leaf,
+    confirmed: false,
+    reason: compRes.reason,
+    failureCode: 'oracle_disagreement',
+    evidence: { ...(leaf.evidence ?? {}), rejectedBy: compRes.rejectedBy ?? `composite_${compRes.failedStage ?? 'receipt'}` },
   }
 }
 
@@ -664,6 +745,29 @@ export class TerminalOracleRegistry {
 
   claimEvaluatorSpecsFor(kind: OracleClaimKind): readonly string[] {
     return getRegisteredClaimEvaluatorSpecs(kind)
+  }
+
+  /**
+   * A2: the embedded terminal proof of a 1-node envelope is evaluated with the SAME host arm/evidence-role
+   * projection and host-trusted policy as the envelope (never raw worker arms), and never with composite-DAG
+   * credential provenance (a 1-node envelope validated no minting hop).
+   */
+  private envelopeEmbeddedEvaluator(
+    pointerRef: Extract<TerminalOraclePointerRef, { kind: 'single_hop' }>,
+    policyContext: TerminalOraclePolicyContext,
+    effectivePolicy: TerminalOraclePolicyContext,
+  ): CompositeOracleEvaluator {
+    const embeddedPolicy: TerminalOraclePolicyContext = { ...effectivePolicy, strictHostDerivation: true, derivedCredentialProvenance: undefined }
+    return {
+      evaluate: (fl, ref, ctx) => ref.kind === 'single_hop'
+        ? this.evaluate(fl, {
+            kind: 'single_hop',
+            receipt: ref.receipt,
+            ...(pointerRef.armOverrides ? { armOverrides: pointerRef.armOverrides } : {}),
+            ...(pointerRef.evidenceRoleOverrides ? { evidenceRoleOverrides: pointerRef.evidenceRoleOverrides } : {}),
+          }, embeddedPolicy)
+        : this.evaluate(fl, ref, { ...(ctx ?? {}), ...(policyContext.signingKey ? { signingKey: policyContext.signingKey } : {}), strictHostDerivation: true }),
+    }
   }
 
   /**
@@ -782,15 +886,23 @@ export class TerminalOracleRegistry {
     }
 
     if (pointerRef.enforceCompositeEnvelope) {
+      // Custody: ORIGINAL host-signed entries (overrides are later host projections); then the full 1-node composite gate.
+      const envCustodyErr = checkHostCustodySignatures(receipt, factLog.toHostSignedTranscript(), policyContext)
+      if (envCustodyErr) {
+        return {
+          confirmed: false, kind: 'single_hop', familyOrRule: rule, reason: envCustodyErr,
+          singleHop: { confirmed: false, vulnClass: receipt.vulnClass, rule, reason: envCustodyErr, observed: receipt.claimedDelta, expected: 'host-custody verified transcript records' },
+        }
+      }
       const canonical = sanitizeSingleHopReceiptForHostCustody(receipt, factLog, policyContext)
       const wrapped = singleReceiptToComposite(canonical, {
         ...(policyContext.replayMode ? { replayMode: policyContext.replayMode } : {}),
         ...(policyContext.benchmarkMode !== undefined ? { benchmarkMode: policyContext.benchmarkMode } : {}),
       })
       const compRes = verifyCompositeReceipt(wrapped, hostTranscript, {
-        oracleEvaluator: this,
         ...(policyContext.compositeOptions ?? {}),
-        ...(policyContext.signingKey ? { signingKey: policyContext.signingKey } : {}),
+        // The embedded terminal proof reuses the SAME host arm/evidence-role projection and host-trusted policy.
+        oracleEvaluator: this.envelopeEmbeddedEvaluator(pointerRef, policyContext, effectivePolicy),
         ...(policyContext.attackerPersonas ? { attackerPersonas: policyContext.attackerPersonas } : {}),
         ...(policyContext.forbiddenShortcutPersonas ? { forbiddenShortcutPersonas: policyContext.forbiddenShortcutPersonas } : {}),
         ...(policyContext.benchmarkMode !== undefined ? { benchmarkMode: policyContext.benchmarkMode } : {}),
@@ -798,15 +910,7 @@ export class TerminalOracleRegistry {
         strictHostDerivation: true,
         factLog,
       })
-      const singleHop = compRes.terminalVerification ?? {
-        confirmed: compRes.confirmed,
-        vulnClass: canonical.vulnClass,
-        rule,
-        reason: compRes.reason,
-        observed: canonical.claimedDelta,
-        expected: 'host-custody verified single-hop composite envelope',
-        ...(compRes.evidence ? { evidence: compRes.evidence } : {}),
-      }
+      const singleHop = envelopeSingleHopVerification(compRes, canonical, rule)
       return {
         confirmed: compRes.confirmed && singleHop.confirmed,
         kind: 'single_hop',
@@ -849,4 +953,51 @@ export function evaluateTerminalOracle(
     throw new UnregisteredTerminalOracleError('TerminalOracleRegistry is not registered (fail-closed; zero unsanitized fallback).')
   }
   return activeDefaultTerminalOracleRegistry.evaluate(factLog, pointerRef, policyContext)
+}
+
+/** Host-held production policy for single-hop receipts built from agent-script claims. */
+export interface SingleHopProductionPolicy {
+  /** The session's private host HMAC key that signed the HostFactLog entries. */
+  signingKey?: string
+  /** Grant-derived persona policy (`buildCompositeVerifyOptionsFromGrant`) plus host persona role labels. */
+  compositeOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
+}
+
+/**
+ * A2: the ONE production path for single-hop agent-script receipts. Always runs the 1-node composite
+ * envelope (host signatures, attacker provenance under the grant's forbidden-shortcut / dual-tenant / role-label
+ * policy, replay mode, and the unified terminal-impact gate) so a single-hop script can never bypass
+ * `verifyTerminalImpactGate`. The grant's positive `attackerPersonas` allowlist is intentionally not applied:
+ * every grant persona is partitioned into attacker vs forbidden, so the forbidden deny-list plus privileged-role
+ * detection decides every grant persona identically, while anonymous single-hop probes (unauthenticated
+ * injection/SSRF/redirect proofs) are not rejected as "not an allowed attacker persona".
+ */
+export function evaluateSingleHopProductionEnvelope(
+  factLog: HostFactLog,
+  built: {
+    readonly receipt: ProofReceipt
+    readonly armOverrides?: ReadonlyMap<string, ImpactStep['arm']>
+    readonly evidenceRoleOverrides?: ReadonlyMap<string, string>
+  },
+  policy: SingleHopProductionPolicy,
+  registry: TerminalOracleRegistry = defaultTerminalOracleRegistry,
+): TerminalOracleResult {
+  const { attackerPersonas: _attackerAllowlist, ...compositeOptions } = policy.compositeOptions ?? {}
+  return registry.evaluate(
+    factLog,
+    {
+      kind: 'single_hop',
+      receipt: built.receipt,
+      ...(built.armOverrides ? { armOverrides: built.armOverrides } : {}),
+      ...(built.evidenceRoleOverrides ? { evidenceRoleOverrides: built.evidenceRoleOverrides } : {}),
+      enforceCompositeEnvelope: true,
+    },
+    {
+      strictHostDerivation: true,
+      ...(policy.signingKey ? { signingKey: policy.signingKey } : {}),
+      compositeOptions,
+      ...(compositeOptions.forbiddenShortcutPersonas ? { forbiddenShortcutPersonas: compositeOptions.forbiddenShortcutPersonas } : {}),
+      ...(built.receipt.oracleEvents?.length ? { trustedOracleEvents: built.receipt.oracleEvents } : {}),
+    },
+  )
 }

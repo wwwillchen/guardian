@@ -1,0 +1,138 @@
+{
+  "id": "derived-capability-same-path-404-peer-fp",
+  "side": "fp",
+  "archetype": "derived-capability-same-path-404",
+  "description": "B1/B3: a tenant-b control gets 404 on an object route and a derived credential (minting response binds no tenant: unknown principal) reads the same path with 200. The unknown principal never inherits the minter's tenant, so the same-path 404 is not a peer denial and grants no cross-tenant inference.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "bfla",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Payout record read with a derived credential",
+    "impact": "Reads a payout object with a minted session credential.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Derived credential reads payout object denied to peer"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true,
+    "agentScriptReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "agentScriptExpectedReason": "derived_credential_requires_composite",
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "claimedDelta": "Derived credential read a payout object that a peer control could not read.",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/v1/payouts/7731"
+  },
+  "personas": [
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    },
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "mint",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/sessions/exchange",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"token\":\"parity-derived-token-9c2e\",\"role\":\"member\"}",
+      "requestJson": {
+        "grant": "exchange"
+      },
+      "emittedCapabilities": [
+        "cap:hop_1:token"
+      ]
+    },
+    {
+      "id": "ctl_b",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/payouts/7731",
+      "persona": "member_b",
+      "status": 404,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"not_found\"}"
+    },
+    {
+      "id": "prb_cap",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/payouts/7731",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"7731\",\"tenantId\":\"tenant-a\",\"status\":\"draft\",\"amountCents\":120000,\"owner_id\":\"usr_a1\"}",
+      "actorCapability": "cap:hop_1:token",
+      "actorCapabilitySourcePersona": "member_b",
+      "requestHeaders": {
+        "authorization": "Bearer parity-derived-token-9c2e"
+      }
+    }
+  ],
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_cap",
+      "controlExchangeIds": [
+        "ctl_b"
+      ]
+    }
+  ]
+}

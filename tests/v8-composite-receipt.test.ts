@@ -965,7 +965,10 @@ test('combined 5-hop signed DAG exercising all 4 edge bindings + custom terminal
     signingKey: SIGNING_KEY,
     verifyTerminalImpact: () => ({ confirmed: true, reason: 'custom v8 oracle confirmed', family: 'cross_surface_pivot' }),
   })
-  assert.equal(ok.confirmed, true, ok.reason)
+  // R3-05 A5: a custom terminal oracle is ADDITIVE — all 4 causal edges verify, but a confirming custom oracle can
+  // never confirm a terminal hop that carries zero host-recorded terminal evidence.
+  assert.equal(ok.confirmed, false, ok.reason)
+  assert.equal(ok.failedStage, 'terminal_impact')
   assert.equal(ok.verifiedEdges.length, 4)
 
   // Custom terminal oracle rejection fails closed.
@@ -994,4 +997,29 @@ test('combined 5-hop signed DAG exercising all 4 edge bindings + custom terminal
   const dirtyRes = verifyCompositeReceipt(receipt, dirtyModeA, { attackerPersonas: ['viewer_a'], signingKey: SIGNING_KEY })
   assert.equal(dirtyRes.confirmed, false)
   assert.equal(dirtyRes.failedStage, 'replay_mode')
+
+  // R3-05 A5 (Neon review): a confirming custom verifyTerminalImpact on oob/browser/injection_or_redirect
+  // must never bypass the built-in job-stub or missing-terminal-evidence guards.
+  const ssrfStubTx = signTranscript({
+    entries: [
+      makeEntry('ex-ssrf-stub', makeStep({ id: 'ex-ssrf-stub', arm: 'probe', method: 'POST', status: 202, pathAndQuery: '/v1/fetch', json: { jobId: 'job_9', status: 'queued' }, body: '{"jobId":"job_9","status":"queued"}' }), {
+        timestampMs: 1000, actorPersona: 'viewer_a',
+      }),
+    ],
+  })
+  const ssrfStubReceipt: CompositeProofReceipt = {
+    chainId: 'chain-custom-ssrf-stub',
+    terminalVulnClass: 'ssrf',
+    hops: [{ hopId: 'h1', surface: 'http', target: { origin: ORIGIN_API, pathAndQuery: '/v1/fetch' }, exchangeIds: ['ex-ssrf-stub'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Queued fetch job handle', producedCapabilities: [], consumedCapabilities: [] }],
+    causalEdges: [],
+    terminalImpact: { terminalHopId: 'h1', terminalExchangeId: 'ex-ssrf-stub', claimedImpact: 'Queued SSRF job handle without OOB callback or readback', preChainControlExchangeIds: [], postChainReadbackExchangeIds: [] },
+    replayMode: 'fresh_clean_replay',
+  }
+  const ssrfStubRes = verifyCompositeReceipt(ssrfStubReceipt, ssrfStubTx, {
+    attackerPersonas: ['viewer_a'],
+    signingKey: SIGNING_KEY,
+    verifyTerminalImpact: () => ({ confirmed: true, reason: 'custom ssrf ok' }),
+  })
+  assert.equal(ssrfStubRes.confirmed, false, ssrfStubRes.reason)
+  assert.equal(ssrfStubRes.failedStage, 'terminal_impact')
 })
