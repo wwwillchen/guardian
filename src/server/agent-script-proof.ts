@@ -604,9 +604,9 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     ?? a1?.composites.find(c => !c.verification.confirmed)
     ?? null
   // A1: a host-recorded composite rejection is FINAL for the attempt — whether or not the script chose to
-  // return its `composite_receipt` claim — unless a composite actually confirmed. The script can never fall
-  // back to a single-hop receipt built from its other claims after the host rejected its chain.
-  if (rejectedComposite && !confirmedComp1) {
+  // return its `composite_receipt` claim — unless composite confirmation above already succeeded (including
+  // under doubleReplay when attempt 1 confirmed and attempt 2 rejected).
+  if (rejectedComposite) {
     const capture = a2 ?? a1
     const exchanges = capture ? factLogToScriptExchanges(capture.factLog, workerSanitizer) : []
     return {

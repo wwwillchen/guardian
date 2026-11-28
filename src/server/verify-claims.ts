@@ -14,7 +14,7 @@ import {
   matchStrippedInjectionFingerprint, resolvePersonaIdentity, routeFamily,
 } from './oracle-invariants.ts'
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity, RoleName } from './oracle-invariants.ts'
-import { isJobOrHandleStub } from './v8-oracle-families.ts'
+import { intermediateLifecycleState, isJobOrHandleStub, readbackStateFingerprint } from './v8-oracle-families.ts'
 import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane, type HostFactLog } from './host-fact-log.ts'
 import { defaultHostMintedOracle, diffRequestParams, exactPathnameOf, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostMintedRedirectCanary, type HostMintedTimingChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
 import { assertLegitimateControl, impactStepToControlExchange, normalizeRequestCarrier } from './proof-kernel/index.ts'
@@ -955,12 +955,6 @@ function toTranscriptStep(store: TranscriptStore, id: string, arm: ImpactStep['a
   } as ImpactStep & { seq: number }
 }
 
-const LIFECYCLE_STATE_KEY_RE = /^(?:status|state|workflow[_-]?status|workflow[_-]?state|approval[_-]?status|approval[_-]?state|lifecycle[_-]?state|lifecycle[_-]?status|stage|phase)$/i
-const INTERMEDIATE_STATE_VAL_RE = /^(?:draft|queued|pending(?:[_-](?:approval|review|verification|settlement|execution|processing))?|awaiting[_-](?:approval|review|verification|settlement|confirmation)|unapproved|unverified|scheduled|enqueued|staged|initiated|requested|submitted|processing|in[_-]progress|accepted|primed)$/i
-const FINALIZED_STATE_VAL_RE = /^(?:approved|settled|paid|disbursed|released|completed|fulfilled|captured|executed|published|active|confirmed|verified|granted|promoted|revoked|deleted|voided|refunded)$/i
-const UNAPPROVED_BOOL_KEY_RE = /^(?:requires[_-]?approval|needs[_-]?approval|pending[_-]?approval|is[_-]?draft)$/i
-const TERMINAL_BOOL_KEY_RE = /^(?:approved|settled|disbursed|verified|finalized|published|executed)$/i
-const COLLECTION_COUNT_KEY_RE = /^(?:count|total_?count|length|size|updated_?at|version)$/i
 export const STANDALONE_TERMINAL_IMPACT_HINT =
   'terminal_impact_unproven: creating or fetching an intermediate draft/queued/pending object or handle stub is NOT terminal security impact — prove unauthorized cross-tenant data exposure, privileged state settlement/approval, economic conservation violation, or chain the intermediate capability via ctx.seal_capability + ctx.prove_composite.'
 
@@ -968,23 +962,6 @@ const parseJsonBody = (body: string | undefined): unknown => { if (!body?.trim()
 const recordStatus = (r: VerifyTranscriptRecord | undefined): number | null => (r?.response?.status != null && Number.isFinite(Number(r.response.status)) ? Number(r.response.status) : null)
 const stubRejection = (claim: VerifyClaim, state: string | null, base: Record<string, unknown> = {}): VerifyClaimCheck =>
   ({ claim, passed: false, detail: STANDALONE_TERMINAL_IMPACT_HINT, observed: { ...base, intermediateStub: true, stubState: state, rejectedBy: 'terminal_impact_unproven' } })
-
-function intermediateLifecycleState(json: unknown, status?: number | null, beforeFlat?: Map<string, string>): { state: string | null; existingMutated: boolean } {
-  if (!json || typeof json !== 'object') return { state: null, existingMutated: false }
-  let state: string | null = null, existingMutated = false
-  for (const [path, rawVal] of flattenJson(json)) {
-    const existed = Boolean(beforeFlat?.has(path))
-    if (existed && beforeFlat!.get(path) === rawVal) continue
-    const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase(), val = rawVal.trim()
-    if (LIFECYCLE_STATE_KEY_RE.test(leaf)) {
-      if (FINALIZED_STATE_VAL_RE.test(val)) return { state: null, existingMutated }
-      if (!state && INTERMEDIATE_STATE_VAL_RE.test(val)) state = val.toLowerCase()
-    } else if (!state && UNAPPROVED_BOOL_KEY_RE.test(leaf) && val.toLowerCase() === 'true') state = 'unapproved'
-    else if (!state && (status === 201 || status === 202) && TERMINAL_BOOL_KEY_RE.test(leaf) && val.toLowerCase() === 'false') state = 'unapproved'
-    else if (existed && !COLLECTION_COUNT_KEY_RE.test(leaf)) existingMutated = true
-  }
-  return { state, existingMutated }
-}
 
 export function detectIntermediateStub(record: VerifyTranscriptRecord | undefined, body: string | undefined): { isStub: boolean; pureJobStub: boolean; state: string | null } {
   const status = recordStatus(record)
@@ -1696,14 +1673,39 @@ function readsStubResourceTree(r: VerifyTranscriptRecord, stubs: readonly Verify
   return rf !== '' && stubs.some(st => { const sf = fam(st); return sf !== '' && (sf === rf || rf.startsWith(`${sf}/`) || sf.startsWith(`${rf}/`)) })
 }
 
-/** C2: a passing impact/boundary claim bypasses the stub gate only when its OWN probe is not an intermediate stub or it cites a verified non-stub post-mutation readback. */
+/** C2: a passing impact/boundary claim bypasses the stub gate only when its OWN probe is not an intermediate stub or it cites a verified non-stub post-mutation readback on the stub's resource tree (or a same-route/same-actor bracketing baseline delta). */
 function claimProbeIsUnverifiedStub(store: TranscriptStore, c: VerifyClaimCheck): boolean {
   if (c.claim.kind !== 'impact' && c.claim.kind !== 'boundary') return false
   const probeRec = store.get(c.claim.probeExchangeId)
   if (!probeRec || !detectIntermediateStub(probeRec, store.body(probeRec.exchangeId)).isStub) return false
   const afterRec = c.claim.kind === 'impact' && c.claim.afterExchangeId ? store.get(c.claim.afterExchangeId) : undefined, afterStatus = recordStatus(afterRec)
-  const beforeBody = c.claim.kind === 'impact' && c.claim.beforeExchangeId ? store.body(c.claim.beforeExchangeId) : undefined
-  return !(afterRec && afterRec.seq > probeRec.seq && afterStatus !== null && afterStatus >= 200 && afterStatus < 300 && !detectIntermediateStub(afterRec, store.body(afterRec.exchangeId)).isStub && !afterReadbackIsIntermediateOnly(beforeBody, afterRec, store.body(afterRec.exchangeId)).isStub)
+  const beforeRec = c.claim.kind === 'impact' && c.claim.beforeExchangeId ? store.get(c.claim.beforeExchangeId) : undefined
+  const beforeBody = beforeRec ? store.body(beforeRec.exchangeId) : undefined
+  const afterBody = afterRec ? store.body(afterRec.exchangeId) : undefined
+  const beforeFp = beforeRec ? readbackStateFingerprint(undefined, beforeBody) : null
+  const afterFp = afterRec ? readbackStateFingerprint(undefined, afterBody) : null
+  const onTreeOrBracketed = Boolean(afterRec && (
+    readsStubResourceTree(afterRec, [probeRec]) ||
+    (beforeRec && beforeRec.seq < probeRec.seq && isReadMethod(beforeRec.request?.method) && isReadMethod(afterRec.request?.method) &&
+      (beforeRec.request?.pathAndQuery ?? '') === (afterRec.request?.pathAndQuery ?? '') &&
+      (beforeRec.request?.personaHandle ?? null) === (afterRec.request?.personaHandle ?? null) &&
+      beforeFp !== null && afterFp !== null && beforeFp !== afterFp)
+  ))
+  return !(afterRec && afterRec.seq > probeRec.seq && afterStatus !== null && afterStatus >= 200 && afterStatus < 300 && onTreeOrBracketed && !detectIntermediateStub(afterRec, afterBody).isStub && !afterReadbackIsIntermediateOnly(beforeBody, afterRec, afterBody).isStub)
+}
+
+/** C2: collect all cited HTTP/race records for the standalone stub gate (including impact claims). */
+function stubGateExchangeRecords(store: TranscriptStore, claims: readonly VerifyClaim[], allowed?: ReadonlySet<string>): VerifyTranscriptRecord[] {
+  const ids = new Set(claimedExchangeIds(claims))
+  for (const claim of claims) {
+    if (claim.kind !== 'impact') continue
+    ids.add(claim.probeExchangeId)
+    if (claim.beforeExchangeId) ids.add(claim.beforeExchangeId)
+    if (claim.afterExchangeId) ids.add(claim.afterExchangeId)
+    for (const id of claim.controlExchangeIds ?? []) ids.add(id)
+  }
+  return [...ids].filter(id => !allowed || allowed.has(id))
+    .map(id => store.get(id)).filter((rec): rec is VerifyTranscriptRecord => Boolean(rec?.request && rec.response && (rec.op === 'http' || rec.op === 'http2' || rec.op === 'race')))
 }
 
 const STATUS_INDEPENDENT_KINDS = new Set<VerifyClaim['kind']>(['structural_diff', 'timing', 'oob', 'race', 'impact', 'boundary', 'mfa', 'dom_sentinel', 'composite_receipt', 'host_evaluated_expression'])
@@ -1803,17 +1805,15 @@ export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyCl
     .map(id => store.get(id))
     .filter((rec): rec is VerifyTranscriptRecord => Boolean(rec?.request && rec.response && (rec.op === 'http' || rec.op === 'http2' || rec.op === 'race')))
   if (!checks.some(c => c.passed && STATUS_INDEPENDENT_KINDS.has(c.claim.kind) && c.claim.kind !== 'structural_diff' && !claimProbeIsUnverifiedStub(store, c)) && !hasEvaluatedOrFp) {
-    const ok2xx = citedRecords.filter(r => { const s = recordStatus(r); return s !== null && s >= 200 && s < 300 })
-    const probe2xx = ok2xx.filter(r => r.request?.sessionRole === 'probe')
-    const mut2xx = ok2xx.filter(r => isMutatingMethod(r.request?.method))
+    const ok2xx = stubGateExchangeRecords(store, claims, context.allowedExchangeIds).filter(r => { const s = recordStatus(r); return s !== null && s >= 200 && s < 300 })
+    const probe2xx = ok2xx.filter(r => r.request?.sessionRole === 'probe'), mut2xx = ok2xx.filter(r => isMutatingMethod(r.request?.method))
     const primary2xx = probe2xx.length > 0 ? probe2xx : (mut2xx.length > 0 ? mut2xx : ok2xx)
     if (primary2xx.length > 0 && primary2xx.every(r => detectIntermediateStub(r, store.body(r.exchangeId)).isStub)) {
       const minProbeSeq = Math.min(...primary2xx.map(r => r.seq))
       const beforeBody = [...ok2xx].reverse().find(r => r.seq < minProbeSeq && !isMutatingMethod(r.request?.method))
-      const probeActors = new Set(primary2xx.map(r => r.request?.personaHandle ?? null))
       const hasNonStubAfter = ok2xx.some(r =>
         r.seq > minProbeSeq && !primary2xx.includes(r) && !detectIntermediateStub(r, store.body(r.exchangeId)).isStub && readsStubResourceTree(r, primary2xx) &&
-        !(probeActors.has(r.request?.personaHandle ?? null) && afterReadbackIsIntermediateOnly(beforeBody ? store.body(beforeBody.exchangeId) : undefined, r, store.body(r.exchangeId)).isStub))
+        !afterReadbackIsIntermediateOnly(beforeBody ? store.body(beforeBody.exchangeId) : undefined, r, store.body(r.exchangeId)).isStub)
       if (!hasNonStubAfter) failures.push(STANDALONE_TERMINAL_IMPACT_HINT)
     }
   }

@@ -1529,7 +1529,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     // bogus-ID 404 selectivity control on another path is not a denial on the target object). When
     // neither arm carries tenant metadata, a strictly lower probe role is the only available reading.
     const sameTenantDenial = deniedControls.find(control =>
-      sameRoute(control, probe) &&
+      !isUnknownDerivedPrincipal(control.actor) && !isUnknownDerivedPrincipal(probe.actor) && sameRoute(control, probe) &&
       !isBogusIdSelectivity404(control, probe) &&
       (sameTenant(control.actor, probe.actor) || (!control.actor.tenant && !probe.actor.tenant)))
     const controlRank = sameTenantDenial ? roleRank(sameTenantDenial.actor.role) : null
@@ -4638,7 +4638,7 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     return !controlMutationIndexes.some(mutatedAt => mutatedAt < at && sameRoute(steps[mutatedAt]!, entry.step))
   })
   const peerSignal = boundarySignals.find(entry => {
-    if (roleEscalation && entry.step.actor.role === 'owner') return false
+    if ((roleEscalation && entry.step.actor.role === 'owner') || isUnknownDerivedPrincipal(entry.step.actor) || (probeActor !== null && isUnknownDerivedPrincipal(probeActor))) return false
     const tenant = entry.step.actor.tenant ?? null, sameOrNoTenant = tenant === null || probeActor?.tenant == null || tenant === probeActor.tenant
     if (boundaryClass === 'access' && sameOrNoTenant && (roleRank(entry.step.actor.role) ?? 99) < (roleRank(probeActor?.role) ?? -1)) return false
     if (tenant === null || probeActor?.tenant == null) return true
@@ -4655,15 +4655,15 @@ function assessBoundaryForClass(input: BoundaryInput, boundaryClass: BoundaryCla
     step.arm === 'probe' &&
     ((stepReadsState(step) && ((step.json !== undefined && step.json !== null) || (step.body?.length ?? 0) >= 8)) ||
       (stepMutatesState(step) && isSuccess(step.status)))))
-  const distinctActors = new Set([...controlSteps, ...probeSteps]
-    .map(step => step.actor.handle).filter((handle): handle is string => Boolean(handle)))
-  const roleOrTenantDifferential = controlSteps.some(control => probeSteps.some(probe =>
+  const knownControls = controlSteps.filter(step => !isUnknownDerivedPrincipal(step.actor)), knownProbes = probeSteps.filter(step => !isUnknownDerivedPrincipal(step.actor))
+  const distinctActors = new Set([...knownControls, ...knownProbes].map(step => step.actor.handle).filter((handle): handle is string => Boolean(handle)))
+  const roleOrTenantDifferential = knownControls.some(control => knownProbes.some(probe =>
     (control.actor.role !== null && probe.actor.role !== null && control.actor.role !== probe.actor.role) ||
     actorsAreCrossTenant(control.actor, probe.actor)))
   // A parameter/body precondition differential (e.g. ?id=pub vs ?id=priv) is the same kind of
   // "the variant changed the precondition" evidence as an actor differential. Rotating nonces,
   // timestamps and tracing headers are transport noise, not a boundary.
-  const requestDifferential = controlSteps.some(control => probeSteps.some(probe =>
+  const requestDifferential = knownControls.some(control => knownProbes.some(probe =>
     canonicalBoundaryRequest(control) !== canonicalBoundaryRequest(probe)))
   const actorDifferential = distinctActors.size >= 2 || roleOrTenantDifferential || requestDifferential
   const strict = input.expectControlDenied === true

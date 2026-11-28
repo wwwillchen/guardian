@@ -10,7 +10,7 @@
  * non-monotonic timestamps, or hardened responses always fail closed (`satisfied: false`).
  */
 
-import { ROLE_RANK, isReadMethod, normalizeRole, resolvePersonaIdentity, routeFamily, stepReadsState, type ImpactAssessment, type RoleName } from './oracle-invariants.ts'
+import { ROLE_RANK, flattenJson, isReadMethod, normalizeRole, resolvePersonaIdentity, routeFamily, stepReadsState, type ImpactAssessment, type RoleName } from './oracle-invariants.ts'
 import type { HydratableEntry } from './v8-oracle-hydrate.ts'
 import { resolveTerminalContractKind } from './oracle-spec.ts'
 export { resolveCompositeTerminalContract } from './oracle-spec.ts'
@@ -251,6 +251,14 @@ export function serverBoundGrantTenant(body: string | undefined, status: number 
   const tenants = extractTenantMarkers(val, body)
   return tenants.size === 1 ? [...tenants][0]! : null
 }
+const LIFECYCLE_STATE_KEY_RE = /^(?:status|state|workflow[_-]?status|workflow[_-]?state|approval[_-]?status|approval[_-]?state|lifecycle[_-]?state|lifecycle[_-]?status|stage|phase)$/i, INTERMEDIATE_STATE_VAL_RE = /^(?:draft|queued|pending(?:[_-](?:approval|review|verification|settlement|execution|processing))?|awaiting[_-](?:approval|review|verification|settlement|confirmation)|unapproved|unverified|scheduled|enqueued|staged|initiated|requested|submitted|processing|in[_-]progress|accepted|primed)$/i, FINALIZED_STATE_VAL_RE = /^(?:approved|settled|paid|disbursed|released|completed|fulfilled|captured|executed|published|active|confirmed|verified|granted|promoted|revoked|deleted|voided|refunded)$/i, UNAPPROVED_BOOL_KEY_RE = /^(?:requires[_-]?approval|needs[_-]?approval|pending[_-]?approval|is[_-]?draft)$/i, TERMINAL_BOOL_KEY_RE = /^(?:approved|settled|disbursed|verified|finalized|published|executed)$/i, COLLECTION_COUNT_KEY_RE = /^(?:count|total_?count|length|size|updated_?at|version)$/i
+/** Shared intermediate-lifecycle state detector (C1/C2): pending/draft/queued objects without finalized state or pre-existing mutation. */
+export function intermediateLifecycleState(json: unknown, status?: number | null, beforeFlat?: Map<string, string>): { state: string | null; existingMutated: boolean } {
+  if (!json || typeof json !== 'object') return { state: null, existingMutated: false }; let state: string | null = null, existingMutated = false
+  for (const [path, rawVal] of flattenJson(json)) { const existed = Boolean(beforeFlat?.has(path)); if (existed && beforeFlat!.get(path) === rawVal) continue; const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase(), val = rawVal.trim(); if (LIFECYCLE_STATE_KEY_RE.test(leaf)) { if (FINALIZED_STATE_VAL_RE.test(val)) return { state: null, existingMutated }; if (!state && INTERMEDIATE_STATE_VAL_RE.test(val)) state = val.toLowerCase() } else if (!state && ((UNAPPROVED_BOOL_KEY_RE.test(leaf) && val.toLowerCase() === 'true') || ((status === 201 || status === 202) && TERMINAL_BOOL_KEY_RE.test(leaf) && val.toLowerCase() === 'false'))) state = 'unapproved'; else if (existed && !COLLECTION_COUNT_KEY_RE.test(leaf)) existingMutated = true }
+  return { state, existingMutated }
+}
+
 /** Universal structural & differential stub/ack/enqueue detector (language-agnostic). */
 export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string, _route?: string | null, baselineJson?: unknown, hasDeniedControl = false): boolean {
   let val = json; const trimmed = typeof body === 'string' ? body.trim() : ''

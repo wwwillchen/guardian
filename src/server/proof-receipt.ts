@@ -49,7 +49,7 @@ import {
   assessImpactEvidence,
   assessInjectionImpact,
   assessStatusOnlyDivergence,
-  deniedControlTenantCompatible, hasForeignTenantOrOwnerDisclosure, isDeniedControlStatus, isUnknownDerivedPrincipal,
+  deniedControlTenantCompatible, flattenJson, hasForeignTenantOrOwnerDisclosure, isDeniedControlStatus, isUnknownDerivedPrincipal,
   isObjectScopedRequest,
   knownOracleEvent,
   routeFamily,
@@ -83,7 +83,7 @@ import {
 import { evaluateMustBeNonPublicStage } from './proof-kernel/publicness.ts'
 export { normalizeRequestCarrier }
 export type { NormalizedRequestCarrier, RequestCarrierInput }
-import { extractTenantMarkers, hasBracketingBaselineDelta, isJobOrHandleStub, selectVerifiedPostMutationReadback } from './v8-oracle-families.ts'
+import { extractTenantMarkers, hasBracketingBaselineDelta, intermediateLifecycleState, isJobOrHandleStub, selectVerifiedPostMutationReadback } from './v8-oracle-families.ts'
 import { deriveBooleanRemediationCode, deriveImpactRemediationCode, type OracleFailureCode } from './retry-governor.ts'
 import { assessSignedUrlMintDifferential, type SignedUrlMintExchange } from './verify-support.ts'
 import {
@@ -4126,14 +4126,14 @@ const CROSS_TENANT_LABEL_RE = /cross[_-]?tenant|tenant[_-]?(?:isolation|bleed|le
 export function isUnverifiedTargetProbeStub(receipt: Pick<ProofReceipt, 'vulnClass' | 'target'>, cited: readonly ReceiptTranscriptEntry[]): boolean {
   const ok = cited.filter(e => e.step.arm === 'probe' && is2xxStatus(e.step.status)), targetPath = normalizePath(receipt.target.pathAndQuery)
   const target = ok.find(e => stepMutatesState(e.step)) ?? ok.find(e => targetPath !== '' && routeOf(e.step) === targetPath) ?? ok[0]
-  const hasBody = (e: ReceiptTranscriptEntry): boolean => e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)
-  const isStub = (e: ReceiptTranscriptEntry): boolean => isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
-  if (!target || !isStub(target)) return false
+  const hasBody = (e: ReceiptTranscriptEntry): boolean => e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0), isJobStub = (e: ReceiptTranscriptEntry): boolean => isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
+  if (!target || (!isJobStub(target) && !(/^(?:POST|PUT)$/i.test(target.step.method) && intermediateLifecycleState(parseStepJson(target.step), target.step.status).state !== null))) return false
   const hydrated = new Map(cited.map((e, idx) => [e.exchangeId, { ...e, timestampMs: typeof e.seq === 'number' ? e.seq : idx }]))
-  const probeTenants = new Set([target.step.actor.tenant?.toLowerCase(), ...(target.step.actor.tenants ?? []).map(t => t.toLowerCase())].filter((t): t is string => Boolean(t)))
-  const ownTenantOnly = (e: ReceiptTranscriptEntry): boolean => { const ts = extractTenantMarkers(e.step.json, e.step.body); return ts.size > 0 && probeTenants.size > 0 && [...ts].every(t => probeTenants.has(t)) }
-  const termHyd = hydrated.get(target.exchangeId)!, tf = routeFamily(routeOf(target.step)), sameTree = (e: ReceiptTranscriptEntry): boolean => { const f = routeFamily(routeOf(e.step)); return f !== '' && tf !== '' && (f === tf || f.startsWith(`${tf}/`) || tf.startsWith(`${f}/`)) }, later = [...hydrated.values()].filter(e => e.exchangeId !== target.exchangeId && e.timestampMs > termHyd.timestampMs && (sameTree(e) || hasBracketingBaselineDelta(e, termHyd, hydrated))).map(e => e.exchangeId)
-  return !selectVerifiedPostMutationReadback(later, termHyd, hydrated, CROSS_TENANT_LABEL_RE.test(receipt.vulnClass), ownTenantOnly, hasBody, e => hasBody(e) && isStub(e)).postMutRb
+  const probeTenants = new Set([target.step.actor.tenant?.toLowerCase(), ...(target.step.actor.tenants ?? []).map(t => t.toLowerCase())].filter((t): t is string => Boolean(t))), ownTenantOnly = (e: ReceiptTranscriptEntry): boolean => { const ts = extractTenantMarkers(e.step.json, e.step.body); return ts.size > 0 && probeTenants.size > 0 && [...ts].every(t => probeTenants.has(t)) }
+  const termHyd = hydrated.get(target.exchangeId)!, tf = routeFamily(routeOf(target.step)), sameTree = (e: ReceiptTranscriptEntry): boolean => { const f = routeFamily(routeOf(e.step)); return f !== '' && tf !== '' && (f === tf || f.startsWith(`${tf}/`) || tf.startsWith(`${f}/`)) }
+  const isRbStub = (e: ReceiptTranscriptEntry & { timestampMs: number }): boolean => { if (isJobStub(e)) return true; const pre = [...hydrated.values()].reverse().find(p => p.exchangeId !== e.exchangeId && p.timestampMs < termHyd.timestampMs && is2xxStatus(p.step.status) && !stepMutatesState(p.step) && routeOf(p.step) === routeOf(e.step)), pj = pre ? parseStepJson(pre.step) : undefined, lc = intermediateLifecycleState(parseStepJson(e.step), e.step.status, pj && typeof pj === 'object' ? flattenJson(pj) : new Map()); return Boolean(lc.state && !lc.existingMutated) }
+  const later = [...hydrated.values()].filter(e => e.exchangeId !== target.exchangeId && e.timestampMs > termHyd.timestampMs && (sameTree(e) || hasBracketingBaselineDelta(e, termHyd, hydrated))).map(e => e.exchangeId)
+  return !selectVerifiedPostMutationReadback(later, termHyd, hydrated, CROSS_TENANT_LABEL_RE.test(receipt.vulnClass), ownTenantOnly, hasBody, e => hasBody(e) && isRbStub(e)).postMutRb
 }
 
 export function isPureJobOrHandleStubChain(steps: readonly ImpactStep[]): boolean {

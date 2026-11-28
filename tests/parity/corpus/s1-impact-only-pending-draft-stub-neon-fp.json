@@ -1,0 +1,126 @@
+{
+  "id": "s1-impact-only-pending-draft-stub-neon-fp",
+  "side": "fp",
+  "archetype": "impact-only-pending-draft-stub",
+  "description": "R3-05 Neon independent bypass case (Class C1/C2): a tenant-b member submits a request creating a 201 pending draft object with rich domain fields (detectIntermediateStub.isStub=true, pureJobStub=false) and a tenant-a readback shows the new item still pending. With ONLY an impact claim, evaluateClaims must inspect impact-cited exchanges in its standalone stub gate and reject with terminal_impact_unproven.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/verify-claims.ts",
+      "src/server/v8-oracle-families.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Pending draft request submitted without terminal approval",
+    "impact": "Creates an unapproved pending draft request that remains pending on readback.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Pending draft request submitted on org queue"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true,
+    "agentScriptReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "agentScriptExpectedReason": "terminal_impact_unproven",
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "claimedDelta": "Tenant-b member created a pending draft request on tenant-a; readback shows only the pending draft.",
+    "targetMethod": "POST",
+    "targetPathAndQuery": "/v1/orgs/tenant-a/requests"
+  },
+  "personas": [
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    },
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "before",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/requests",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"requests\":[]}"
+    },
+    {
+      "id": "prb_draft",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/v1/orgs/tenant-a/requests",
+      "persona": "member_b",
+      "status": 201,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"req_77\",\"status\":\"pending\",\"tenantId\":\"tenant-a\",\"title\":\"Quarterly summary request for finance review\",\"department\":\"finance\",\"region\":\"us-east\"}",
+      "requestJson": {
+        "title": "Quarterly summary request for finance review",
+        "department": "finance",
+        "region": "us-east"
+      }
+    },
+    {
+      "id": "after",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/requests",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"requests\":[{\"id\":\"req_77\",\"status\":\"pending\",\"tenantId\":\"tenant-a\",\"title\":\"Quarterly summary request for finance review\",\"department\":\"finance\",\"region\":\"us-east\"}]}"
+    }
+  ],
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_draft",
+      "beforeExchangeId": "before",
+      "afterExchangeId": "after"
+    }
+  ]
+}
