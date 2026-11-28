@@ -1,3 +1,4 @@
+import { Dialog as DialogPrimitive } from '@base-ui/react/dialog'
 import { Link } from '@tanstack/react-router'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
@@ -72,6 +73,226 @@ function SourcesEmptyIllustration() {
 function formatGithubConnectionBadge(status: ProjectLoaderData['githubPatStatus']): string {
   if (!status.configured) return 'Not connected'
   return status.login ? `GitHub connected · @${status.login}` : 'GitHub connected'
+}
+
+/** "Installed on 3 accounts" */
+export function formatInstallationSummary(count: number): string {
+  return `Installed on ${count} ${count === 1 ? 'account' : 'accounts'}`
+}
+
+interface RepoDiscoverySheetProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  status: ProjectLoaderData['githubPatStatus']
+  loading: boolean
+  reposLoaded: boolean
+  reposTruncated: boolean
+  repos: DiscoveredGithubRepo[]
+  selectedRepos: string[]
+  onChangeSelectedRepos: (repos: string[]) => void
+  search: string
+  onSearchChange: (value: string) => void
+  maxSyncBatch: number
+  showBroadNote: boolean
+  error: string
+  onRefresh: () => void
+  onSync: () => void
+}
+
+const SHEET_MOTION = [
+  'transition-[opacity,translate] duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]',
+  'data-[starting-style]:translate-x-6 data-[starting-style]:opacity-0',
+  'data-[ending-style]:translate-x-6 data-[ending-style]:opacity-0 data-[ending-style]:duration-150',
+  'motion-reduce:data-[starting-style]:translate-x-0 motion-reduce:data-[ending-style]:translate-x-0',
+].join(' ')
+
+/**
+ * Repo discovery as a right-hand slide-over ([U15]): pinned search/filter bar
+ * with a collapsed installation pill, one scroll region with sticky org headers,
+ * and a bottom selection tray that is always on screen.
+ */
+function RepoDiscoverySheet({
+  open,
+  onOpenChange,
+  status,
+  loading,
+  reposLoaded,
+  reposTruncated,
+  repos,
+  selectedRepos,
+  onChangeSelectedRepos,
+  search,
+  onSearchChange,
+  maxSyncBatch,
+  showBroadNote,
+  error,
+  onRefresh,
+  onSync,
+}: RepoDiscoverySheetProps) {
+  const [installationsOpen, setInstallationsOpen] = useState(false)
+  const installations = status.installations ?? []
+  const overCap = selectedRepos.length > maxSyncBatch
+  const banner = (
+    <GithubInstallBanner
+      authKind={status.authKind}
+      tokenKind={status.tokenKind}
+      login={status.login}
+      installUrl={status.installUrl}
+      installations={installations}
+      privateRepoCount={status.privateRepoCount}
+      needsAppInstall={status.needsAppInstall}
+      loading={loading}
+      onRefresh={onRefresh}
+      flush
+    />
+  )
+  const installPill = installations.length > 0 && !status.needsAppInstall ? (
+    <button
+      type="button"
+      aria-expanded={installationsOpen}
+      data-slot="installations-pill"
+      className="ml-1 inline-flex h-6 flex-none cursor-pointer items-center gap-1 whitespace-nowrap rounded-full border border-line-2 bg-sunk px-2 text-[11.5px] font-medium text-fg-muted shadow-none hover:bg-hover hover:text-fg"
+      onClick={() => setInstallationsOpen(prev => !prev)}
+    >
+      {formatInstallationSummary(installations.length)}
+      <Icon
+        name="chevD"
+        size={11}
+        className={cn('transition-[rotate] duration-150 ease-kovo motion-reduce:transition-none', installationsOpen && 'rotate-180')}
+      />
+    </button>
+  ) : null
+  const notes = (
+    <>
+      {(installationsOpen || status.needsAppInstall || (installations.length === 0 && (status.authKind === 'github_app_device' || status.tokenKind === 'github_app'))) && banner}
+      {(reposTruncated || status.source === 'fixture' || (showBroadNote && repos.length > 0)) && (
+        <div className="grid gap-1.5 border-b border-line bg-panel px-4 py-2 text-[12px] text-fg-subtle">
+          {reposTruncated && <p className="m-0">Showing the 200 most recently updated repositories.</p>}
+          {status.source === 'fixture' && (
+            <p className="m-0 text-[11.5px]">
+              Using a local fallback GitHub token. Open{' '}
+              <Link to="/settings" search={{}} className="font-medium text-accent hover:underline">
+                Settings
+              </Link>{' '}
+              to sign in with GitHub or save your own read-only token instead.
+            </p>
+          )}
+          {showBroadNote && repos.length > 0 && (
+            <p className="m-0 rounded-[7px] border border-warn-line bg-warn-soft px-2.5 py-1.5 text-fg-muted">
+              {status.tokenKind === 'classic'
+                ? `Classic GitHub token detected (${repos.length} accessible repos).`
+                : `Found ${repos.length} accessible repos.`}{' '}
+              {repos.length > 10
+                ? 'Nothing was pre-selected so you do not accidentally clone everything.'
+                : 'Consider scoping a read-only token or GitHub App installation to only the target repositories.'}
+            </p>
+          )}
+        </div>
+      )}
+    </>
+  )
+
+  return (
+    <DialogPrimitive.Root open={open} onOpenChange={next => onOpenChange(next)}>
+      <DialogPrimitive.Portal>
+        <DialogPrimitive.Backdrop
+          data-slot="repo-sheet-backdrop"
+          className="fixed inset-0 z-[60] bg-scrim transition-opacity duration-200 ease-kovo data-[ending-style]:opacity-0 data-[starting-style]:opacity-0"
+        />
+        <DialogPrimitive.Popup
+          data-slot="repo-discovery-sheet"
+          aria-label="Discover repositories"
+          className={cn(
+            'pw-repo-sheet fixed inset-y-0 right-0 z-[60] flex h-dvh w-[min(640px,100vw)] max-w-[100vw] flex-col overflow-hidden border-l border-line-2 bg-panel text-fg shadow-popover outline-none',
+            SHEET_MOTION,
+          )}
+        >
+          <header className="flex min-h-12 flex-none flex-wrap items-center gap-x-2 gap-y-1 border-b border-line bg-raise py-2 pl-4 pr-2.5">
+            <Icon name="search" size={14} className="flex-none text-fg-subtle" />
+            <DialogPrimitive.Title className="m-0 min-w-0 text-[13px] font-semibold text-fg">
+              Discover repositories
+            </DialogPrimitive.Title>
+            <DialogPrimitive.Description className="m-0 min-w-0 flex-1 truncate text-[12px] text-fg-subtle">
+              Read-only shallow clone + OpenAPI, GraphQL, route &amp; lockfile extraction
+            </DialogPrimitive.Description>
+            <div className="ml-auto flex flex-none items-center gap-1">
+              <Button type="button" variant="ghost" disabled={loading} onClick={onRefresh}>
+                {loading && !reposLoaded ? 'Loading…' : 'Refresh'}
+              </Button>
+              <Link to="/settings" search={{}} className={cn(buttonVariants({ variant: 'ghost' }), 'no-underline')}>
+                GitHub settings
+              </Link>
+              <DialogPrimitive.Close
+                aria-label="Close"
+                className={cn(buttonVariants({ variant: 'ghost', size: 'icon' }), 'size-[26px]')}
+              >
+                <Icon name="close" size={14} />
+              </DialogPrimitive.Close>
+            </div>
+          </header>
+
+          {loading && !reposLoaded ? (
+            <div className="flex min-h-0 flex-1 flex-col">
+              {notes}
+              <div className="px-4 py-3.5 text-[12.5px] text-fg-subtle">Discovering accessible repositories…</div>
+            </div>
+          ) : (
+            <GroupedRepoPicker
+              repos={repos}
+              selectedRepos={selectedRepos}
+              onChangeSelectedRepos={onChangeSelectedRepos}
+              search={search}
+              onSearchChange={onSearchChange}
+              maxSelectable={maxSyncBatch}
+              disabled={loading}
+              variant="detailed"
+              layout="sheet"
+              toolbarAccessory={installPill}
+              toolbarPanel={notes}
+              searchPlaceholder="Filter repositories by name, branch, or description…"
+              emptyMessage="No repositories were returned for this account. Verify the GitHub App installation or token grants Contents: Read-only on at least one repository."
+            />
+          )}
+
+          <footer
+            className="flex flex-none flex-wrap items-center gap-2 border-t border-line bg-raise px-4 py-2.5"
+            data-slot="repo-selection-tray"
+          >
+            {(overCap || error) && (
+              <div className="grid basis-full gap-1">
+                {overCap && (
+                  <p role="alert" className="m-0 text-[12px] text-danger">
+                    Select at most {maxSyncBatch} repositories per sync batch.
+                  </p>
+                )}
+                <FormError error={error} />
+              </div>
+            )}
+            <span className="mr-auto text-[12.5px] font-medium tabular-nums text-fg" data-slot="repo-selection-count" aria-live="polite">
+              {selectedRepos.length} selected
+              <span className="font-normal text-fg-subtle">{` of ${repos.length}`}</span>
+            </span>
+            {selectedRepos.length > 0 && (
+              <Button type="button" variant="ghost" disabled={loading} onClick={() => onChangeSelectedRepos([])}>
+                Clear
+              </Button>
+            )}
+            <DialogPrimitive.Close className={buttonVariants({ variant: 'ghost' })} disabled={loading && reposLoaded}>
+              Cancel
+            </DialogPrimitive.Close>
+            <Button
+              type="button"
+              variant="default"
+              disabled={loading || selectedRepos.length === 0 || overCap}
+              onClick={onSync}
+            >
+              {loading && reposLoaded ? 'Syncing…' : 'Sync'}
+            </Button>
+          </footer>
+        </DialogPrimitive.Popup>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
+  )
 }
 
 export function ProjectSourcesTab({ data }: Props) {
@@ -167,10 +388,6 @@ export function ProjectSourcesTab({ data }: Props) {
 
   function openRepoPicker() {
     setGithubNotice('')
-    if (repoPickerOpen && reposLoaded) {
-      setRepoPickerOpen(false)
-      return
-    }
     setRepoPickerOpen(true)
     if (!reposLoaded) loadGithubRepos()
   }
@@ -260,9 +477,9 @@ export function ProjectSourcesTab({ data }: Props) {
                 variant="outline"
                 disabled={githubAction.pending}
                 onClick={openRepoPicker}
-                aria-expanded={repoPickerOpen}
+                aria-haspopup="dialog"
               >
-                {repoPickerOpen ? 'Hide repos' : 'Discover & sync repos'}
+                Discover &amp; sync repos
               </Button>
             )}
             <Link
@@ -316,126 +533,38 @@ export function ProjectSourcesTab({ data }: Props) {
         </Card>
       )}
 
-      {showRepoSheet && (
-        <Card className="pw-repo-sheet mb-4 overflow-hidden border-line">
-          <CardHeader className="flex-wrap items-center gap-y-1.5 py-2.5">
-            <span className="min-w-0 text-[13px] font-semibold text-fg">Select repositories to sync</span>
-            <div className="flex flex-wrap items-center gap-1.5">
-              <Button type="button" variant="ghost" disabled={githubAction.pending} onClick={loadGithubRepos}>
-                {githubAction.pending && !reposLoaded ? 'Loading…' : 'Refresh'}
-              </Button>
-              <Link
-                to="/settings"
-                search={{}}
-                className={cn(buttonVariants({ variant: 'ghost' }), 'no-underline')}
-              >
-                GitHub settings
-              </Link>
-            </div>
-          </CardHeader>
-
-          <GithubInstallBanner
-            authKind={liveGithubStatus.authKind}
-            tokenKind={liveGithubStatus.tokenKind}
-            login={liveGithubStatus.login}
-            installUrl={liveGithubStatus.installUrl}
-            installations={liveGithubStatus.installations}
-            privateRepoCount={liveGithubStatus.privateRepoCount}
-            needsAppInstall={liveGithubStatus.needsAppInstall}
-            loading={githubAction.pending}
-            onRefresh={loadGithubRepos}
-            flush
-          />
-
-          <div className="grid gap-2 border-b border-line bg-panel px-4 py-2.5">
-            <p className="m-0 text-[12px] text-fg-subtle">
-              Read-only shallow clone + automatic OpenAPI, GraphQL, route, and lockfile extraction.
-              {reposTruncated && ' Showing the 200 most recently updated repositories.'}
-            </p>
-
-            {liveGithubStatus.source === 'fixture' && (
-              <p className="m-0 text-[11.5px] text-fg-subtle">
-                Using a local fallback GitHub token. Open{' '}
-                <Link to="/settings" search={{}} className="font-medium text-accent hover:underline">
-                  Settings
-                </Link>{' '}
-                to sign in with GitHub or save your own read-only token instead.
-              </p>
-            )}
-
-            {showBroadNote && discoveredRepos.length > 0 && (
-              <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-[7px] border border-warn-line bg-warn-soft px-2.5 py-2 text-[12px] text-fg-muted">
-                <span>
-                  {liveGithubStatus.tokenKind === 'classic'
-                    ? `Classic GitHub token detected (${discoveredRepos.length} accessible repos).`
-                    : `Found ${discoveredRepos.length} accessible repos.`}{' '}
-                  {discoveredRepos.length > 10
-                    ? 'Nothing was pre-selected so you do not accidentally clone everything.'
-                    : 'Consider scoping a read-only token or GitHub App installation to only the target repositories.'}
-                </span>
-              </div>
-            )}
-          </div>
-
-          {githubAction.pending && !reposLoaded ? (
-            <div className="px-4 py-3.5 text-[12.5px]">
-              <span className="text-fg-subtle">Discovering accessible repositories…</span>
-            </div>
-          ) : (
-            <GroupedRepoPicker
-              repos={discoveredRepos}
-              selectedRepos={selectedRepos}
-              onChangeSelectedRepos={setSelectedRepos}
-              search={repoSearch}
-              onSearchChange={setRepoSearch}
-              maxSelectable={maxSyncBatch}
-              disabled={githubAction.pending}
-              variant="detailed"
-              searchPlaceholder="Filter repositories by name, branch, or description…"
-              emptyMessage="No repositories were returned for this account. Verify the GitHub App installation or token grants Contents: Read-only on at least one repository."
-            />
-          )}
-
-          {(selectedRepos.length > maxSyncBatch || githubAction.error) && (
-            <div className="grid gap-1.5 border-t border-line px-4 py-2.5">
-              {selectedRepos.length > maxSyncBatch && (
-                <p role="alert" className="m-0 text-[12px] text-danger">
-                  Select at most {maxSyncBatch} repositories per sync batch.
-                </p>
-              )}
-              <FormError error={githubAction.error} />
-            </div>
-          )}
-
-          <CardFooter className="flex-wrap py-2.5">
-            <span className="mr-auto text-[12px] tabular-nums text-fg-subtle">
-              {selectedRepos.length} of {discoveredRepos.length} selected
-            </span>
-            <Button type="button" variant="ghost" onClick={() => setRepoPickerOpen(false)}>
-              Close
-            </Button>
-            <Button
-              type="button"
-              variant="default"
-              disabled={githubAction.pending || selectedRepos.length === 0 || selectedRepos.length > maxSyncBatch}
-              onClick={() => {
-                setGithubNotice('')
-                void githubAction.submit(
-                  () => syncGithubRepositories({ data: { projectId: project.id, repos: selectedRepos } }),
-                  async result => {
-                    setRepoPickerOpen(false)
-                    await refreshLinkedRepos()
-                    const warnText = result.warnings.length ? ` Warnings: ${result.warnings.join('; ')}` : ''
-                    setGithubNotice(`Synced ${result.repos.length} ${result.repos.length === 1 ? 'repo' : 'repos'}: ${result.specsImported} specs imported, ${result.dependenciesExtracted} dependencies extracted.${warnText}`)
-                  },
-                )
-              }}
-            >
-              {githubAction.pending ? 'Syncing…' : `Sync selected (${selectedRepos.length})`}
-            </Button>
-          </CardFooter>
-        </Card>
-      )}
+      <RepoDiscoverySheet
+        open={showRepoSheet}
+        onOpenChange={next => {
+          if (!next && githubAction.pending && reposLoaded) return
+          setRepoPickerOpen(next)
+        }}
+        status={liveGithubStatus}
+        loading={githubAction.pending}
+        reposLoaded={reposLoaded}
+        reposTruncated={reposTruncated}
+        repos={discoveredRepos}
+        selectedRepos={selectedRepos}
+        onChangeSelectedRepos={setSelectedRepos}
+        search={repoSearch}
+        onSearchChange={setRepoSearch}
+        maxSyncBatch={maxSyncBatch}
+        showBroadNote={showBroadNote}
+        error={githubAction.error}
+        onRefresh={loadGithubRepos}
+        onSync={() => {
+          setGithubNotice('')
+          void githubAction.submit(
+            () => syncGithubRepositories({ data: { projectId: project.id, repos: selectedRepos } }),
+            async result => {
+              setRepoPickerOpen(false)
+              await refreshLinkedRepos()
+              const warnText = result.warnings.length ? ` Warnings: ${result.warnings.join('; ')}` : ''
+              setGithubNotice(`Synced ${result.repos.length} ${result.repos.length === 1 ? 'repo' : 'repos'}: ${result.specsImported} specs imported, ${result.dependenciesExtracted} dependencies extracted.${warnText}`)
+            },
+          )
+        }}
+      />
 
       {showLinkedReposCard && (
         <Card className="mb-4 overflow-hidden border-line">

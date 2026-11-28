@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { listGithubRepositories } from '../../actions.ts'
 import { cn } from '../../lib/cn.ts'
 import type { GithubAppInstallationSummary } from '../../server/github-connector.ts'
@@ -60,60 +60,82 @@ function GithubMarkIcon() {
   )
 }
 
-/** Refined neutral-ink repo + branch + security lens illustration (light & dark). */
-function GithubBannerSvg() {
-  return (
-    <svg
-      className="block flex-none text-fg-muted max-[520px]:hidden"
-      width="54"
-      height="40"
-      viewBox="0 0 58 44"
-      fill="none"
-      aria-hidden="true"
-    >
-      {/* Repository code card */}
-      <rect
-        x="1"
-        y="3"
-        width="40"
-        height="34"
-        rx="7"
-        fill="var(--panel)"
-        stroke="var(--line-2)"
-        strokeWidth="1.25"
-      />
-      {/* Window header bar */}
-      <path d="M1.6 11.5H40.4" stroke="var(--line)" strokeWidth="1.1" />
-      <circle cx="7" cy="7.5" r="1.3" fill="var(--fg-4)" />
-      <circle cx="11.5" cy="7.5" r="1.3" fill="var(--fg-4)" />
-      <circle cx="16" cy="7.5" r="1.3" fill="var(--fg-4)" />
+/** sessionStorage key for the in-progress New project draft (non-secret fields only). */
+export const NEW_PROJECT_DRAFT_KEY = 'kovo:new-project-draft'
 
-      {/* Git branch graph inside repo card */}
-      <circle cx="11.5" cy="18.5" r="2.1" fill="var(--panel)" stroke="currentColor" strokeWidth="1.35" />
-      <circle cx="11.5" cy="30" r="2.1" fill="var(--panel)" stroke="currentColor" strokeWidth="1.35" />
-      <path d="M11.5 20.6V27.9" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
-      <path d="M11.5 27.9C11.5 24.4 21.5 25.2 21.5 23.1" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
-      <circle cx="21.5" cy="21" r="2.2" fill="var(--accent)" />
+export interface NewProjectDraft {
+  name: string
+  sites: string
+}
 
-      {/* Subtle code lines */}
-      <rect x="27" y="17.5" width="9" height="2.2" rx="1.1" fill="var(--line-strong)" />
-      <rect x="27" y="23" width="7" height="2.2" rx="1.1" fill="var(--line-2)" />
-      <rect x="27" y="28.5" width="8.5" height="2.2" rx="1.1" fill="var(--line-2)" />
+/** Serialises only the non-secret `name` / `sites` fields; returns null when there is nothing worth keeping. */
+export function serializeProjectDraft(draft: Partial<NewProjectDraft>): string | null {
+  const name = typeof draft.name === 'string' ? draft.name.slice(0, 160) : ''
+  const sites = typeof draft.sites === 'string' ? draft.sites.slice(0, 20_000) : ''
+  if (!name.trim() && !sites.trim()) return null
+  return JSON.stringify({ name, sites })
+}
 
-      {/* Overlapping neutral security lens badge */}
-      <circle
-        cx="43"
-        cy="28"
-        r="11.5"
-        fill="var(--panel)"
-        stroke="var(--line-strong)"
-        strokeWidth="1.25"
-      />
-      <circle cx="43" cy="28" r="9" fill="var(--sunk)" />
-      <circle cx="41.8" cy="26.8" r="3.9" stroke="var(--fg-2)" strokeWidth="1.55" />
-      <path d="M44.7 29.7L47.5 32.5" stroke="var(--fg-2)" strokeWidth="1.65" strokeLinecap="round" />
-    </svg>
-  )
+/** Parses a stored draft defensively: unknown keys are dropped, wrong types yield null. */
+export function parseProjectDraft(raw: string | null | undefined): NewProjectDraft | null {
+  if (!raw) return null
+  try {
+    const value: unknown = JSON.parse(raw)
+    if (!value || typeof value !== 'object') return null
+    const { name, sites } = value as Record<string, unknown>
+    if (typeof name !== 'string' || typeof sites !== 'string') return null
+    if (!name.trim() && !sites.trim()) return null
+    return { name: name.slice(0, 160), sites: sites.slice(0, 20_000) }
+  } catch {
+    return null
+  }
+}
+
+function sessionStore(): Storage | null {
+  try {
+    return typeof window === 'undefined' ? null : window.sessionStorage
+  } catch {
+    return null
+  }
+}
+
+type DraftField = HTMLInputElement | HTMLTextAreaElement
+
+function draftFields(root: HTMLElement | null): { name: DraftField | null; sites: DraftField | null } {
+  const form = root?.closest('form')
+  const pick = (fieldName: string): DraftField | null => {
+    const el = form?.elements.namedItem(fieldName)
+    return el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? el : null
+  }
+  return { name: pick('name'), sites: pick('seeds') }
+}
+
+/** Saves the surrounding form's name/sites before leaving for Settings. */
+function persistDraftFrom(root: HTMLElement | null) {
+  const store = sessionStore()
+  if (!store) return
+  const fields = draftFields(root)
+  const serialized = serializeProjectDraft({ name: fields.name?.value, sites: fields.sites?.value })
+  try {
+    if (serialized) store.setItem(NEW_PROJECT_DRAFT_KEY, serialized)
+  } catch {
+    // Storage full or disabled: navigation still proceeds, only the draft is lost.
+  }
+}
+
+/** Restores a saved draft into empty fields once, then clears it. */
+function useRestoreProjectDraft(rootRef: React.RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    const store = sessionStore()
+    if (!store) return
+    const draft = parseProjectDraft(store.getItem(NEW_PROJECT_DRAFT_KEY))
+    if (!draft) return
+    const fields = draftFields(rootRef.current)
+    if (!fields.name && !fields.sites) return
+    if (fields.name && !fields.name.value) fields.name.value = draft.name
+    if (fields.sites && !fields.sites.value) fields.sites.value = draft.sites
+    store.removeItem(NEW_PROJECT_DRAFT_KEY)
+  }, [rootRef])
 }
 
 export function CreateProjectGithubBlock({
@@ -128,6 +150,10 @@ export function CreateProjectGithubBlock({
   const [reposLoaded, setReposLoaded] = useState(false)
   const [search, setSearch] = useState('')
   const [error, setError] = useState('')
+  const [expanded, setExpanded] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const panelId = useId()
+  useRestoreProjectDraft(rootRef)
 
   useEffect(() => {
     setPatStatus(initialPatStatus)
@@ -177,24 +203,30 @@ export function CreateProjectGithubBlock({
     }
   }
 
+  const settingsLinkClass = cn(buttonVariants({ variant: 'ghost' }), 'h-6 px-[7px] text-[12px] text-fg-muted no-underline')
+
   if (!patStatus.configured) {
     return (
-      <div className="flex flex-wrap items-center gap-[13px] overflow-hidden rounded-card border border-line-2 bg-sunk px-[15px] py-[13px] dark:bg-raise">
-        <GithubBannerSvg />
-        <div className="flex min-w-0 grow basis-[220px] flex-col gap-0.5">
-          <span className="flex flex-wrap items-center gap-2">
-            <strong className="text-[13.5px] font-semibold leading-[19px] text-fg">Connect GitHub</strong>
-            <Badge className="h-[19px] shrink-0 bg-panel text-[11px] font-medium tracking-[0.01em] text-fg-muted">
-              Recommended
-            </Badge>
-          </span>
-          <span className="text-[12px] font-normal leading-[17px] text-fg-muted">
-            Add source code to find deeper vulnerabilities. Connect GitHub in Settings anytime.
-          </span>
-        </div>
+      <div
+        ref={rootRef}
+        data-slot="create-project-github"
+        className="flex min-h-9 min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1.5 rounded-card border border-line-2 bg-sunk py-[5px] pl-3 pr-[5px] dark:bg-raise"
+      >
+        <GithubMarkIcon />
+        <strong className="flex-none text-[12.5px] font-semibold leading-[18px] text-fg">Connect GitHub</strong>
+        <Badge className="h-[18px] shrink-0 bg-panel text-[11px] font-medium tracking-[0.01em] text-fg-muted">
+          Recommended
+        </Badge>
+        <span
+          className="min-w-0 flex-[1_1_120px] truncate text-[12px] font-normal leading-[17px] text-fg-muted"
+          title="Add source code to find deeper vulnerabilities. Connect GitHub in Settings anytime; your draft is kept."
+        >
+          Add source code to find deeper vulnerabilities.
+        </span>
         <Link
           to="/settings"
           search={{}}
+          onClick={() => persistDraftFrom(rootRef.current)}
           className={cn(
             buttonVariants({ variant: 'outline' }),
             'flex-none no-underline max-[520px]:w-full max-[520px]:justify-center',
@@ -208,79 +240,104 @@ export function CreateProjectGithubBlock({
     )
   }
 
+  const repoStatus = loadingRepos && !reposLoaded
+    ? 'Loading repositories…'
+    : error
+      ? 'Could not load repositories'
+      : patStatus.needsAppInstall
+        ? 'App not installed on any account yet'
+        : reposLoaded
+          ? `${repos.length} ${repos.length === 1 ? 'repository' : 'repositories'} available · optional`
+          : 'Optional'
+
   return (
-    <div className="overflow-hidden rounded-card border border-line-2 bg-panel">
-      <div className="flex min-h-[38px] items-center justify-between gap-2 bg-sunk py-1.5 pl-3 pr-2.5">
-        <div className="flex min-w-0 flex-wrap items-center gap-[7px]">
-          <GithubMarkIcon />
-          <strong className="text-[12.5px] font-semibold leading-[18px] text-fg">GitHub</strong>
-          <Badge className="max-w-[180px] bg-panel font-medium text-fg-muted">
-            {connectionBadge(patStatus)}
+    <div ref={rootRef} data-slot="create-project-github" className="overflow-hidden rounded-card border border-line-2 bg-panel">
+      <div className="flex min-h-9 min-w-0 items-center gap-2 bg-sunk py-[5px] pl-3 pr-[5px]">
+        <GithubMarkIcon />
+        <strong className="flex-none text-[12.5px] font-semibold leading-[18px] text-fg">GitHub</strong>
+        <Badge className="max-w-[160px] flex-none bg-panel font-medium text-fg-muted">
+          {connectionBadge(patStatus)}
+        </Badge>
+        {selectedRepos.length > 0 && (
+          <Badge variant="accent" className="flex-none text-[11px] font-medium tabular-nums">
+            {selectedRepos.length} selected
           </Badge>
-          {selectedRepos.length > 0 && (
-            <Badge variant="accent" className="text-[11px] font-medium tabular-nums">
-              {selectedRepos.length} selected
-            </Badge>
-          )}
-        </div>
-        <div className="flex flex-none items-center gap-1">
-          <Link
-            to="/settings"
-            search={{}}
-            className={cn(buttonVariants({ variant: 'ghost' }), 'h-6 px-[7px] text-[12px] text-fg-muted no-underline')}
-          >
-            Settings
-          </Link>
-          <Button
-            type="button"
-            variant="ghost"
-            className="h-6 px-[7px] text-[12px] text-fg-muted"
-            disabled={loadingRepos || disabled}
-            onClick={() => void handleRefresh()}
-          >
-            {loadingRepos ? 'Loading…' : 'Refresh'}
-          </Button>
-        </div>
-      </div>
-
-      <GithubInstallBanner
-        authKind={patStatus.authKind}
-        tokenKind={patStatus.tokenKind}
-        login={patStatus.login}
-        installUrl={patStatus.installUrl}
-        installations={patStatus.installations}
-        privateRepoCount={patStatus.privateRepoCount}
-        needsAppInstall={patStatus.needsAppInstall}
-        loading={loadingRepos}
-        onRefresh={() => void handleRefresh()}
-        compact
-        flush
-      />
-
-      <div className="border-t border-line bg-panel">
-        {loadingRepos && !reposLoaded ? (
-          <div className="px-3.5 py-3 text-[12.5px]">
-            <span className="text-fg-subtle">Loading repositories…</span>
-          </div>
-        ) : error ? (
-          <div className="flex items-center justify-between gap-2 px-3.5 py-3 text-[12.5px]">
-            <span role="alert" className="text-[12px] text-danger">{error}</span>
-            <Button type="button" variant="ghost" onClick={() => void handleRefresh()}>Retry</Button>
-          </div>
-        ) : (
-          <GroupedRepoPicker
-            repos={repos}
-            selectedRepos={selectedRepos}
-            onChangeSelectedRepos={onChangeSelectedRepos}
-            search={search}
-            onSearchChange={setSearch}
-            maxSelectable={MAX_SYNC_REPOS}
-            disabled={disabled}
-            variant="compact"
-            emptyMessage="No repositories found. You can sync repos later in the project."
-          />
         )}
+        <span className="min-w-0 flex-1 truncate text-[12px] text-fg-subtle" title={repoStatus}>{repoStatus}</span>
+        {expanded && (
+          <>
+            <Link to="/settings" search={{}} onClick={() => persistDraftFrom(rootRef.current)} className={cn(settingsLinkClass, 'max-[520px]:hidden')}>
+              Settings
+            </Link>
+            <Button
+              type="button"
+              variant="ghost"
+              className="h-6 flex-none px-[7px] text-[12px] text-fg-muted"
+              disabled={loadingRepos || disabled}
+              onClick={() => void handleRefresh()}
+            >
+              {loadingRepos ? 'Loading…' : 'Refresh'}
+            </Button>
+          </>
+        )}
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={panelId}
+          className="inline-flex h-[26px] flex-none cursor-pointer items-center gap-1 whitespace-nowrap rounded-[6px] border border-line-2 bg-panel px-2 text-[12px] font-medium text-fg shadow-none hover:bg-hover"
+          onClick={() => setExpanded(open => !open)}
+        >
+          {expanded ? 'Hide repos' : 'Choose repos'}
+          <Icon
+            name="chevD"
+            size={12}
+            className={cn('text-fg-subtle transition-[rotate] duration-150 ease-kovo motion-reduce:transition-none', expanded && 'rotate-180')}
+          />
+        </button>
       </div>
+
+      {expanded && (
+        <div id={panelId} className="border-t border-line transition-opacity duration-150 ease-kovo starting:opacity-0">
+          <GithubInstallBanner
+            authKind={patStatus.authKind}
+            tokenKind={patStatus.tokenKind}
+            login={patStatus.login}
+            installUrl={patStatus.installUrl}
+            installations={patStatus.installations}
+            privateRepoCount={patStatus.privateRepoCount}
+            needsAppInstall={patStatus.needsAppInstall}
+            loading={loadingRepos}
+            onRefresh={() => void handleRefresh()}
+            compact
+            flush
+          />
+
+          <div className="border-t border-line bg-panel">
+            {loadingRepos && !reposLoaded ? (
+              <div className="px-3.5 py-3 text-[12.5px]">
+                <span className="text-fg-subtle">Loading repositories…</span>
+              </div>
+            ) : error ? (
+              <div className="flex items-center justify-between gap-2 px-3.5 py-3 text-[12.5px]">
+                <span role="alert" className="text-[12px] text-danger">{error}</span>
+                <Button type="button" variant="ghost" onClick={() => void handleRefresh()}>Retry</Button>
+              </div>
+            ) : (
+              <GroupedRepoPicker
+                repos={repos}
+                selectedRepos={selectedRepos}
+                onChangeSelectedRepos={onChangeSelectedRepos}
+                search={search}
+                onSearchChange={setSearch}
+                maxSelectable={MAX_SYNC_REPOS}
+                disabled={disabled}
+                variant="compact"
+                emptyMessage="No repositories found. You can sync repos later in the project."
+              />
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

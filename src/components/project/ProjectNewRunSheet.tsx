@@ -1,5 +1,6 @@
 import { useNavigate } from '@tanstack/react-router'
-import { useEffect, useRef, useState } from 'react'
+import { Popover } from '@base-ui/react/popover'
+import { useEffect, useId, useRef, useState } from 'react'
 import { createRun } from '../../actions.ts'
 import type { ApprovalPolicy, CapabilityTier, PublicPersona } from '../../domain.ts'
 import {
@@ -69,7 +70,7 @@ const SCAN_MODES: Record<ScanMode, ScanModePreset> = {
     goal: 'Run safe active checks, auth/access-control probes, and high-impact proofs while pausing for human approval before risky state-changing actions.',
     label: 'Supervised Scan',
     badge: 'Recommended',
-    desc: 'Safe active checks automatically; pauses for approval before risky writes.',
+    desc: 'Safe active checks; pauses for approval before risky writes.',
     badgeVariant: 'accent',
   },
   autonomous: {
@@ -88,49 +89,41 @@ const SCAN_MODES: Record<ScanMode, ScanModePreset> = {
 const SCAN_MODE_ORDER: readonly ScanMode[] = ['passive', 'supervised', 'autonomous']
 const BUDGET_CHIPS = [10, 25, 50] as const
 
-function PassiveScanSvg() {
-  return (
-    <svg className="block h-[38px] w-[60px] flex-none text-fg" viewBox="0 0 64 40" fill="none" aria-hidden="true">
-      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
-      <circle cx="32" cy="20" r="12.5" stroke="var(--line-strong)" strokeWidth="1.2" />
-      <circle cx="32" cy="20" r="7" stroke="var(--line-strong)" strokeWidth="1.2" strokeDasharray="2.5 2.5" />
-      <path d="M32 20L41 12" stroke="var(--accent)" strokeWidth="1.6" strokeLinecap="round" />
-      <circle cx="32" cy="20" r="2.25" fill="var(--panel)" stroke="currentColor" strokeWidth="1.4" />
-      <circle cx="41" cy="12" r="2.6" fill="var(--accent)" />
-      <circle cx="24" cy="25" r="1.9" fill="var(--fg-3)" />
-    </svg>
+const MODE_ICON: Record<ScanMode, 'search' | 'shield' | 'play'> = {
+  passive: 'search',
+  supervised: 'shield',
+  autonomous: 'play',
+}
+
+/** Chips shown before the "+N" overflow pill; six fit two lines of the 680px sheet. */
+export const MAX_VISIBLE_ACCOUNT_CHIPS = 5
+
+/**
+ * Selected-account chip row: show every chip when one more would not need a
+ * "+1" pill, otherwise cap at `max` and report the rest as overflow.
+ */
+export function summarizeAccountChips<T>(selected: readonly T[], max = MAX_VISIBLE_ACCOUNT_CHIPS): { visible: T[]; overflow: number } {
+  if (selected.length <= max + 1) return { visible: [...selected], overflow: 0 }
+  return { visible: selected.slice(0, max), overflow: selected.length - max }
+}
+
+/** Case-insensitive match on handle, account label, tenant, and auth summary. */
+export function filterAccounts<T extends Pick<PublicPersona, 'handle' | 'roleLabel'> & { tenantRef?: string | null }>(
+  personas: readonly T[],
+  query: string,
+  describe: (persona: T) => string = () => '',
+): T[] {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return [...personas]
+  return personas.filter(persona =>
+    [persona.handle, persona.roleLabel, persona.tenantRef ?? '', describe(persona)]
+      .some(field => field.toLowerCase().includes(needle)),
   )
 }
 
-function SupervisedScanSvg() {
-  return (
-    <svg className="block h-[38px] w-[60px] flex-none text-fg" viewBox="0 0 64 40" fill="none" aria-hidden="true">
-      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
-      <path d="M10 20h14M40 20h14" stroke="var(--line-strong)" strokeWidth="1.4" strokeLinecap="round" />
-      <path d="M14 14l4 6-4 6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-      <rect x="24.5" y="11" width="15" height="18" rx="4" fill="var(--panel)" stroke="var(--accent)" strokeWidth="1.5" />
-      <path d="M29 20.2 31.2 22.4 35.4 17.8" stroke="var(--accent)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M49 16l4.5 4-4.5 4" stroke="var(--accent)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
-function AutonomousScanSvg() {
-  return (
-    <svg className="block h-[38px] w-[60px] flex-none text-fg" viewBox="0 0 64 40" fill="none" aria-hidden="true">
-      <rect x="1.5" y="1.5" width="61" height="37" rx="7" fill="var(--sunk)" stroke="var(--line-2)" strokeWidth="1.2" />
-      <path d="M12 20h10M42 20h10" stroke="var(--line-strong)" strokeWidth="1.4" strokeLinecap="round" />
-      <path d="M34 10 24 21h8l-2 9 10-11h-8l2-9Z" fill="var(--panel)" stroke="var(--warn)" strokeWidth="1.5" strokeLinejoin="round" />
-      <circle cx="15" cy="20" r="2.2" fill="var(--fg-3)" />
-      <circle cx="49" cy="20" r="2.2" fill="var(--warn)" />
-    </svg>
-  )
-}
-
-function ModeIllustration({ mode }: { mode: ScanMode }) {
-  if (mode === 'passive') return <PassiveScanSvg />
-  if (mode === 'supervised') return <SupervisedScanSvg />
-  return <AutonomousScanSvg />
+/** "4 of 12 selected" */
+export function formatAccountSelection(selected: number, total: number): string {
+  return `${selected} of ${total} selected`
 }
 
 export function resolveRunSubmissionMode(
@@ -228,7 +221,7 @@ function PersonaPill({
     <div
       data-slot="persona-pill"
       className={cn(
-        'inline-flex min-h-[28px] min-w-0 max-w-full items-center overflow-hidden rounded-full border transition-colors',
+        'inline-flex h-[26px] min-w-0 max-w-[min(200px,100%)] items-center overflow-hidden rounded-full border transition-colors',
         selected
           ? 'border-accent-line bg-accent-soft text-fg'
           : 'border-line-2 bg-sunk text-fg-muted',
@@ -237,7 +230,8 @@ function PersonaPill({
       <button
         type="button"
         aria-pressed={selected}
-        className="inline-flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 whitespace-nowrap border-0 bg-transparent py-1 pl-2.5 pr-2 text-[12px] font-medium text-inherit shadow-none transition-colors hover:bg-hover/60"
+        aria-label={`${persona.handle} selected for this run (click to remove)`}
+        className="inline-flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 whitespace-nowrap border-0 bg-transparent py-0 pl-2 pr-1.5 text-[12px] font-medium text-inherit shadow-none transition-colors hover:bg-hover/60"
         onClick={onToggle}
         title={`${persona.handle} · ${persona.roleLabel} (${formatPersonaAuthBadge(persona)})`}
       >
@@ -252,14 +246,13 @@ function PersonaPill({
         >
           <SelectedCheck />
         </span>
-        <span className="min-w-0 max-w-[26ch] truncate font-mono text-[12px]" title={persona.handle}>{persona.handle}</span>
-        <span className="min-w-0 max-w-[20ch] shrink-[3] truncate font-normal text-fg-subtle">{persona.roleLabel}</span>
+        <span className="min-w-0 truncate font-mono text-[12px]">{persona.handle}</span>
       </button>
       <button
         type="button"
         disabled={test?.status === 'testing'}
         className={cn(
-          'inline-flex h-full flex-none cursor-pointer items-center whitespace-nowrap border-0 border-l border-line/80 bg-transparent px-2 py-1 text-[11px] font-medium shadow-none transition-colors hover:bg-hover/80 disabled:cursor-default disabled:opacity-60',
+          'inline-flex h-full flex-none cursor-pointer items-center whitespace-nowrap border-0 border-l border-line/80 bg-transparent px-2 py-0 text-[11px] font-medium shadow-none transition-colors hover:bg-hover/80 disabled:cursor-default disabled:opacity-60',
           verifyToneFor(test),
         )}
         aria-label={`Verify sign-in for ${persona.handle}`}
@@ -268,6 +261,258 @@ function PersonaPill({
       >
         {verifyLabelFor(test)}
       </button>
+    </div>
+  )
+}
+
+function QuietAction({ children, className, ...props }: React.ComponentProps<'button'>) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        'h-6 cursor-pointer whitespace-nowrap rounded-[5px] border-0 bg-transparent px-[7px] text-[11.5px] font-medium text-fg-muted shadow-none transition-colors hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent',
+        className,
+      )}
+      {...props}
+    >
+      {children}
+    </button>
+  )
+}
+
+/**
+ * Searchable multi-select account picker ([U12]): a summary header, an
+ * input-like trigger that opens a listbox popover with search, and a compact
+ * chip row of the selected accounts capped to two lines with a "+N" overflow.
+ */
+function AccountCombobox({
+  personas,
+  selectedIds,
+  setSelectedIds,
+  personaTests,
+  onTestPersona,
+  onAddAccount,
+}: {
+  personas: readonly PublicPersona[]
+  selectedIds: readonly string[]
+  setSelectedIds: React.Dispatch<React.SetStateAction<string[]>>
+  personaTests: Record<string, PersonaTestState>
+  onTestPersona: (persona: PublicPersona) => void
+  onAddAccount: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [activeIndex, setActiveIndex] = useState(0)
+  const searchRef = useRef<HTMLInputElement | null>(null)
+  const listboxId = useId()
+
+  const selectedSet = new Set(selectedIds)
+  const matches = filterAccounts(personas, query, formatPersonaAuthBadge)
+  const selectedPersonas = selectedIds
+    .map(id => personas.find(persona => persona.id === id))
+    .filter((persona): persona is PublicPersona => Boolean(persona))
+  const chips = summarizeAccountChips(selectedPersonas)
+  const activeOption = matches[Math.min(activeIndex, Math.max(0, matches.length - 1))]
+
+  function toggle(id: string) {
+    setSelectedIds(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]))
+  }
+
+  function onSearchKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (matches.length === 0) return
+      const delta = event.key === 'ArrowDown' ? 1 : -1
+      setActiveIndex(index => (Math.min(index, matches.length - 1) + delta + matches.length) % matches.length)
+      return
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      if (activeOption) toggle(activeOption.id)
+    }
+  }
+
+  return (
+    <div className="flex min-w-0 flex-col gap-2" data-slot="account-combobox">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="inline-flex min-w-0 items-baseline gap-2 text-[12px] font-semibold text-fg">
+          Test accounts
+          {personas.length > 0 && (
+            <span className="font-normal tabular-nums text-fg-subtle" data-slot="account-selection-count">
+              {formatAccountSelection(selectedPersonas.length, personas.length)}
+            </span>
+          )}
+        </span>
+        <div className="flex flex-wrap items-center gap-0.5">
+          {personas.length > 1 && (
+            <QuietAction
+              disabled={selectedPersonas.length === personas.length}
+              onClick={() => setSelectedIds(personas.map(persona => persona.id))}
+            >
+              Select all
+            </QuietAction>
+          )}
+          {selectedPersonas.length > 0 && (
+            <>
+              <QuietAction onClick={() => setSelectedIds([])}>Clear</QuietAction>
+              {selectedPersonas.length > 1 && (
+                <QuietAction onClick={() => selectedPersonas.forEach(persona => onTestPersona(persona))}>
+                  Verify all
+                </QuietAction>
+              )}
+            </>
+          )}
+          <Button type="button" variant="outline" className="ml-1" onClick={onAddAccount}>
+            + Add test account
+          </Button>
+        </div>
+      </div>
+
+      {personas.length === 0 ? (
+        <span className="text-[12px] text-fg-subtle">
+          No test accounts configured yet — add User A &amp; User B to test signed-in views and cross-user isolation.
+        </span>
+      ) : (
+        <>
+          <Popover.Root
+            open={open}
+            onOpenChange={next => {
+              setOpen(next)
+              if (!next) {
+                setQuery('')
+                setActiveIndex(0)
+              }
+            }}
+          >
+            <Popover.Trigger
+              data-slot="account-combobox-trigger"
+              aria-label="Choose test accounts for this run"
+              className="flex h-[30px] w-full min-w-0 cursor-pointer items-center gap-2 whitespace-nowrap rounded-[6px] border border-line-2 bg-panel px-2.5 text-left text-[12px] font-normal text-fg-subtle shadow-none transition-colors hover:border-line-strong hover:bg-panel data-[popup-open]:border-accent-line"
+            >
+              <Icon name="search" size={13} className="flex-none" />
+              <span className="min-w-0 flex-1 truncate">
+                {`Search ${personas.length} test ${personas.length === 1 ? 'account' : 'accounts'}…`}
+              </span>
+              <Icon name="chevD" size={12} className="flex-none" />
+            </Popover.Trigger>
+            <Popover.Portal>
+              <Popover.Positioner side="bottom" align="start" sideOffset={4} className="z-[70]">
+                <Popover.Popup
+                  initialFocus={searchRef}
+                  data-slot="account-combobox-popup"
+                  className={cn(
+                    'flex w-[var(--anchor-width)] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-card border border-line-2 bg-raise text-fg shadow-popover outline-none',
+                    'origin-[var(--transform-origin)] transition-[opacity,scale] duration-150 ease-kovo data-[ending-style]:scale-[.98] data-[ending-style]:opacity-0 data-[starting-style]:scale-[.98] data-[starting-style]:opacity-0',
+                  )}
+                >
+                  <div className="flex h-9 flex-none items-center gap-2 border-b border-line px-2.5">
+                    <Icon name="search" size={13} className="flex-none text-fg-subtle" />
+                    <input
+                      ref={searchRef}
+                      type="search"
+                      role="combobox"
+                      aria-expanded="true"
+                      aria-controls={listboxId}
+                      aria-autocomplete="list"
+                      aria-activedescendant={activeOption ? `${listboxId}-${activeOption.id}` : undefined}
+                      aria-label="Search test accounts"
+                      placeholder="Search by handle, label, or tenant…"
+                      className="h-[26px] w-full min-w-0 flex-1 rounded-none border-0 bg-transparent p-0 text-[12.5px] shadow-none outline-none focus:shadow-none [&::-webkit-search-cancel-button]:appearance-none"
+                      value={query}
+                      onChange={event => {
+                        setQuery(event.target.value)
+                        setActiveIndex(0)
+                      }}
+                      onKeyDown={onSearchKeyDown}
+                    />
+                  </div>
+                  <div
+                    id={listboxId}
+                    role="listbox"
+                    aria-multiselectable="true"
+                    aria-label="Test accounts"
+                    className="max-h-[232px] overflow-y-auto p-1"
+                  >
+                    {matches.length === 0 ? (
+                      <div className="px-2 py-3 text-[12px] text-fg-subtle">No test accounts match “{query.trim()}”.</div>
+                    ) : matches.map(persona => {
+                      const checked = selectedSet.has(persona.id)
+                      const active = activeOption?.id === persona.id
+                      const test = personaTests[persona.id]
+                      return (
+                        <div
+                          key={persona.id}
+                          id={`${listboxId}-${persona.id}`}
+                          role="option"
+                          aria-selected={checked}
+                          data-active={active ? 'true' : undefined}
+                          className="flex min-h-[36px] cursor-pointer select-none items-center gap-2 rounded-[6px] px-2 py-1 data-[active=true]:bg-hover hover:bg-hover"
+                          onMouseDown={event => event.preventDefault()}
+                          onMouseEnter={() => setActiveIndex(matches.indexOf(persona))}
+                          onClick={() => toggle(persona.id)}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className={cn(
+                              'inline-grid size-[14px] flex-none place-items-center rounded-[4px] border',
+                              checked ? 'border-accent bg-accent text-accent-fg' : 'border-line-strong text-transparent',
+                            )}
+                          >
+                            <SelectedCheck />
+                          </span>
+                          <span className="flex min-w-0 flex-1 flex-col">
+                            <span className="truncate font-mono text-[12px] font-medium text-fg">{persona.handle}</span>
+                            <span className="truncate text-[11px] text-fg-subtle">
+                              {[persona.roleLabel, persona.tenantRef, formatPersonaAuthBadge(persona)].filter(Boolean).join(' · ')}
+                            </span>
+                          </span>
+                          {test && (
+                            <span className={cn('flex-none text-[11px] font-medium', verifyToneFor(test))}>{verifyLabelFor(test)}</span>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div className="flex flex-none items-center justify-between gap-2 border-t border-line px-2.5 py-1.5 text-[11.5px] text-fg-subtle">
+                    <span className="tabular-nums">{formatAccountSelection(selectedPersonas.length, personas.length)}</span>
+                    <Popover.Close
+                      className="h-6 cursor-pointer rounded-[5px] border-0 bg-transparent px-[7px] text-[11.5px] font-medium text-accent shadow-none hover:bg-hover"
+                    >
+                      Done
+                    </Popover.Close>
+                  </div>
+                </Popover.Popup>
+              </Popover.Positioner>
+            </Popover.Portal>
+          </Popover.Root>
+
+          {chips.visible.length > 0 && (
+            <div className="flex min-w-0 flex-wrap gap-1.5" role="group" aria-label="Selected test accounts" data-slot="account-chips">
+              {chips.visible.map(persona => (
+                <PersonaPill
+                  key={persona.id}
+                  persona={persona}
+                  selected
+                  test={personaTests[persona.id]}
+                  onToggle={() => toggle(persona.id)}
+                  onTestPersona={onTestPersona}
+                />
+              ))}
+              {chips.overflow > 0 && (
+                <button
+                  type="button"
+                  data-slot="account-chip-overflow"
+                  aria-label={`Show ${chips.overflow} more selected test accounts`}
+                  className="h-[26px] cursor-pointer whitespace-nowrap rounded-full border border-line-2 bg-sunk px-2.5 text-[11.5px] font-medium tabular-nums text-fg-muted shadow-none hover:bg-hover hover:text-fg"
+                  onClick={() => setOpen(true)}
+                >
+                  {`+${chips.overflow}`}
+                </button>
+              )}
+            </div>
+          )}
+        </>
+      )}
     </div>
   )
 }
@@ -338,10 +583,6 @@ export function ProjectNewRunSheet({
     setScanMode(nextMode)
     setBudgetText(String(preset.usdCap))
     setRateText(String(preset.rps))
-  }
-
-  function togglePersona(id: string) {
-    setSelectedPersonaIds(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]))
   }
 
   function focusField(name: string) {
@@ -432,13 +673,26 @@ export function ProjectNewRunSheet({
 
             <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
               <div className="flex flex-col gap-2">
-                <div className="grid grid-cols-1 gap-[9px] sm:grid-cols-3" role="radiogroup" aria-label="Scan mode">
+                <div
+                  className="flex flex-col gap-1.5"
+                  role="radiogroup"
+                  aria-label="Scan mode"
+                  onKeyDown={event => {
+                    const delta = event.key === 'ArrowDown' || event.key === 'ArrowRight' ? 1 : event.key === 'ArrowUp' || event.key === 'ArrowLeft' ? -1 : 0
+                    if (!delta) return
+                    event.preventDefault()
+                    const index = SCAN_MODE_ORDER.indexOf(scanMode)
+                    const nextMode = SCAN_MODE_ORDER[(index + delta + SCAN_MODE_ORDER.length) % SCAN_MODE_ORDER.length]!
+                    applyScanMode(nextMode)
+                    requestAnimationFrame(() => checkedModeRef.current?.focus())
+                  }}
+                >
                   {SCAN_MODE_ORDER.map(modeKey => {
                     const m = SCAN_MODES[modeKey]
                     const active = scanMode === modeKey
                     const activeClasses = modeKey === 'autonomous'
-                      ? 'border-warn-line bg-warn-soft text-fg hover:bg-warn-soft'
-                      : 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                      ? 'border-warn-line bg-warn-soft hover:bg-warn-soft'
+                      : 'border-accent-line bg-accent-soft hover:bg-accent-soft'
                     return (
                       <button
                         key={modeKey}
@@ -446,32 +700,41 @@ export function ProjectNewRunSheet({
                         type="button"
                         role="radio"
                         aria-checked={active}
+                        tabIndex={active ? 0 : -1}
+                        data-slot="scan-mode-row"
+                        title={m.warning ? `${m.desc} ${m.warning}.` : m.desc}
                         className={cn(
-                          'flex h-auto w-full cursor-pointer flex-col gap-[9px] whitespace-normal rounded-[9px] border px-[13px] py-3 text-left shadow-none transition-colors',
-                          active
-                            ? activeClasses
-                            : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
+                          'flex h-auto min-h-[42px] w-full min-w-0 cursor-pointer items-center gap-2.5 whitespace-normal rounded-[8px] border px-3 py-1.5 text-left font-normal text-fg shadow-none transition-colors active:scale-100',
+                          active ? activeClasses : 'border-line-2 bg-panel hover:border-line-strong hover:bg-hover',
                         )}
                         onClick={() => applyScanMode(modeKey)}
                       >
-                        <div className="flex w-full items-start justify-between gap-2">
-                          <ModeIllustration mode={modeKey} />
-                          <Badge
-                            variant={m.badgeVariant}
-                            className={m.badgeVariant === 'neutral' ? 'bg-sunk' : undefined}
-                          >
-                            {m.badge}
-                          </Badge>
-                        </div>
-                        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                          <strong className="text-[13px] font-semibold leading-[18px] text-fg">{m.label}</strong>
-                          <span className="text-[11.5px] font-normal leading-4 text-fg-muted">{m.desc}</span>
-                          {m.warning && (
-                            <span className="mt-1 text-[11px] font-medium leading-3.5 text-warn">
-                              {m.warning}
-                            </span>
+                        <span
+                          aria-hidden="true"
+                          className={cn(
+                            'inline-grid size-4 flex-none place-items-center rounded-full border transition-colors',
+                            active
+                              ? modeKey === 'autonomous' ? 'border-warn bg-warn' : 'border-accent bg-accent'
+                              : 'border-line-strong bg-panel',
                           )}
-                        </div>
+                        >
+                          <span className={cn('size-1.5 rounded-full', active ? 'bg-panel' : 'bg-transparent')} />
+                        </span>
+                        <Icon
+                          name={MODE_ICON[modeKey]}
+                          size={16}
+                          className={cn('flex-none', modeKey === 'autonomous' ? 'text-warn' : active ? 'text-accent' : 'text-fg-subtle')}
+                        />
+                        <span className="flex min-w-0 flex-1 items-baseline gap-2 max-[560px]:flex-col max-[560px]:gap-0">
+                          <strong className="flex-none text-[12.5px] font-semibold leading-[18px] text-fg">{m.label}</strong>
+                          <span className="min-w-0 truncate text-[11.5px] leading-4 text-fg-muted max-[560px]:whitespace-normal">{m.desc}</span>
+                        </span>
+                        <Badge
+                          variant={m.badgeVariant}
+                          className={cn('flex-none', m.badgeVariant === 'neutral' && 'bg-sunk')}
+                        >
+                          {m.badge}
+                        </Badge>
                       </button>
                     )
                   })}
@@ -480,7 +743,7 @@ export function ProjectNewRunSheet({
                 {scanMode === 'autonomous' && (
                   <div
                     role="status"
-                    className="flex items-start gap-2 rounded-[7px] border border-warn-line bg-warn-soft px-3 py-2 text-[12px] leading-[17px] text-fg"
+                    className="flex items-start gap-2 rounded-[7px] border border-warn-line bg-warn-soft px-3 py-1.5 text-[12px] leading-[17px] text-fg"
                   >
                     <Icon name="alert" size={14} className="mt-0.5 flex-none text-warn" />
                     <span>
@@ -491,56 +754,33 @@ export function ProjectNewRunSheet({
                 )}
               </div>
 
-              <div className="flex min-w-0 flex-col gap-2.5 border-t border-line pt-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-fg">
-                    Test accounts
-                    <Badge variant="neutral" className="bg-sunk tabular-nums">
-                      {selectedPersonaIds.length}/{personas.length}
-                    </Badge>
-                  </span>
-                  <Button type="button" variant="outline" onClick={() => setAddPersonaOpen(true)}>
-                    + Add test account
-                  </Button>
-                </div>
-                {personas.length > 0 ? (
-                  <>
-                    <div className="flex min-w-0 flex-wrap gap-1.5" role="group" aria-label="Select test accounts for run">
-                      {personas.map(persona => (
-                        <PersonaPill
-                          key={persona.id}
-                          persona={persona}
-                          selected={selectedPersonaIds.includes(persona.id)}
-                          test={personaTests[persona.id]}
-                          onToggle={() => togglePersona(persona.id)}
-                          onTestPersona={onTestPersona}
-                        />
-                      ))}
-                    </div>
-                    {testedPersonas.length > 0 && (
-                      <div className="grid gap-1" role="status">
-                        {testedPersonas.map(persona => {
-                          const test = personaTests[persona.id]!
-                          const tone = test.status === 'ok'
-                            ? 'text-ok'
-                            : test.status === 'warn'
-                              ? 'text-warn'
-                              : test.status === 'error'
-                                ? 'text-danger'
-                                : 'text-fg-subtle'
-                          return (
-                            <div key={persona.id} className={cn('min-w-0 text-[11.5px] [overflow-wrap:anywhere]', tone)}>
-                              <span className="font-mono font-medium">{persona.handle}</span>: {test.message}
-                            </div>
-                          )
-                        })}
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <span className="text-[12px] text-fg-subtle">
-                    No test accounts configured yet — add User A &amp; User B to test signed-in views and cross-user isolation.
-                  </span>
+              <div className="flex min-w-0 flex-col gap-2 border-t border-line pt-3">
+                <AccountCombobox
+                  personas={personas}
+                  selectedIds={selectedPersonaIds}
+                  setSelectedIds={setSelectedPersonaIds}
+                  personaTests={personaTests}
+                  onTestPersona={onTestPersona}
+                  onAddAccount={() => setAddPersonaOpen(true)}
+                />
+                {testedPersonas.length > 0 && (
+                  <div className="grid max-h-[52px] gap-1 overflow-y-auto" role="status">
+                    {testedPersonas.map(persona => {
+                      const test = personaTests[persona.id]!
+                      const tone = test.status === 'ok'
+                        ? 'text-ok'
+                        : test.status === 'warn'
+                          ? 'text-warn'
+                          : test.status === 'error'
+                            ? 'text-danger'
+                            : 'text-fg-subtle'
+                      return (
+                        <div key={persona.id} className={cn('min-w-0 text-[11.5px] [overflow-wrap:anywhere]', tone)}>
+                          <span className="font-mono font-medium">{persona.handle}</span>: {test.message}
+                        </div>
+                      )
+                    })}
+                  </div>
                 )}
               </div>
 

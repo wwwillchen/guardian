@@ -49,6 +49,10 @@ interface ActiveCaptureSession {
   viewport: { width: number; height: number }
 }
 
+// Step panels crossfade with an 8px directional translate (200ms). Reduced
+// motion keeps only the opacity fade (app.css limits transition properties).
+const STEP_PANEL_MOTION = 'grid gap-4 transition-[opacity,translate] duration-200 ease-kovo starting:opacity-0 motion-reduce:starting:translate-x-0'
+
 const EMPTY_ASSETS: readonly ProjectLoaderData['assets'][number][] = []
 
 export function buildProjectDefaultOrigins(
@@ -90,6 +94,78 @@ function parseOriginList(raw: string): string[] {
   }
   return result
 }
+
+export type PersonaStep = 1 | 2 | 3
+
+/** localStorage key remembering the last authentication method for returning users (no secrets). */
+export const PERSONA_LAST_METHOD_KEY = 'kovo:persona-last-auth-method'
+
+const AUTH_MODES: readonly UniversalAuthMode[] = ['browser_session', 'header_cookie', 'automated_login']
+
+export function parseStoredAuthMode(raw: string | null | undefined): UniversalAuthMode | null {
+  return AUTH_MODES.find(mode => mode === raw) ?? null
+}
+
+/** Stepper labels: the last step reads "Capture" for browser sessions and "Credentials" otherwise. */
+export function personaStepLabels(mode: UniversalAuthMode): readonly [string, string, string] {
+  return ['Account', 'Method', mode === 'browser_session' ? 'Capture' : 'Credentials']
+}
+
+/** Clamped step navigation (Back / Continue / Enter). */
+export function stepPersonaFlow(step: PersonaStep, delta: 1 | -1): PersonaStep {
+  return Math.min(3, Math.max(1, step + delta)) as PersonaStep
+}
+
+/**
+ * Browser-session saves are gated until a session exists: a fresh capture, a
+ * staged storageState.json, or (when editing) the persona's existing session.
+ * Credential modes always allow the attempt; inline field validation reports gaps.
+ */
+export function personaSaveGate(input: {
+  mode: UniversalAuthMode
+  hasCapturedToken: boolean
+  hasStorageState: boolean
+  keepsExistingSession: boolean
+}): { allowed: boolean; reason: string } {
+  if (input.mode !== 'browser_session') return { allowed: true, reason: '' }
+  if (input.hasCapturedToken || input.hasStorageState || input.keepsExistingSession) return { allowed: true, reason: '' }
+  return { allowed: false, reason: 'Capture a browser session to enable saving.' }
+}
+
+function readLastAuthMode(): UniversalAuthMode | null {
+  try {
+    return typeof window === 'undefined' ? null : parseStoredAuthMode(window.localStorage.getItem(PERSONA_LAST_METHOD_KEY))
+  } catch {
+    return null
+  }
+}
+
+function rememberAuthMode(mode: UniversalAuthMode) {
+  try {
+    window.localStorage.setItem(PERSONA_LAST_METHOD_KEY, mode)
+  } catch {
+    // Private mode / disabled storage: the default method is used next time.
+  }
+}
+
+const AUTH_METHOD_OPTIONS: readonly { mode: UniversalAuthMode; label: string; desc: string; badge?: string }[] = [
+  {
+    mode: 'browser_session',
+    label: 'Browser Session',
+    desc: 'Works with SSO, Passkeys, MFA, CAPTCHA, Clerk, Auth0, Supabase & auto-refreshes.',
+    badge: 'Recommended',
+  },
+  {
+    mode: 'header_cookie',
+    label: 'Header / Cookie / cURL',
+    desc: 'Paste Bearer token, Cookie, custom header, or DevTools Copy as cURL.',
+  },
+  {
+    mode: 'automated_login',
+    label: 'Automated Login (CI / Staging)',
+    desc: 'Email + password form/JSON sign-in for non-MFA local labs & staging CI.',
+  },
+]
 
 interface Props {
   open: boolean
@@ -234,6 +310,9 @@ export function PersonaFormModal({
   const [importOpen, setImportOpen] = useState(false)
   const [importJsonText, setImportJsonText] = useState('')
   const [importNote, setImportNote] = useState('')
+  const [step, setStep] = useState<PersonaStep>(1)
+  const [stepDirection, setStepDirection] = useState<1 | -1>(1)
+  const methodRadioRef = useRef<HTMLButtonElement | null>(null)
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const roleLabelRef = useRef<HTMLInputElement | null>(null)
@@ -369,7 +448,9 @@ export function PersonaFormModal({
       return
     }
     const init = resolveInitialMode(editingPersona)
-    setAuthMode(init.mode)
+    setStep(1)
+    setStepDirection(1)
+    setAuthMode(editingPersona ? init.mode : (readLastAuthMode() ?? init.mode))
     setStaticKind(init.staticKind)
     setLoginAdapter(init.adapter)
     setCaptureError('')
@@ -960,8 +1041,29 @@ export function PersonaFormModal({
     void sendCaptureInput({ kind: 'key', type: 'insertText', text })
   }
 
+  function goToStep(next: PersonaStep) {
+    if (next === step) return
+    setStepDirection(next > step ? 1 : -1)
+    setStep(next)
+    requestAnimationFrame(() => {
+      if (next === 1) roleLabelRef.current?.focus()
+      else if (next === 2) methodRadioRef.current?.focus()
+    })
+  }
+
+  function selectAuthMode(mode: UniversalAuthMode) {
+    if (mode !== 'browser_session') void cancelActiveCaptureSession()
+    setAuthMode(mode)
+    setCaptureError('')
+    if (!editingPersona) rememberAuthMode(mode)
+  }
+
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
+    if (step < 3) {
+      goToStep(stepPersonaFlow(step, 1))
+      return
+    }
     const cleanLabel = roleLabel.trim() || suggestNextAccountLabel(existingPersonas)
     const cleanTenantRef = tenantRef.trim() || null
     const cleanPrivilege: PersonaPrivilege | null = privilege || null
@@ -1114,6 +1216,13 @@ export function PersonaFormModal({
   }
 
   const captureVp = activeCapture?.viewport ?? { width: 1280, height: 800 }
+  const stepLabels = personaStepLabels(authMode)
+  const saveGate = personaSaveGate({
+    mode: authMode,
+    hasCapturedToken: Boolean(capturedToken.trim()),
+    hasStorageState: Boolean(importedStorageStateJson.trim() || importJsonText.trim()),
+    keepsExistingSession: keepingSameAuthKind,
+  })
   const isSecureRemoteUrl = currentRemoteUrl.startsWith('https://')
 
   return (
@@ -1421,8 +1530,55 @@ export function PersonaFormModal({
                 <Icon name="close" size={14} />
               </Button>
             </DialogHeader>
+            <nav aria-label="Test account setup steps" className="shrink-0 border-b border-line bg-panel px-4 py-2" data-slot="persona-stepper">
+              <ol className="m-0 flex list-none items-center gap-1.5 p-0">
+                {stepLabels.map((label, index) => {
+                  const stepNumber = (index + 1) as PersonaStep
+                  const isCurrent = stepNumber === step
+                  const isDone = stepNumber < step
+                  return (
+                    <li key={label} className="flex min-w-0 items-center gap-1.5">
+                      {index > 0 && <span aria-hidden="true" className={cn('h-px w-6 flex-none', isDone || isCurrent ? 'bg-accent-line' : 'bg-line-2')} />}
+                      <button
+                        type="button"
+                        aria-current={isCurrent ? 'step' : undefined}
+                        disabled={!isDone || personaAction.pending}
+                        data-state={isCurrent ? 'current' : isDone ? 'complete' : 'upcoming'}
+                        className={cn(
+                          'inline-flex h-7 min-w-0 items-center gap-1.5 whitespace-nowrap rounded-full border-0 bg-transparent px-1.5 text-[12px] font-medium shadow-none active:scale-100 disabled:cursor-default disabled:opacity-100',
+                          isCurrent ? 'text-fg' : isDone ? 'cursor-pointer text-fg-muted hover:bg-hover hover:text-fg' : 'text-fg-subtle',
+                        )}
+                        onClick={() => goToStep(stepNumber)}
+                      >
+                        <span
+                          aria-hidden="true"
+                          className={cn(
+                            'inline-grid size-[18px] flex-none place-items-center rounded-full border text-[10.5px] font-semibold tabular-nums',
+                            isCurrent
+                              ? 'border-accent bg-accent text-accent-fg'
+                              : isDone
+                                ? 'border-accent-line bg-accent-soft text-accent'
+                                : 'border-line-2 bg-panel text-fg-subtle',
+                          )}
+                        >
+                          {isDone ? <Icon name="check" size={10} /> : stepNumber}
+                        </span>
+                        <span className="truncate">{label}</span>
+                      </button>
+                    </li>
+                  )
+                })}
+              </ol>
+            </nav>
 
-            <DialogBody className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden p-4">
+            <DialogBody className="flex h-[min(440px,calc(100vh-min(12vh,96px)-32px-150px))] min-h-0 flex-col overflow-y-auto overflow-x-hidden p-4">
+              {step === 1 && (
+                <div
+                  key="step-1"
+                  data-slot="persona-step-panel"
+                  data-step="1"
+                  className={cn(STEP_PANEL_MOTION, stepDirection > 0 ? 'starting:translate-x-2' : 'starting:-translate-x-2')}
+                >
               <div className="grid gap-1.5">
                 <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)_minmax(0,1fr)]">
                   <label className="grid min-w-0 gap-1.5 text-[12px] font-medium text-fg-muted">
@@ -1472,78 +1628,86 @@ export function PersonaFormModal({
                 </small>
               </div>
 
-              {/* Universal 3-Mode Auth Selector */}
-              <div className="grid gap-2" role="radiogroup" aria-label="Authentication mode">
-                <span className="text-[12px] font-medium text-fg-muted">Authentication method</span>
-                <div className="grid grid-cols-1 items-stretch gap-2.5 sm:grid-cols-3">
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={authMode === 'browser_session'}
-                    onClick={() => {
-                      setAuthMode('browser_session')
-                      setCaptureError('')
-                    }}
-                    className={cn(
-                      'flex h-auto w-full min-w-0 cursor-pointer flex-col items-start justify-start gap-1.5 whitespace-normal rounded-[9px] border px-3 py-2.5 text-left font-normal shadow-none transition-colors',
-                      authMode === 'browser_session'
-                        ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
-                        : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
-                    )}
-                  >
-                    <div className="flex w-full flex-wrap items-center justify-between gap-1.5">
-                      <span className="text-[12.5px] font-semibold leading-[17px] text-fg">Browser Session</span>
-                      <Badge variant="accent" className="h-[18px] px-1.5 text-[10.5px]">Recommended</Badge>
-                    </div>
-                    <span className="text-[11.5px] leading-[16px] text-fg-muted">
-                      Works with SSO, Passkeys, MFA, CAPTCHA, Clerk, Auth0, Supabase &amp; auto-refreshes.
-                    </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={authMode === 'header_cookie'}
-                    onClick={() => {
-                      void cancelActiveCaptureSession()
-                      setAuthMode('header_cookie')
-                    }}
-                    className={cn(
-                      'flex h-auto w-full min-w-0 cursor-pointer flex-col items-start justify-start gap-1.5 whitespace-normal rounded-[9px] border px-3 py-2.5 text-left font-normal shadow-none transition-colors',
-                      authMode === 'header_cookie'
-                        ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
-                        : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
-                    )}
-                  >
-                    <span className="text-[12.5px] font-semibold leading-[17px] text-fg">Header / Cookie / cURL</span>
-                    <span className="text-[11.5px] leading-[16px] text-fg-muted">
-                      Paste Bearer token, Cookie, custom header, or DevTools Copy as cURL.
-                    </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={authMode === 'automated_login'}
-                    onClick={() => {
-                      void cancelActiveCaptureSession()
-                      setAuthMode('automated_login')
-                    }}
-                    className={cn(
-                      'flex h-auto w-full min-w-0 cursor-pointer flex-col items-start justify-start gap-1.5 whitespace-normal rounded-[9px] border px-3 py-2.5 text-left font-normal shadow-none transition-colors',
-                      authMode === 'automated_login'
-                        ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
-                        : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
-                    )}
-                  >
-                    <span className="text-[12.5px] font-semibold leading-[17px] text-fg">Automated Login (CI / Staging)</span>
-                    <span className="text-[11.5px] leading-[16px] text-fg-muted">
-                      Email + password form/JSON sign-in for non-MFA local labs &amp; staging CI.
-                    </span>
-                  </button>
                 </div>
+              )}
+              {step === 2 && (
+                <div
+                  key="step-2"
+                  data-slot="persona-step-panel"
+                  data-step="2"
+                  className={cn(STEP_PANEL_MOTION, stepDirection > 0 ? 'starting:translate-x-2' : 'starting:-translate-x-2')}
+                >
+              <div
+                className="grid gap-2"
+                role="radiogroup"
+                aria-label="Authentication mode"
+                onKeyDown={event => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    goToStep(3)
+                    return
+                  }
+                  const delta = event.key === 'ArrowDown' || event.key === 'ArrowRight' ? 1 : event.key === 'ArrowUp' || event.key === 'ArrowLeft' ? -1 : 0
+                  if (!delta) return
+                  event.preventDefault()
+                  const index = AUTH_MODES.indexOf(authMode)
+                  selectAuthMode(AUTH_MODES[(index + delta + AUTH_MODES.length) % AUTH_MODES.length]!)
+                  requestAnimationFrame(() => methodRadioRef.current?.focus())
+                }}
+              >
+                <span className="text-[12px] font-medium text-fg-muted">How should Kovo sign in as this account?</span>
+                {AUTH_METHOD_OPTIONS.map(option => {
+                  const checked = authMode === option.mode
+                  return (
+                    <button
+                      key={option.mode}
+                      ref={checked ? methodRadioRef : undefined}
+                      type="button"
+                      role="radio"
+                      aria-checked={checked}
+                      tabIndex={checked ? 0 : -1}
+                      data-slot="auth-method-row"
+                      onClick={() => selectAuthMode(option.mode)}
+                      onDoubleClick={() => goToStep(3)}
+                      className={cn(
+                        'flex h-auto min-h-[56px] w-full min-w-0 cursor-pointer items-center gap-3 whitespace-normal rounded-[9px] border px-3 py-2 text-left font-normal shadow-none transition-colors active:scale-100',
+                        checked
+                          ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                          : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
+                      )}
+                    >
+                      <span
+                        aria-hidden="true"
+                        className={cn(
+                          'inline-grid size-4 flex-none place-items-center rounded-full border',
+                          checked ? 'border-accent bg-accent' : 'border-line-strong bg-panel',
+                        )}
+                      >
+                        <span className={cn('size-1.5 rounded-full', checked ? 'bg-panel' : 'bg-transparent')} />
+                      </span>
+                      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                        <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+                          <span className="text-[12.5px] font-semibold leading-[17px] text-fg">{option.label}</span>
+                          {option.badge && <Badge variant="accent" className="h-[18px] px-1.5 text-[10.5px]">{option.badge}</Badge>}
+                        </span>
+                        <span className="text-[11.5px] leading-[16px] text-fg-muted">{option.desc}</span>
+                      </span>
+                    </button>
+                  )
+                })}
+                <small className="text-[11.5px] font-normal text-fg-subtle">
+                  {editingPersona ? 'Changing the method replaces the saved sign-in on save.' : 'Kovo remembers your choice for the next test account. Press Enter to continue.'}
+                </small>
               </div>
-
+                </div>
+              )}
+              {step === 3 && (
+                <div
+                  key="step-3"
+                  data-slot="persona-step-panel"
+                  data-step="3"
+                  className={cn(STEP_PANEL_MOTION, stepDirection > 0 ? 'starting:translate-x-2' : 'starting:-translate-x-2')}
+                >
               {/* Mode 1: Universal Browser Session (Embedded Live-Login Browser + storageState.json Fallback) */}
               {authMode === 'browser_session' && (() => {
                 const reviewVerifyOrigin = verifyOrigin.trim() || capturedSummary?.verifyOrigin || capturedSummary?.targetOrigin || ''
@@ -1614,6 +1778,13 @@ export function PersonaFormModal({
                       </span>
                     )}
                   </div>
+
+                  {!saveGate.allowed && (
+                    <p className="m-0 flex items-start gap-1.5 text-[11.5px] leading-4 text-fg-muted" data-slot="capture-required">
+                      <Icon name="lock" size={12} className="mt-0.5 flex-none text-fg-subtle" />
+                      <span>Saving unlocks after you sign in with the browser and capture the session (or stage a storageState.json import).</span>
+                    </p>
+                  )}
 
                   {capturedSummary && reviewPillText && (
                     <div
@@ -1985,6 +2156,8 @@ export function PersonaFormModal({
                   </label>
                 </DisclosureContent>
               </Disclosure>
+                </div>
+              )}
             </DialogBody>
 
             <DialogFooter className="shrink-0 flex-wrap items-center justify-between gap-2.5 px-4 py-2.5">
@@ -1999,28 +2172,56 @@ export function PersonaFormModal({
                   {personaAction.error}
                 </p>
               )}
-              <span className="min-w-0 text-[12px] text-fg-subtle">
-                Credentials stay encrypted on your machine and are never sent to AI models.
+              <span
+                id="persona-save-gate"
+                className={cn('min-w-0 flex-1 truncate text-[12px]', step === 3 && !saveGate.allowed ? 'text-warn-text' : 'text-fg-subtle')}
+                data-slot="persona-footer-note"
+                title={step === 3 && !saveGate.allowed ? saveGate.reason : undefined}
+              >
+                {step === 3 && !saveGate.allowed
+                  ? saveGate.reason
+                  : 'Credentials stay encrypted on your machine and are never sent to AI models.'}
               </span>
               <div className="flex shrink-0 items-center gap-2">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  disabled={personaAction.pending}
-                  onClick={() => {
-                    void cancelActiveCaptureSession()
-                    onClose()
-                  }}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="submit"
-                  variant="default"
-                  disabled={personaAction.pending}
-                >
-                  {personaAction.pending ? 'Saving…' : editingPersona ? 'Save changes' : submitLabel}
-                </Button>
+                {step === 1 ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    disabled={personaAction.pending}
+                    onClick={() => {
+                      void cancelActiveCaptureSession()
+                      onClose()
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={personaAction.pending}
+                    onClick={() => goToStep(stepPersonaFlow(step, -1))}
+                  >
+                    <Icon name="arrowL" size={13} />
+                    Back
+                  </Button>
+                )}
+                {step < 3 ? (
+                  <Button key="continue" type="submit" variant="default" disabled={personaAction.pending}>
+                    Continue
+                    <Icon name="arrowR" size={13} />
+                  </Button>
+                ) : (
+                  <Button
+                    key="save"
+                    type="submit"
+                    variant="default"
+                    disabled={personaAction.pending || !saveGate.allowed}
+                    aria-describedby={!saveGate.allowed ? 'persona-save-gate' : undefined}
+                  >
+                    {personaAction.pending ? 'Saving…' : editingPersona ? 'Save changes' : submitLabel}
+                  </Button>
+                )}
               </div>
             </DialogFooter>
           </form>

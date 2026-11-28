@@ -101,7 +101,8 @@ function HeaderSeedSummary({ seeds }: { seeds: readonly string[] }) {
     >
       <span className="min-w-0 truncate font-mono text-[12px]">{safeHost(seeds[0]!)}</span>
       {seeds.length > 1 && (
-        <Badge variant="neutral" className="bg-sunk tabular-nums">+{formatCount(seeds.length - 1)}</Badge>
+        // One text node: "+" and the count as separate nodes read back as "+\n29".
+        <Badge variant="neutral" className="bg-sunk tabular-nums">{`+${formatCount(seeds.length - 1)}`}</Badge>
       )}
     </span>
   )

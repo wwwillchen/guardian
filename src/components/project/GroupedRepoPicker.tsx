@@ -29,6 +29,16 @@ export interface GroupedRepoPickerProps {
   variant?: 'compact' | 'detailed'
   searchPlaceholder?: string
   emptyMessage?: string
+  /**
+   * `sheet`: the picker fills a flex column (Repo Discovery sheet). The search
+   * toolbar stays pinned above one scroll region and org headers stick to its top,
+   * so there is never a nested double scrollbar.
+   */
+  layout?: 'inline' | 'sheet'
+  /** Extra control rendered at the end of the search toolbar (e.g. the installation pill). */
+  toolbarAccessory?: React.ReactNode
+  /** Panel rendered under the toolbar row, inside the pinned region. */
+  toolbarPanel?: React.ReactNode
 }
 
 const repoRowVariants = cva(
@@ -138,6 +148,9 @@ export function GroupedRepoPicker({
   variant = 'compact',
   searchPlaceholder,
   emptyMessage = 'No repositories found.',
+  layout = 'inline',
+  toolbarAccessory,
+  toolbarPanel,
 }: GroupedRepoPickerProps) {
   const [manualExpanded, setManualExpanded] = useState<Record<string, boolean>>({})
   const [searchToggled, setSearchToggled] = useState<{ needle: string; collapsed: Record<string, boolean> }>({
@@ -157,6 +170,7 @@ export function GroupedRepoPicker({
   const showToolbar = variant === 'detailed' ? repos.length > 0 : repos.length > 1
   const remainingCap = Math.max(0, maxSelectable - selectedRepos.length)
   const isDetailed = variant === 'detailed'
+  const isSheet = layout === 'sheet'
 
   function isGroupExpanded(group: RepoOwnerGroup, index: number, selectedInGroup: number): boolean {
     if (isSearching) {
@@ -226,67 +240,78 @@ export function GroupedRepoPicker({
 
   if (repos.length === 0) {
     return (
-      <div className={cn('text-[12px] text-fg-subtle', isDetailed ? 'p-4' : 'px-3 py-3.5')}>
-        {emptyMessage}
+      <div className={cn(isSheet && 'flex min-h-0 flex-1 flex-col')}>
+        {isSheet && toolbarPanel}
+        <div className={cn('text-[12px] text-fg-subtle', isDetailed ? 'p-4' : 'px-3 py-3.5')}>
+          {emptyMessage}
+        </div>
       </div>
     )
   }
 
   return (
-    <div className="flex flex-col bg-panel">
+    <div className={cn('flex flex-col bg-panel', isSheet && 'min-h-0 flex-1')}>
       {showToolbar && (
-        <div
-          className={cn(
-            'flex flex-wrap items-center gap-1.5 border-b border-line bg-panel transition-colors duration-[var(--d1)] focus-within:border-b-accent-line',
-            isDetailed ? 'min-h-10 py-[5px] pl-4 pr-3' : 'min-h-9 py-1 pl-3 pr-2',
-          )}
-        >
-          <div className="flex min-w-[120px] flex-1 items-center gap-[7px]">
-            <Icon name="search" size={13} className="flex-none text-fg-subtle" />
-            <input
-              type="search"
-              className="h-[26px] w-full min-w-0 flex-1 truncate rounded-none border-0 bg-transparent p-0 text-[12.5px] leading-5 text-fg shadow-none outline-none placeholder:text-fg-subtle focus:shadow-none focus:outline-none [&::-webkit-search-cancel-button]:appearance-none [&::-webkit-search-decoration]:appearance-none"
-              value={search}
-              onChange={e => onSearchChange(e.target.value)}
-              placeholder={
-                searchPlaceholder ??
-                (isDetailed
-                  ? 'Filter repositories by name, branch, or description…'
-                  : 'Filter repositories…')
-              }
-              aria-label="Filter GitHub repositories"
-              disabled={disabled}
-            />
-          </div>
-          <div className="flex flex-none items-center gap-0.5 max-[480px]:basis-full max-[480px]:justify-end">
-            <button
-              type="button"
-              className="h-6 cursor-pointer rounded-[5px] border-0 bg-transparent px-[7px] text-[11.5px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent"
-              disabled={disabled || filteredRepos.length === 0}
-              onClick={handleSelectAllVisible}
-            >
-              {isDetailed
-                ? `Select all${filteredRepos.length > maxSelectable ? ` (first ${maxSelectable})` : filteredRepos.length > 0 ? ` (${filteredRepos.length})` : ''}`
-                : 'Select all'}
-            </button>
-            {selectedRepos.length > 0 && (
+        <div className={cn(isSheet && 'z-20 flex-none')} data-slot="repo-picker-toolbar">
+          <div
+            className={cn(
+              'flex flex-wrap items-center gap-1.5 border-b border-line bg-panel transition-colors duration-[var(--d1)] focus-within:border-b-accent-line',
+              isDetailed ? 'min-h-10 py-[5px] pl-4 pr-3' : 'min-h-9 py-1 pl-3 pr-2',
+            )}
+          >
+            <div className="flex min-w-[120px] flex-1 items-center gap-[7px]">
+              <Icon name="search" size={13} className="flex-none text-fg-subtle" />
+              <input
+                type="search"
+                className="h-[26px] w-full min-w-0 flex-1 truncate rounded-none border-0 bg-transparent p-0 text-[12.5px] leading-5 text-fg shadow-none outline-none placeholder:text-fg-subtle focus:shadow-none focus:outline-none [&::-webkit-search-cancel-button]:appearance-none [&::-webkit-search-decoration]:appearance-none"
+                value={search}
+                onChange={e => onSearchChange(e.target.value)}
+                placeholder={
+                  searchPlaceholder ??
+                  (isDetailed
+                    ? 'Filter repositories by name, branch, or description…'
+                    : 'Filter repositories…')
+                }
+                aria-label="Filter GitHub repositories"
+                disabled={disabled}
+              />
+            </div>
+            <div className="flex flex-none items-center gap-0.5 max-[480px]:basis-full max-[480px]:justify-end">
               <button
                 type="button"
                 className="h-6 cursor-pointer rounded-[5px] border-0 bg-transparent px-[7px] text-[11.5px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent"
-                disabled={disabled}
-                onClick={() => onChangeSelectedRepos([])}
+                disabled={disabled || filteredRepos.length === 0}
+                onClick={handleSelectAllVisible}
               >
-                Clear
+                {isDetailed
+                  ? `Select all${filteredRepos.length > maxSelectable ? ` (first ${maxSelectable})` : filteredRepos.length > 0 ? ` (${filteredRepos.length})` : ''}`
+                  : 'Select all'}
               </button>
-            )}
+              {selectedRepos.length > 0 && (
+                <button
+                  type="button"
+                  className="h-6 cursor-pointer rounded-[5px] border-0 bg-transparent px-[7px] text-[11.5px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent"
+                  disabled={disabled}
+                  onClick={() => onChangeSelectedRepos([])}
+                >
+                  Clear
+                </button>
+              )}
+              {toolbarAccessory}
+            </div>
           </div>
+          {toolbarPanel}
         </div>
       )}
 
       <div
-        className={cn('overflow-y-auto bg-panel', isDetailed ? 'max-h-96' : 'max-h-[216px]')}
+        className={cn(
+          'overflow-y-auto bg-panel',
+          isSheet ? 'min-h-0 flex-1 overscroll-contain' : isDetailed ? 'max-h-96' : 'max-h-[216px]',
+        )}
         role="group"
         aria-label="Accessible GitHub repositories"
+        data-slot="repo-picker-list"
       >
         {visibleGroups.length === 0 ? (
           <div className={cn('text-[12px] text-fg-subtle', isDetailed ? 'p-4' : 'px-3 py-3.5')}>
@@ -305,8 +330,10 @@ export function GroupedRepoPicker({
             return (
               <div key={group.owner} className="border-t border-line first:border-t-0">
                 <div
+                  data-slot="org-header"
                   className={cn(
                     'group/org flex flex-wrap items-center justify-between gap-x-1.5 bg-sunk transition-colors duration-[var(--d1)] hover:bg-[color-mix(in_srgb,var(--hover)_70%,var(--sunk))]',
+                    isSheet && 'sticky top-0 z-10 border-b border-line',
                     isDetailed ? 'min-h-[34px] pl-2.5 pr-3' : 'min-h-8 pl-1.5 pr-2',
                   )}
                 >
