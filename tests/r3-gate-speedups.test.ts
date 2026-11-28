@@ -196,6 +196,7 @@ function createMiniGateRepo(t: { after: (fn: () => void) => void }): {
     'tests/ui-polish-run-workbench.test.ts',
     'tests/ui-wave2a-palette-rail-micro.test.ts',
     'tests/ui-wave2b-create-inventory.test.ts',
+    'tests/ui-wave2c-resizer-graph.test.ts',
     'tests/v7-realism1-spa.test.ts',
     'tests/v8-seam1-golden-e2e.test.ts',
   ]

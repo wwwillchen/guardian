@@ -29,6 +29,7 @@ import {
   personaSecrets,
   resolveRunPersonas,
 } from '../src/server/persona-vault.ts'
+import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { retestReplaySpec, verifyReplaySpec } from '../src/server/replay-verifier.ts'
 import { exportReportMarkdown } from '../src/server/report-export.ts'
 import { ScopedBrowser } from '../src/server/scoped-browser.ts'
@@ -715,9 +716,23 @@ test('correlates CVE-2025-29927 hypothesis, confirms vulnerable fixture, rules o
   }
 
   const backend = new LinuxWorkerBackend()
+  const personas = new Map<string, ResolvedPersona>([
+    ['member', {
+      id: 'persona-member',
+      handle: 'member',
+      roleLabel: 'Member',
+      originAllowlist: [northstar],
+      authKind: 'cookie',
+      headerName: 'Cookie',
+      secret: 'session=member_lowpriv_token',
+      canaryMarkers: [],
+    }],
+  ])
+  const cveGrant = () => makeGrant({ tier: 2, personas })
   const cveReplaySpec: DeclarativeReplaySpec = {
     ...replayBaseFields(northstar),
-    kind: 'http_chain',
+    kind: 'auth_protocol_proof',
+    protocol: 'session',
     title: 'Next.js Middleware Auth Bypass (CVE-2025-29927)',
     cwe: 'CWE-287',
     severity: 'critical',
@@ -726,28 +741,23 @@ test('correlates CVE-2025-29927 hypothesis, confirms vulnerable fixture, rules o
       {
         id: 'control',
         role: 'control',
-        description: 'Request /admin without spoofed middleware header (expect 401/403/302).',
-        request: { origin: northstar, method: 'GET', pathAndQuery: '/admin', followRedirects: false },
+        description: 'Request /admin as low-privileged member without spoofed middleware header (expect 401/403/302).',
+        request: { origin: northstar, method: 'GET', pathAndQuery: '/admin', persona: 'member', followRedirects: false },
       },
       {
         id: 'probe',
         role: 'probe',
-        description: 'Request /admin with x-middleware-subrequest header.',
+        description: 'Request /admin as same member with x-middleware-subrequest header.',
         request: {
           origin: northstar,
           method: 'GET',
           pathAndQuery: '/admin',
+          persona: 'member',
           headers: { 'x-middleware-subrequest': 'middleware:middleware:middleware:middleware:middleware' },
           followRedirects: false,
         },
       },
     ],
-    assertionsJq: `{
-      controlPassed: (.steps.control.status == 401 or .steps.control.status == 403 or .steps.control.status == 302),
-      confirmed: (.steps.probe.status == 200 and (.steps.probe.body | contains("admin_panel_secret_view")) and ((.spaCatchall.allProbesMatchedCatchall // false) | not)),
-      observed: ("control=" + (.steps.control.status | tostring) + ", probe=" + (.steps.probe.status | tostring)),
-      expected: "401/403 on both control and probe"
-    }`,
   }
 
   // Case A: Vulnerable fixture -> confirmed
@@ -769,37 +779,32 @@ test('correlates CVE-2025-29927 hypothesis, confirms vulnerable fixture, rules o
       if (mode === 'vulnerable' && url.pathname === '/admin' && hasSubreq) {
         return { status: 200, headers: { 'content-type': 'application/json' }, body: '{"panel":"admin_panel_secret_view"}' }
       }
-      return { status: 401, headers: { 'content-type': 'application/json' }, body: '{"error":"unauthorized"}' }
+      return { status: 403, headers: { 'content-type': 'application/json' }, body: '{"error":"forbidden"}' }
     },
   })
 
-  const vulnRes = await verifyReplaySpec({ spec: cveReplaySpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  const vulnRes = await verifyReplaySpec({ spec: cveReplaySpec, broker, backend, grant: cveGrant(), signal: AbortSignal.timeout(20_000) })
   assert.equal(vulnRes.verdict, 'confirmed')
   assert.equal(vulnRes.outcome.controlPassed, true)
   assert.equal(vulnRes.outcome.confirmed, true)
 
   // One-click Verify Fix retest while still vulnerable -> 'reproduced'
-  const retestBefore = await retestReplaySpec({ spec: cveReplaySpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  const retestBefore = await retestReplaySpec({ spec: cveReplaySpec, broker, backend, grant: cveGrant(), envelopeTrust: 'host_persisted', signal: AbortSignal.timeout(20_000) })
   assert.equal(retestBefore.verdict, 'reproduced')
 
   // Case B: Edge-blocked / patched fixture -> dismissed (ruled out!) and retest -> 'fixed'
   mode = 'edge_blocked'
-  const blockedRes = await verifyReplaySpec({ spec: cveReplaySpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  const blockedRes = await verifyReplaySpec({ spec: cveReplaySpec, broker, backend, grant: cveGrant(), signal: AbortSignal.timeout(20_000) })
   assert.equal(blockedRes.verdict, 'dismissed')
   assert.equal(blockedRes.outcome.controlPassed, true)
   assert.equal(blockedRes.outcome.confirmed, false)
 
-  const retestAfter = await retestReplaySpec({ spec: cveReplaySpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  const retestAfter = await retestReplaySpec({ spec: cveReplaySpec, broker, backend, grant: cveGrant(), envelopeTrust: 'host_persisted', signal: AbortSignal.timeout(20_000) })
   assert.equal(retestAfter.verdict, 'fixed')
 
   // Case C: SPA 200 index.html catch-all -> MUST be inconclusive (never confirmed!)
   mode = 'spa_catchall'
-  const spaCatchallSpec: DeclarativeReplaySpec = {
-    ...cveReplaySpec,
-    // Even if an overly permissive jq tried to confirm on status 200, spaCatchallControl MUST force inconclusive!
-    assertionsJq: '{ controlPassed: true, confirmed: (.steps.probe.status == 200), observed: "200 html", expected: "404" }',
-  }
-  const spaRes = await verifyReplaySpec({ spec: spaCatchallSpec, broker, backend, grant: makeGrant(), signal: AbortSignal.timeout(20_000) })
+  const spaRes = await verifyReplaySpec({ spec: cveReplaySpec, broker, backend, grant: cveGrant(), signal: AbortSignal.timeout(20_000) })
   assert.equal(spaRes.verdict, 'inconclusive')
   assert.equal(spaRes.outcome.confirmed, false)
   assert.match(spaRes.outcome.reason ?? '', /SPA catch-all/)

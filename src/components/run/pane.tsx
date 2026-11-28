@@ -12,7 +12,7 @@
 //   }
 //
 // PaneHeader adds Back (when the stack has entries) and Close automatically.
-import { useEffect, useState } from 'react'
+import { createContext, useContext, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { readArtifact } from '../../actions.ts'
 import { useBoardUnread } from './coordinator.tsx'
@@ -29,18 +29,58 @@ import { cn, httpCodeClass, runIconBtn, RW } from './tw.ts'
 export interface InspectorProps { sel: Sel }
 export type InspectorMap = Record<string, (props: InspectorProps) => ReactNode>
 
+/** Inspector pane geometry shared by the shell (owner) and the pane header (controls). */
+export interface PaneLayout {
+  mode: 'overlay' | 'docked'
+  pinned: boolean
+  width: number
+  widened: boolean
+  togglePin: () => void
+  toggleWiden: () => void
+}
+const PaneLayoutContext = createContext<PaneLayout | null>(null)
+export function PaneLayoutProvider({ value, children }: { value: PaneLayout; children: ReactNode }) {
+  return <PaneLayoutContext.Provider value={value}>{children}</PaneLayoutContext.Provider>
+}
+/** The pane layout, or null outside the run shell (headers then render without pin / widen). */
+export const usePaneLayout = () => useContext(PaneLayoutContext)
+
 export function PaneHeader({ title, sub, extra }: { title: ReactNode; sub?: ReactNode; extra?: ReactNode }) {
   const nav = useNav()
   const unread = useBoardUnread()
+  const layout = usePaneLayout()
+  const docked = layout?.mode === 'docked'
   return <div className="flex h-11 flex-none items-center gap-1.5 border-b border-line pl-4 pr-2.5">
     {nav.stack.length > 0 && <button type="button" className={runIconBtn()} onClick={() => nav.back()} title="Back (Esc)" aria-label="Back"><Icon name="arrowL" /></button>}
     <span className="min-w-0 flex-1 truncate font-medium text-fg">
       {title}{sub != null && <> <span className="font-normal text-fg-subtle">{sub}</span></>}
     </span>
     {extra}
+    {layout && nav.sel != null && !nav.chat && <button
+      type="button"
+      className={cn(runIconBtn(), 'flex-none', layout.widened && 'bg-press text-fg hover:bg-press')}
+      onClick={layout.toggleWiden}
+      title={layout.widened ? 'Restore inspector width' : 'Widen for evidence'}
+      aria-label={layout.widened ? 'Restore inspector width' : 'Widen for evidence'}
+      aria-pressed={layout.widened}
+      data-testid="pane-widen-toggle"
+    >
+      <Icon name="fit" />
+    </button>}
+    {layout && <button
+      type="button"
+      className={cn(runIconBtn(), 'flex-none', docked && 'text-fg')}
+      onClick={layout.togglePin}
+      title={docked ? 'Float inspector as overlay' : 'Pin inspector to dock'}
+      aria-label={docked ? 'Float inspector as overlay' : 'Pin inspector to dock'}
+      aria-pressed={docked}
+      data-testid="pane-dock-toggle"
+    >
+      <Icon name="panelR" />
+    </button>}
     <button
       type="button"
-      className={cn(runIconBtn(), 'relative')}
+      className={cn(runIconBtn(), 'relative flex-none')}
       onClick={() => nav.openChat(null)}
       title={'Board (C)' + (unread ? ` · ${unread} new` : '')}
       aria-label="Board"
@@ -55,7 +95,7 @@ export function PaneHeader({ title, sub, extra }: { title: ReactNode; sub?: Reac
         </span>
       )}
     </button>
-    <button type="button" className={runIconBtn()} onClick={() => nav.close()} title="Close (Esc)" aria-label="Close"><Icon name="close" /></button>
+    <button type="button" className={cn(runIconBtn(), 'flex-none')} onClick={() => nav.close()} title="Close (Esc)" aria-label="Close"><Icon name="close" /></button>
   </div>
 }
 
