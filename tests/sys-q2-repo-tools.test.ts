@@ -341,8 +341,13 @@ test('Q2.4: repo/evidence tools & derive_evidence are parallel and execute concu
     { reposDir },
   )
   const modeOf = (name: string) => tools.find(tool => tool.name === name)?.executionMode
-  assert.equal(modeOf('read_repo_file'), 'parallel')
-  assert.equal(modeOf('search_repo'), 'parallel')
+  // Docker sandbox (derive_evidence) active: /repos is explored in-sandbox; host repo tools are retired.
+  assert.equal(modeOf('read_repo_file'), undefined)
+  assert.equal(modeOf('search_repo'), undefined)
+  // Host-only fallback (no sandbox) keeps the parallel host repo tools.
+  const hostTools = buildWorkerTools({ record_fact: async () => ({ id: 'f1' }) }, text => text, AbortSignal.timeout(5_000), 12 * 1024, () => {}, { reposDir })
+  assert.equal(hostTools.find(tool => tool.name === 'read_repo_file')?.executionMode, 'parallel')
+  assert.equal(hostTools.find(tool => tool.name === 'search_repo')?.executionMode, 'parallel')
   assert.equal(modeOf('read_evidence_slice'), 'parallel')
   assert.equal(modeOf('derive_evidence'), 'parallel')
   assert.equal(modeOf('request_http'), 'sequential')
