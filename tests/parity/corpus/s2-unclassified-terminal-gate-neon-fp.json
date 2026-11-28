@@ -7,8 +7,7 @@
   "covers": {
     "files": [
       "src/server/oracle-spec.ts",
-      "src/server/exec-verify.ts",
-      "src/vuln-taxonomy.ts"
+      "src/server/exec-verify.ts"
     ],
     "classes": [
       "webhook",
