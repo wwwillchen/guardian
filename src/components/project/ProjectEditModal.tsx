@@ -29,12 +29,19 @@ export function ProjectEditModal({ open, project, onClose, onSaved }: Props) {
   const action = useAction()
   const nameRef = useRef<HTMLInputElement | null>(null)
 
+  // Re-seed the form only when a new edit session starts (closed→open or a
+  // different project). Loader polls / SSE refreshes hand us fresh `project`
+  // references while the modal is open; they must never clobber user edits.
+  const openKey = open ? project.id : null
+  const openKeyRef = useRef<string | null>(null)
   useEffect(() => {
-    if (!open) return
+    if (openKeyRef.current === openKey) return
+    openKeyRef.current = openKey
+    if (openKey === null) return
     setName(project.name)
     setEnvironment(project.environment)
     setSeeds(mergeOrigins([], project.seeds))
-  }, [open, project.id, project.name, project.environment, project.seeds])
+  }, [openKey, project.name, project.environment, project.seeds])
 
   const parsedSeeds = seeds
   const invalidSeeds = summarizeOrigins(seeds).invalidTokens

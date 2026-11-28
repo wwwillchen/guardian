@@ -442,8 +442,16 @@ export function PersonaFormModal({
     void cancelActiveCaptureSession()
   }, [])
 
+  // Initialize the stepper only when a new form session starts (closed→open,
+  // a different project, or a different target persona). Background loader
+  // refreshes re-create `defaultProjectOrigins` / `existingPersonas` /
+  // `editingPersona` references while open and must not reset in-progress input.
+  const openKey = open ? `${project.id}:${editingPersona?.id ?? 'new'}` : null
+  const openKeyRef = useRef<string | null>(null)
   useEffect(() => {
-    if (!open) {
+    if (openKeyRef.current === openKey) return
+    openKeyRef.current = openKey
+    if (openKey === null) {
       void cancelActiveCaptureSession()
       return
     }
@@ -500,7 +508,7 @@ export function PersonaFormModal({
     setCurlPaste('')
     setCurlNote('')
     setAdvancedOpen(false)
-  }, [open, project.id, defaultProjectOrigins, existingPersonas, editingPersona])
+  }, [openKey, defaultProjectOrigins, existingPersonas, editingPersona])
 
   // Stream live CDP JPEG frames onto the embedded <canvas> whenever a capture session is active.
   useEffect(() => {
