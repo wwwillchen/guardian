@@ -715,6 +715,11 @@ fetch(${JSON.stringify(`${idpOrigin}/token`)}, { method: 'POST', credentials: 'i
   const dialog = page.getByRole('dialog')
   await dialog.waitFor({ state: 'visible', timeout: 10_000 })
 
+  // Advance the 3-step persona stepper (Account -> Method -> Capture) to reach the browser capture controls.
+  await dialog.getByRole('button', { name: /Continue/ }).click()
+  await dialog.getByRole('radiogroup', { name: 'Authentication mode' }).waitFor({ state: 'visible', timeout: 5_000 })
+  await dialog.getByRole('button', { name: /Continue/ }).click()
+
   // 1. Verify Starting host selector is visible next to Sign in with browser and defaults to appOrigin (first in defaultScope)
   const startHostSelect = dialog.locator('select[name="startingHost"]')
   await startHostSelect.waitFor({ state: 'visible', timeout: 5_000 })

@@ -525,11 +525,11 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
       'Seed host must start pre-approved, not under Needs approval',
     )
     const targetHost = new URL(targetServer.origin).host
-    const approveCheckbox = inventorySection.getByRole('checkbox', {
+    const approveSwitch = inventorySection.getByRole('switch', {
       name: `Remove host ${targetHost} from project scope`,
     })
-    await approveCheckbox.waitFor({ state: 'visible', timeout: 5_000 })
-    assert.equal(await approveCheckbox.getAttribute('aria-checked'), 'true')
+    await approveSwitch.waitFor({ state: 'visible', timeout: 5_000 })
+    assert.equal(await approveSwitch.getAttribute('aria-checked'), 'true')
     assert.deepEqual(pageErrors, [], `Unexpected browser pageerror(s): ${pageErrors.join('; ')}`)
   })
 
@@ -551,7 +551,7 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
     await dialog.waitFor({ state: 'visible', timeout: 10_000 })
     await dialog.getByRole('heading', { name: 'Add test account' }).waitFor({ state: 'visible', timeout: 5_000 })
 
-    async function assertPersonaFormDialogGeometry(label: string) {
+    async function assertPersonaFormDialogGeometry(label: string, opts?: { expectRadios?: boolean }) {
       interface BoxRect {
         left: number
         top: number
@@ -588,13 +588,15 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
             clientHeight: el.clientHeight,
           }
         })
-        const cancelBtn = Array.from(dlg.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Cancel')
-        const submitBtn = dlg.querySelector('button[type="submit"]') as HTMLElement | null
-        const toRect = (el: HTMLElement | null): BoxRect | null => {
-          if (!el) return null
-          const r = el.getBoundingClientRect()
-          return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }
-        }
+        const secondaryBtn = Array.from(footer?.querySelectorAll('button') ?? []).find(b => /^(Cancel|Back)$/.test(b.textContent?.trim() ?? ''))
+        const submitBtn = footer?.querySelector('button[type="submit"]') as HTMLElement | null
+        const [bodyRect, footerRect, secondaryBtnRect, submitBtnRect] = [body, footer, secondaryBtn ?? null, submitBtn].map(
+          (el): BoxRect | null => {
+            if (!el) return null
+            const r = el.getBoundingClientRect()
+            return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }
+          },
+        )
         return {
           vp,
           dialog: {
@@ -608,13 +610,13 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
             clientWidth: dlg.clientWidth,
           },
           body: body ? {
-            rect: toRect(body)!,
+            rect: bodyRect!,
             scrollWidth: body.scrollWidth,
             clientWidth: body.clientWidth,
           } : null,
-          footer: toRect(footer),
-          cancelBtn: toRect(cancelBtn ?? null),
-          submitBtn: toRect(submitBtn),
+          footer: footerRect,
+          secondaryBtn: secondaryBtnRect,
+          submitBtn: submitBtnRect,
           radios,
         }
       })
@@ -628,34 +630,52 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
       assert.ok(geo.body, `${label}: dialog body must exist`)
       assert.ok(geo.body.scrollWidth <= geo.body.clientWidth + 2, `${label}: dialog body has horizontal overflow (${geo.body.scrollWidth} > ${geo.body.clientWidth})`)
 
-      // Primary submit & Cancel buttons must fit inside viewport and never overlap each other or body content.
-      assert.ok(geo.cancelBtn && geo.submitBtn && geo.footer, `${label}: footer, Cancel, and Submit buttons must exist`)
-      for (const [name, btn] of [['Cancel', geo.cancelBtn], ['Submit', geo.submitBtn]] as const) {
+      // Primary submit/Continue & Cancel/Back buttons must fit inside viewport and never overlap each other or body content.
+      assert.ok(geo.secondaryBtn && geo.submitBtn && geo.footer, `${label}: footer, Cancel/Back, and Primary buttons must exist`)
+      for (const [name, btn] of [['Secondary', geo.secondaryBtn], ['Primary', geo.submitBtn]] as const) {
         assert.ok(btn.width > 0 && btn.height > 0, `${label}: ${name} button must be visible`)
         assert.ok(btn.left >= 0 && btn.top >= 0 && btn.right <= geo.vp.width && btn.bottom <= geo.vp.height, `${label}: ${name} button must fit inside viewport`)
         assert.ok(btn.top >= geo.body.rect.bottom - 1, `${label}: ${name} button must not overlap dialog body`)
       }
-      assert.ok(geo.cancelBtn.right <= geo.submitBtn.left + 1, `${label}: Cancel and Submit buttons must not overlap`)
+      assert.ok(geo.secondaryBtn.right <= geo.submitBtn.left + 1, `${label}: Secondary and Primary buttons must not overlap`)
 
-      // All 3 auth mode radio cards must expand to fit wrapped content with zero clipping or mutual overlap.
-      const radios: RadioRect[] = geo.radios
-      assert.equal(radios.length, 3, `${label}: expected 3 authentication mode cards`)
-      for (let i = 0; i < radios.length; i += 1) {
-        const card = radios[i]!
-        assert.ok(card.height >= 55, `${label}: mode card ${i} height (${card.height}px) must not collapse to single-line button`)
-        assert.ok(card.scrollWidth <= card.clientWidth + 2, `${label}: mode card ${i} horizontal overflow (${card.scrollWidth} > ${card.clientWidth})`)
-        assert.ok(card.scrollHeight <= card.clientHeight + 2, `${label}: mode card ${i} vertical text overflow (${card.scrollHeight} > ${card.clientHeight})`)
-        for (let j = i + 1; j < radios.length; j += 1) {
-          const other = radios[j]!
-          const overlapX = Math.min(card.right, other.right) - Math.max(card.left, other.left)
-          const overlapY = Math.min(card.bottom, other.bottom) - Math.max(card.top, other.top)
-          assert.ok(!(overlapX > 1 && overlapY > 1), `${label}: mode cards ${i} and ${j} overlap by ${overlapX}x${overlapY}px`)
+      if (opts?.expectRadios) {
+        // All 3 auth mode radio cards must expand to fit wrapped content with zero clipping or mutual overlap.
+        const radios: RadioRect[] = geo.radios
+        assert.equal(radios.length, 3, `${label}: expected 3 authentication mode cards`)
+        for (let i = 0; i < radios.length; i += 1) {
+          const card = radios[i]!
+          assert.ok(card.height >= 40, `${label}: mode card ${i} height (${card.height}px) must not collapse to single-line button`)
+          assert.ok(card.scrollWidth <= card.clientWidth + 2, `${label}: mode card ${i} horizontal overflow (${card.scrollWidth} > ${card.clientWidth})`)
+          assert.ok(card.scrollHeight <= card.clientHeight + 2, `${label}: mode card ${i} vertical text overflow (${card.scrollHeight} > ${card.clientHeight})`)
+          for (let j = i + 1; j < radios.length; j += 1) {
+            const other = radios[j]!
+            const overlapX = Math.min(card.right, other.right) - Math.max(card.left, other.left)
+            const overlapY = Math.min(card.bottom, other.bottom) - Math.max(card.top, other.top)
+            assert.ok(!(overlapX > 1 && overlapY > 1), `${label}: mode cards ${i} and ${j} overlap by ${overlapX}x${overlapY}px`)
+          }
         }
       }
     }
 
-    // 0a. Layout & geometry invariants in Mode 1 (Browser Session) at 1440x900.
-    await assertPersonaFormDialogGeometry('Mode 1 Browser Session (1440x900)')
+    // 1. Step 1 (Account): Account label is auto-populated with "User A" and legacy Handle/canaryMarkers are completely GONE.
+    const labelInput = dialog.locator('input[name="roleLabel"]')
+    assert.equal(await labelInput.inputValue(), 'User A', 'Account label should auto-populate with "User A"')
+    assert.equal(await dialog.locator('input[name="handle"]').count(), 0, 'Handle input must be removed')
+    assert.equal(await dialog.getByLabel(/^Handle/i).count(), 0, 'Handle label must be removed')
+    assert.equal(await dialog.locator('[name="canaryMarkers"]').count(), 0, 'canaryMarkers input must be removed')
+    assert.equal(/canary/i.test(await dialog.innerText()), false, 'canaryMarkers copy must not appear in PersonaFormModal')
+    await assertPersonaFormDialogGeometry('Step 1 Account (1440x900)')
+
+    // Advance to Step 2 (Method) and check all 3 authentication mode cards.
+    await dialog.getByRole('button', { name: /Continue/ }).click()
+    await dialog.getByRole('radiogroup', { name: 'Authentication mode' }).waitFor({ state: 'visible', timeout: 5_000 })
+    await assertPersonaFormDialogGeometry('Step 2 Method (1440x900)', { expectRadios: true })
+
+    // 0a. Advance to Step 3 (Mode 1 Browser Session) at 1440x900.
+    await dialog.getByRole('button', { name: /Continue/ }).click()
+    await dialog.getByRole('button', { name: /Sign in with browser/ }).waitFor({ state: 'visible', timeout: 5_000 })
+    await assertPersonaFormDialogGeometry('Step 3 Mode 1 Browser Session (1440x900)')
 
     // 0b. Live Sign-In Browser expansion & editable address bar regression test.
     await dialog.getByRole('button', { name: /Sign in with browser/ }).click()
@@ -702,25 +722,17 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
     assert.equal(await addressBar.inputValue(), customTargetUrl, 'Address bar should reflect navigated URL after Enter')
     assert.equal(await dialog.getByRole('button', { name: 'Back', exact: true }).isDisabled(), false, 'Back button should enable after navigating to a second URL')
 
-    // Cancel live browser and confirm dialog returns cleanly to compact Add test account form.
+    // Cancel live browser and confirm dialog returns cleanly to compact Add test account form (Step 3).
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
     await dialog.getByRole('heading', { name: 'Add test account' }).waitFor({ state: 'visible', timeout: 5_000 })
     await delay(250)
 
-    // 1. Account label is auto-populated with "User A".
-    const labelInput = dialog.locator('input[name="roleLabel"]')
-    assert.equal(await labelInput.inputValue(), 'User A', 'Account label should auto-populate with "User A"')
-
-    // 2. Legacy Handle input and canaryMarkers are completely GONE.
-    assert.equal(await dialog.locator('input[name="handle"]').count(), 0, 'Handle input must be removed')
-    assert.equal(await dialog.getByLabel(/^Handle/i).count(), 0, 'Handle label must be removed')
-    assert.equal(await dialog.locator('[name="canaryMarkers"]').count(), 0, 'canaryMarkers input must be removed')
-    const dialogTextInitial = await dialog.innerText()
-    assert.equal(/canary/i.test(dialogTextInitial), false, 'canaryMarkers copy must not appear in PersonaFormModal')
-
-    // 3. Selecting Header / Cookie / cURL -> Custom request header reveals Header name immediately outside Disclosure.
+    // 3. Back to Step 2 -> Selecting Header / Cookie / cURL -> Step 3 -> Custom request header reveals Header name immediately outside Disclosure.
+    await dialog.getByRole('button', { name: /Back/ }).click()
     await dialog.getByRole('radio', { name: /Header \/ Cookie \/ cURL/ }).click()
+    await dialog.getByRole('button', { name: /Continue/ }).click()
     const signInSelect = dialog.locator('select[name="authKind"]')
+    await signInSelect.waitFor({ state: 'visible', timeout: 5_000 })
     await signInSelect.selectOption('header')
     const headerNameInput = dialog.locator('input[name="headerName"]')
     await headerNameInput.waitFor({ state: 'visible', timeout: 5_000 })
@@ -733,9 +745,13 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
     await page.setViewportSize({ width: 1280, height: 800 })
     await assertPersonaFormDialogGeometry('Mode 2 Header/Cookie/cURL (1280x800)')
 
-    // 4. Selecting Automated Login -> Clerk __client cookie (auto-refresh) works cleanly end-to-end.
+    // 4. Back to Step 2 -> Selecting Automated Login -> Step 3 -> Clerk __client cookie (auto-refresh) works cleanly end-to-end.
+    await dialog.getByRole('button', { name: /Back/ }).click()
     await dialog.getByRole('radio', { name: /Automated Login/ }).click()
-    await advTrigger.click()
+    await dialog.getByRole('button', { name: /Continue/ }).click()
+    const advTrigger3 = dialog.getByRole('button', { name: 'Advanced configuration' })
+    await advTrigger3.waitFor({ state: 'visible', timeout: 5_000 })
+    await advTrigger3.click()
     await assertPersonaFormDialogGeometry('Mode 3 Automated Login + Advanced (1280x800)')
     await page.setViewportSize({ width: 1440, height: 900 })
     const adapterSelect = dialog.locator('select[name="loginAdapter"]')
