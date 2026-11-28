@@ -1908,6 +1908,10 @@ export function provider(
 }
 
 let rrCounter = 0
+/** E2-A: per-session (per `providerPool` instance) sticky affinity: one round-robin tick + last-successful (warm) profile. */
+export type PoolAffinityState = { readonly tick: number; pinnedId: string | null }
+/** E2-A: longest `Retry-After` worth waiting on the warm profile instead of a cold-prefill failover. */
+const MAX_WARM_RETRY_AFTER_MS = 8_000
 
 function roleRank(profile: ResolvedModelProfile, preferredRole?: RoleAffinity): number {
   if (!preferredRole || preferredRole === 'any') return 0
@@ -1921,10 +1925,13 @@ function compareProfiles(a: ResolvedModelProfile, b: ResolvedModelProfile, prefe
   return roleRank(a, preferredRole) - roleRank(b, preferredRole) || b.priority - a.priority
 }
 
+/** Healthy, context-fitting profiles in (roleRank, priority) order. Equal tiers rotate by `affinity.tick` (else a process-wide
+ *  counter); a pool's warm pinned profile is moved first so a session never bounces back to a recovered higher tier. */
 export function orderProfiles(
   profiles: readonly ResolvedModelProfile[],
   estimatedTokens: number,
   preferredRole?: RoleAffinity,
+  affinity?: PoolAffinityState,
 ): ResolvedModelProfile[] {
   const now = Date.now()
   const sorted = [...profiles].sort((a, b) => compareProfiles(a, b, preferredRole))
@@ -1935,26 +1942,19 @@ export function orderProfiles(
     ? healthy
     : [...pool].sort((a, b) => (a.cooldownUntil ?? 0) - (b.cooldownUntil ?? 0)).slice(0, 1)
 
-  // Round-robin within equal (roleRank, priority) groups.
-  const tick = rrCounter++
+  // Round-robin within equal (roleRank, priority) groups; pools pass a per-session tick (balance across sessions, not turns).
+  const tick = affinity?.tick ?? rrCounter++
   const out: ResolvedModelProfile[] = []
   for (let i = 0; i < base.length;) {
     let j = i + 1
-    while (
-      j < base.length &&
-      roleRank(base[j], preferredRole) === roleRank(base[i], preferredRole) &&
-      base[j].priority === base[i].priority
-    ) j++
+    while (j < base.length && compareProfiles(base[j], base[i], preferredRole) === 0) j++
     const group = base.slice(i, j)
-    if (group.length > 1) {
-      const offset = tick % group.length
-      for (let k = 0; k < group.length; k++) out.push(group[(k + offset) % group.length])
-    } else {
-      out.push(group[0])
-    }
+    for (let k = 0; k < group.length; k++) out.push(group[(k + tick) % group.length])
     i = j
   }
-  return out
+  // E2-A: the session's warm (last-successful) profile stays first while healthy and fitting, even above a recovered tier.
+  const pinned = affinity?.pinnedId ? out.findIndex(p => p.id === affinity.pinnedId) : -1
+  return pinned > 0 ? [out[pinned], ...out.filter((_, k) => k !== pinned)] : out
 }
 
 type PoolHealthOverride = { healthState: 'closed' | 'open' | 'half_open'; cooldownUntil: number | null }
@@ -2015,8 +2015,7 @@ export function providerPool(
 ) {
   if (!profiles.length) throw new Error('No enabled workspace model profiles are configured.')
   const sorted = [...profiles].sort((a, b) => compareProfiles(a, b, options.roleAffinity))
-  const now = Date.now()
-  const primary = sorted.find(p => !(p.healthState === 'open' && p.cooldownUntil !== null && p.cooldownUntil > now)) ?? sorted[0]
+  const primary = sorted.find(p => !(p.healthState === 'open' && p.cooldownUntil !== null && p.cooldownUntil > Date.now())) ?? sorted[0]
   const callCounter = { count: 0, maxCalls: options.maxCalls ?? defaultMaxCalls }
   const poolKeySecrets: readonly NamedSecret[] = profiles.map(p => ({ value: p.key, placeholder: '[redacted]' }))
   const poolOptions: ProviderOptions = {
@@ -2036,6 +2035,7 @@ export function providerPool(
     ? Math.max(0, Math.floor(options.transportRetryBaseMs))
     : defaultTransportRetryBaseMs
   const poolHealthOverrides = new Map<string, PoolHealthOverride>()
+  const affinity: PoolAffinityState = { tick: rrCounter++, pinnedId: null }
   const recordPoolAttemptFailure = (candidate: ResolvedModelProfile, attemptState: { recorded: boolean } | undefined, willRetryOrFailover: boolean) =>
     recordPoolAttemptFailureHelper(emitTelemetry, candidate, attemptState, willRetryOrFailover)
   const reportPoolCandidateFailure = (candidate: ResolvedModelProfile, typed: ProviderFailureError) =>
@@ -2052,7 +2052,7 @@ export function providerPool(
       const effectivePool = poolHealthOverrides.size
         ? sorted.map(p => { const ov = poolHealthOverrides.get(p.id); return ov ? { ...p, ...ov } : p })
         : sorted
-      const ordered = orderProfiles(effectivePool, estimatedTokens, options.roleAffinity)
+      const ordered = orderProfiles(effectivePool, estimatedTokens, options.roleAffinity, affinity)
 
       // Execute failover strictly inside the safe window (before yielding the first non-error event).
       const iter = (async function* () {
@@ -2069,6 +2069,15 @@ export function providerPool(
         const maxTransportRetries = options.maxTransportRetries !== undefined
           ? Math.max(0, Math.floor(options.maxTransportRetries))
           : (ordered.length === 1 ? defaultMaxTransportRetries : 1)
+        // Same-provider retry plan: last candidate keeps the bounded legacy retry; E2-A adds ONE short-wait retry of a transient 429
+        // on the session's warm (pinned) profile before a cold failover would bust its KV-cache prefix. `null` = fail over / give up.
+        const planRetryMs = (typed: ProviderFailureError, idx: number, attempt: number): number | null => {
+          const transport = { retryable: typed.retryable, hard: typed.hard, transientAttempts, maxTransportRetries }
+          const warmRetry = attempt === 0 && ordered[idx].id === affinity.pinnedId && typed.kind === 'rate_limited'
+            && (typed.retryAfterMs ?? 0) <= MAX_WARM_RETRY_AFTER_MS && shouldRetryProviderTransport({ ...transport, isLastCandidate: true })
+          if (!warmRetry && !shouldRetryProviderTransport({ ...transport, isLastCandidate: idx === ordered.length - 1 })) return null
+          return computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt: attempt + 1, baseMs: retryBaseMs })
+        }
 
         for (let idx = 0; idx < ordered.length; idx++) {
           const candidate = ordered[idx]
@@ -2112,10 +2121,8 @@ export function providerPool(
                     lastError = typed
                     if (callBox) callBox.lastFailure = typed
                     failedOver = true
-                    if (shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })) {
-                      transientAttempts++; attempt++; retrySame = true
-                      retryWaitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
-                    }
+                    const plannedWaitMs = planRetryMs(typed, idx, attempt)
+                    if (plannedWaitMs !== null) { transientAttempts++; attempt++; retrySame = true; retryWaitMs = plannedWaitMs }
                     recordPoolAttemptFailure(candidate, attemptTelemetryState, retrySame || idx + 1 < ordered.length)
                     break
                   }
@@ -2137,15 +2144,11 @@ export function providerPool(
                   reportPoolCandidateFailure(candidate, typed)
                   lastError = typed
                   if (callBox) callBox.lastFailure = typed
-                  const willRetrySame = shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })
-                  recordPoolAttemptFailure(candidate, attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
-                  if (willRetrySame) {
-                    transientAttempts++; attempt++
-                    const waitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
-                    if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
-                    continue
-                  }
-                  break
+                  const waitMs = planRetryMs(typed, idx, attempt)
+                  recordPoolAttemptFailure(candidate, attemptTelemetryState, waitMs !== null || idx + 1 < ordered.length)
+                  if (waitMs === null) break
+                  transientAttempts++; attempt++; if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
+                  continue
                 }
               }
               if (res.stopReason === 'error') {
@@ -2159,6 +2162,7 @@ export function providerPool(
                 poolHealthOverrides.set(candidate.id, { healthState: 'closed', cooldownUntil: null })
                 options.onProfileSuccess?.(candidate.id)
               }
+              if (res.stopReason !== 'error') affinity.pinnedId = candidate.id // E2-A: pin the now-warm profile for this session.
               return res
             } catch (error) {
               if (emitted) {
@@ -2177,15 +2181,11 @@ export function providerPool(
               reportPoolCandidateFailure(candidate, typed)
               lastError = typed
               if (callBox) callBox.lastFailure = typed
-              const willRetrySame = shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })
-              recordPoolAttemptFailure(candidate, attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
-              if (willRetrySame) {
-                transientAttempts++; attempt++
-                const waitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
-                if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
-                continue
-              }
-              break
+              const waitMs = planRetryMs(typed, idx, attempt)
+              recordPoolAttemptFailure(candidate, attemptTelemetryState, waitMs !== null || idx + 1 < ordered.length)
+              if (waitMs === null) break
+              transientAttempts++; attempt++; if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
+              continue
             }
           }
         }
