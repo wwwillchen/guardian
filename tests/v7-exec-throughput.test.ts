@@ -88,11 +88,11 @@ test('planMultiTrialExpansion subtracts existing queued trial-group steps from s
     { id: 'fresh-1', status: 'ready' as const, priority: 96, trialGroupId: null, dependsOnFactIds: [], dependsOnStepIds: [] },
   ]
   assert.deepEqual(planMultiTrialExpansion({ steps, concurrency: 3 }), [])
-  // With concurrency 5 (2 surplus slots), fresh-1 expands cleanly up to 3 trials.
+  // With concurrency 5 (2 surplus slots), fresh-1 expands by at most one upfront duplicate (E1 pacing).
   const expanded = planMultiTrialExpansion({ steps, concurrency: 5 })
   assert.equal(expanded.length, 1)
   assert.equal(expanded[0]?.step.id, 'fresh-1')
-  assert.equal(expanded[0]?.fanout, 3)
+  assert.equal(expanded[0]?.fanout, 2)
 })
 
 test('selectUncoveredHighRiskEndpoints filters risk >= 60, skips confirmed/covered routes, and ranks deterministically', () => {

@@ -622,7 +622,7 @@ export class Execution {
       markReplaySpecCoverage: (run, spec, c) => this.markReplaySpecCoverage(run, spec, c),
       waitForTier3Approval: (job, input, signal) => this.waitForTier3Approval(job, input, signal),
       postVerificationVerdict: (run, opts) => this.postVerificationVerdict(run, opts),
-      cancelSiblingTrialsOnConfirmation: (run, stepId, findingId) => this.cancelSiblingTrialsOnConfirmation(run, stepId, findingId),
+      cancelSiblingTrialsOnConfirmation: (run, stepId, findingId) => { this.cancelSiblingTrialsForStep(run, stepId, null, findingId) },
       scheduleVariantSweepForFinding: (run, row) => this.scheduleVariantSweepForFinding(run, row),
       recordSpecVerification: (runId, specId, feedback, summary) =>
         this.storage.recordReplaySpecVerification(runId, specId, feedback, summary),
@@ -689,7 +689,7 @@ export class Execution {
       ensureRunTrace: (run, profiles) => this.ensureRunTrace(run, profiles),
       capabilityVaultFor: runId => this.capabilityVaultFor(runId),
       executeInlineVerification: (...a) => this.executeInlineVerification(...a),
-      persistAgentScriptProof: (...a) => this.persistAgentScriptProof(...a),
+      persistAgentScriptProof: (...a) => this.persistAgentScriptProof(...a), cancelSiblingTrialsForStep: (...a) => this.cancelSiblingTrialsForStep(...a),
       alreadyConfirmedRefs: (...a) => this.alreadyConfirmedRefs(...a),
       detLeadSummaries: (...a) => this.detLeadSummaries(...a),
       assignmentBriefForStep: (...a) => this.assignmentBriefForStep(...a),
@@ -2439,13 +2439,16 @@ export class Execution {
         .map(f => f.id),
     )
 
-    // Trial budget = worker slots left after every distinct queued hypothesis. Duplicate trials may
-    // fill idle capacity; they must never displace a planned hypothesis (the v7 funnel defect).
+    // Trial budget = idle worker slots left after every running assignment AND every distinct queued
+    // hypothesis. Duplicate trials may fill idle capacity; they must never displace a planned
+    // hypothesis (the v7 funnel defect) nor burn tokens beside a busy fleet (E1 fan-out pacing).
+    const activeAssignments = [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length
     const expansions = planMultiTrialExpansion({
       // Tier-A leads are distinct hypotheses with their own Round-1 slot; duplicate trials would
       // displace other first-pass work. Only expand genuinely dispatchable steps (`R4-H-12`/`R4-H-13`).
       steps: steps.filter(step => !this.tierAStepIds.has(step.id) && dispatchableStepIds.has(step.id)),
       concurrency: conc,
+      activeAssignments,
       multiTrialEnabled: true,
       highSignalFactIds: highSignalFacts,
     })
@@ -2485,55 +2488,52 @@ export class Execution {
     })
   }
 
-  private cancelSiblingTrialsOnConfirmation(run: Run, winningStepId: string | null, findingId?: string) {
-    if (!winningStepId) return
-    const steps = this.storage.listChainSteps(run.id, run.goalRevision)
+  /**
+   * The ONE sibling-trial early stop, shared by declarative replay confirmation and worker
+   * `kovo_verify` full/terminal composite confirmation: cancels queued/running siblings in the
+   * winning step's trial group (never the winning step or the winner assignment) and aborts their
+   * live workers. Steps outside the trial group are untouched. Returns the canceled step ids.
+   */
+  private cancelSiblingTrialsForStep(run: Run, winningStepId: string | null, winnerAssignmentId?: string | null, findingId?: string): string[] {
+    const steps = winningStepId ? this.storage.listChainSteps(run.id, run.goalRevision) : []
     const winningStep = steps.find(s => s.id === winningStepId)
-    if (!winningStep?.trialGroupId) return
-
-    const siblings = steps.filter(s =>
-      s.trialGroupId === winningStep.trialGroupId &&
-      s.id !== winningStep.id &&
-      ['pending', 'ready', 'running'].includes(s.status),
-    )
-    if (!siblings.length) return
-
+    const siblings = winningStep?.trialGroupId
+      ? steps.filter(s =>
+        s.trialGroupId === winningStep.trialGroupId &&
+        s.id !== winningStep.id &&
+        !(winnerAssignmentId && s.assignedWorkerId === winnerAssignmentId) &&
+        ['pending', 'ready', 'running'].includes(s.status))
+      : []
     const canceledStepIds: string[] = []
     for (const sib of siblings) {
       this.storage.updateChainStep(sib.id, { status: 'canceled' })
       canceledStepIds.push(sib.id)
-      if (sib.assignedWorkerId) {
-        const activeSib = this.active.get(sib.assignedWorkerId)
-        if (activeSib) {
-          activeSib.controller.abort('trial.early_stopped')
+      if (!sib.assignedWorkerId) continue
+      this.active.get(sib.assignedWorkerId)?.controller.abort('trial.early_stopped')
+      try {
+        const w = this.storage.worker(sib.assignedWorkerId)
+        if (w.status === 'running' || w.status === 'queued' || w.status === 'waiting_approval') {
+          this.storage.updateWorker(w.id, {
+            status: 'canceled', lease: null, leaseExpiresAt: null, outcome: 'Canceled via multi-trial early stopping after sibling confirmation.',
+          })
         }
-        try {
-          const w = this.storage.worker(sib.assignedWorkerId)
-          if (w.status === 'running' || w.status === 'queued' || w.status === 'waiting_approval') {
-            this.storage.updateWorker(w.id, {
-              status: 'canceled',
-              lease: null,
-              leaseExpiresAt: null,
-              outcome: 'Canceled via multi-trial early stopping after sibling confirmation.',
-            })
-          }
-        } catch { /* ignore */ }
-      }
+      } catch { /* sibling worker row already gone */ }
     }
-
-    if (canceledStepIds.length > 0) {
+    if (canceledStepIds.length > 0 && winningStep) {
       this.storage.event(
         run.id,
         'trial.early_stopped',
-        `Early-stopped ${canceledStepIds.length} sibling trial(s) in group ${winningStep.trialGroupId} after Zero-LLM confirmation.`,
+        `Early-stopped ${canceledStepIds.length} sibling trial(s) in group ${winningStep.trialGroupId} after ${winnerAssignmentId ? 'composite proof' : 'Zero-LLM'} confirmation.`,
         {
           trialGroupId: winningStep.trialGroupId,
           winningStepId: winningStep.id,
+          winnerAssignmentId: winnerAssignmentId ?? null,
           findingId: findingId ?? null,
           canceledStepIds,
         },
       )
     }
+    return canceledStepIds
   }
 
   private ensureVariantSweepsForConfirmedFindings(run: Run) {

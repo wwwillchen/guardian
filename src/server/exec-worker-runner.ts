@@ -218,21 +218,14 @@ export function shouldPersistDeriveEvidenceArtifact(input: {
   explicitPersist?: boolean
 }): boolean {
   if (input.explicitPersist) return true
-  if (input.outputs && Object.values(input.outputs).some(v => typeof v === 'string' && v.trim().length > 0)) {
-    return true
-  }
+  if (input.outputs && Object.values(input.outputs).some(v => typeof v === 'string' && v.trim().length > 0)) return true
   const combinedBytes = Buffer.byteLength(input.stdout ?? '', 'utf8') + Buffer.byteLength(input.stderr ?? '', 'utf8')
   return combinedBytes > DERIVE_EVIDENCE_PERSIST_THRESHOLD_BYTES
 }
 
 export interface WorkerWallClockPlan {
-  remainingBudgetMs: number
-  effectiveSettlementMs: number
-  verifyGraceMs: number
-  expandedVerifyGraceMs: number
-  settlementStreamGraceMs: number
-  maxStallCreditMs: number
-  hardWallClockCeilingMs: number
+  remainingBudgetMs: number; effectiveSettlementMs: number; verifyGraceMs: number; expandedVerifyGraceMs: number
+  settlementStreamGraceMs: number; maxStallCreditMs: number; hardWallClockCeilingMs: number
 }
 
 export type WorkerVerifyGraceReason =
@@ -242,22 +235,13 @@ export type WorkerVerifyGraceReason =
   | 'settlement_stream'
 
 export interface WorkerVerifyGraceInput {
-  plan: WorkerWallClockPlan
-  sessionActiveElapsedMs: number
-  inFlightProofCall: boolean
-  enteredKovoVerify: boolean
-  kovoVerifyProgressed?: boolean
-  hasLiveSealedCapability: boolean
-  hasHopCheckpoint: boolean
-  inSettlementStream: boolean
+  plan: WorkerWallClockPlan; sessionActiveElapsedMs: number; inFlightProofCall: boolean; enteredKovoVerify: boolean
+  kovoVerifyProgressed?: boolean; hasLiveSealedCapability: boolean; hasHopCheckpoint: boolean; inSettlementStream: boolean
   stallAbort?: boolean
 }
 
 export interface WorkerVerifyGraceDecision {
-  graceMs: number
-  reason: WorkerVerifyGraceReason
-  verifyGraceApplied: boolean
-  hardCeilingRemainingMs: number
+  graceMs: number; reason: WorkerVerifyGraceReason; verifyGraceApplied: boolean; hardCeilingRemainingMs: number
 }
 
 /**
@@ -402,18 +386,32 @@ export interface ExecBrokeredTransportContext {
   sharedHandlers: ReturnType<ExecWorkerRunner['buildSharedSessionHandlers']>
   trackPersonaResources: (curRun: Run, res: BrokerExchangeResult, exchangeId: string) => void
   prepareBudgetedProbe: (origin: string, requestedMax: number | undefined, defaultMax: number) => {
-    curRun: Run
-    cleanOrigin: string
-    remainingReqs: number
-    cappedMax: number
+    curRun: Run; cleanOrigin: string; remainingReqs: number; cappedMax: number
   }
   stageJsonArtifact: (
-    curRun: Run,
-    kind: 'dns' | 'tls' | 'browser' | 'surface' | 'ws',
-    title: string,
-    filename: string, payload: unknown, signal: AbortSignal, secretsList?: readonly NamedSecret[],
+    curRun: Run, kind: 'dns' | 'tls' | 'browser' | 'surface' | 'ws', title: string, filename: string, payload: unknown, signal: AbortSignal, secretsList?: readonly NamedSecret[],
   ) => Promise<{ evidenceId: string; stagedPath: string | null }>
   onExchangeRecorded?: (ex: RecordedRequestExchange) => void
+}
+
+/**
+ * E1 sibling-trial early stop after a worker `kovo_verify` proof PERSISTED (call only after
+ * `commitPersistence` returned). Only a confirmed full/terminal finding stops the trial group; a
+ * held (`needs_review`) finding or an R2 partial composite that still needs continuation leaves
+ * every sibling running. Never throws into the tool result; failures are reported as events.
+ */
+export function cancelSiblingTrialsAfterProofPersistence(
+  host: Pick<ExecWorkerHost, 'cancelSiblingTrialsForStep' | 'safeEvent'> & { reconPlanner: Pick<ExecReconPlanner, 'isPartialCompositeConfirmation'> },
+  input: { run: Run; step: ChainStep; assignmentId: string; persisted: { findingId: string; findingStatus: string }; compositeHopCount: number },
+): string[] {
+  const { run, step, persisted } = input
+  try {
+    return persisted.findingStatus === 'confirmed' && !host.reconPlanner.isPartialCompositeConfirmation(run, step, input.compositeHopCount)
+      ? host.cancelSiblingTrialsForStep(run, step.id, input.assignmentId, persisted.findingId) : []
+  } catch (err) {
+    host.safeEvent(run.id, 'trial.early_stop_failed', `Sibling-trial early stop failed after proof persistence: ${err instanceof Error ? err.message : String(err)}`.slice(0, 400), { stepId: step.id, assignmentId: input.assignmentId, findingId: persisted.findingId })
+    return []
+  }
 }
 
 const UNSAFE_PROTO_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype'])
@@ -498,6 +496,8 @@ export interface ExecWorkerHost extends ExecCoreServices {
   capabilityVaultFor: (runId: string) => DerivedCapabilityVault
   executeInlineVerification: (...a: Parameters<ExecVerifier['executeInlineVerification']>) => ReturnType<ExecVerifier['executeInlineVerification']>
   persistAgentScriptProof: (...a: Parameters<ExecVerifier['persistAgentScriptProof']>) => ReturnType<ExecVerifier['persistAgentScriptProof']>
+  /** The one sibling-trial early stop: cancels active siblings of `stepId`'s trial group except the winner; returns canceled step ids. */
+  cancelSiblingTrialsForStep: (run: Run, stepId: string, winnerAssignmentId: string, findingId?: string) => string[]
   alreadyConfirmedRefs: (...a: Parameters<ExecReconPlanner['alreadyConfirmedRefs']>) => ReturnType<ExecReconPlanner['alreadyConfirmedRefs']>
   detLeadSummaries: (...a: Parameters<ExecReconPlanner['detLeadSummaries']>) => ReturnType<ExecReconPlanner['detLeadSummaries']>
   assignmentBriefForStep: (...a: Parameters<ExecReconPlanner['assignmentBriefForStep']>) => ReturnType<ExecReconPlanner['assignmentBriefForStep']>
@@ -2520,7 +2520,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               title: args.title?.trim() || proof.claimTitle || undefined, proof,
               secrets: [...currentSecrets(), ...vaultScrubDescriptors(runVault), ...vaultScrubDescriptors(verifyVault)],
             }), compositeReceipt?.confirmed ? compositeReceipt.hopCount : 0)
-            confirmedDuringAssignment = confirmedDuringAssignment || proofHandoff.confirmed
+            confirmedDuringAssignment = confirmedDuringAssignment || proofHandoff.confirmed; cancelSiblingTrialsAfterProofPersistence(this.host, { run: curRun, step, assignmentId: job.assignment.id, persisted, compositeHopCount: compositeReceipt?.confirmed ? compositeReceipt.hopCount : 0 })
             this.host.schedulePlanner(curRun.id)
             return checkpointOnlyGuard.summarizeOutcome({
               verdict: {

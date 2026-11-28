@@ -677,7 +677,7 @@ test('M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stop
   const highFacts = new Set(['fact-suspect-1'])
   assert.equal(computeMultiTrialFanout({ multiTrialEnabled: true, workerConcurrency: 4 }, { priority: 40, dependsOnFactIds: [], trialGroupId: null }, highFacts), 1)
   assert.equal(computeMultiTrialFanout({ multiTrialEnabled: true, workerConcurrency: 4 }, { priority: 88, dependsOnFactIds: [], trialGroupId: null }, highFacts), 2)
-  assert.equal(computeMultiTrialFanout({ multiTrialEnabled: true, workerConcurrency: 4 }, { priority: 96, dependsOnFactIds: [], trialGroupId: null }, highFacts), 3)
+  assert.equal(computeMultiTrialFanout({ multiTrialEnabled: true, workerConcurrency: 4 }, { priority: 96, dependsOnFactIds: [], trialGroupId: null }, highFacts), 2)
   assert.equal(computeMultiTrialFanout({ multiTrialEnabled: true, workerConcurrency: 2 }, { priority: 99, dependsOnFactIds: [], trialGroupId: null }, highFacts), 2)
   assert.equal(computeMultiTrialFanout({ multiTrialEnabled: true, workerConcurrency: 4 }, { priority: 60, dependsOnFactIds: ['fact-suspect-1'], trialGroupId: null }, highFacts), 2)
   assert.equal(computeMultiTrialFanout({ multiTrialEnabled: false, workerConcurrency: 4 }, { priority: 99, dependsOnFactIds: ['fact-suspect-1'], trialGroupId: null }, highFacts), 1)

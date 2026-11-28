@@ -54,7 +54,7 @@ type Internals = {
   advanceToVerification: (run: Run) => void
   runEngineInvestigation: (run: Run, opts?: LaneOptions) => Promise<void>
   startInvestigationStep: (run: Run, step: ChainStep, profiles: readonly unknown[]) => void
-  cancelSiblingTrialsOnConfirmation: (run: Run, winningStepId: string | null, findingId?: string) => void
+  cancelSiblingTrialsForStep: (run: Run, winningStepId: string | null, winnerAssignmentId?: string | null, findingId?: string) => string[]
   ensureRunTrace: (run: Run, profiles?: readonly unknown[]) => { dir: string; closeTrace: () => unknown } | null
   traceLifecycle: (runId: string, kind: 'lane_start' | 'lane_end' | 'checkpoint' | 'verdict' | 'abort', payload?: Record<string, unknown>) => void
   tracePlannerDecision: (runId: string, payload: Record<string, unknown>) => void
@@ -313,7 +313,7 @@ test('multi-trial fanout/early-stop machinery is untouched by the lane', async (
   const group = trials[0].trialGroupId
 
   // Early stop still cancels the sibling when the winner confirms.
-  internals(execution).cancelSiblingTrialsOnConfirmation(storage.run(runId), trials[0].id, 'finding-winner')
+  internals(execution).cancelSiblingTrialsForStep(storage.run(runId), trials[0].id, null, 'finding-winner')
   const finalSteps = storage.listChainSteps(runId, storage.run(runId).goalRevision)
   const losing = finalSteps.find(step => step.trialGroupId === group && step.id !== trials[0].id)
   assert.equal(losing?.status, 'canceled')

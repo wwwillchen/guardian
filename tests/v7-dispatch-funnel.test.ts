@@ -101,7 +101,7 @@ test('idle fleet still fans out: 1 hypothesis and 6 slots uses the trial budget'
   const steps = [planStep(1, { priority: 100 })]
   const expansions = planMultiTrialExpansion({ steps, concurrency: 6 })
   assert.equal(expansions.length, 1)
-  assert.equal(expansions[0].fanout, 3, 'priority-100 hypothesis keeps its 3-trial fanout')
+  assert.equal(expansions[0].fanout, 2, 'priority-100 hypothesis gets at most one upfront duplicate trial')
 })
 
 test('two hypotheses and six slots: fanout fills idle capacity but never exceeds it', () => {
@@ -110,7 +110,7 @@ test('two hypotheses and six slots: fanout fills idle capacity but never exceeds
   const trials = expansions.reduce((total, entry) => total + entry.fanout - 1, 0)
   assert.ok(expansions.length >= 1)
   assert.ok(trials <= multiTrialSurplusSlots(2, 6), `trials ${trials} must stay within the 4 surplus slots`)
-  assert.equal(expansions[0].fanout, 3)
+  assert.equal(expansions[0].fanout, 2)
 })
 
 test('disabled multi-trial and single-worker runs never expand', () => {

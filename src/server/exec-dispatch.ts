@@ -791,7 +791,7 @@ export function computeMultiTrialFanout(
   if (run.multiTrialEnabled === false) return 1
   const concurrencyCap = Math.max(1, run.workerConcurrency || defaultWorkerConcurrency)
   const linkedHighSignal = step.dependsOnFactIds.some(id => highSignalFactIds?.has(id))
-  if (step.priority >= 96) return Math.min(3, concurrencyCap)
+  // E1 pacing: at most ONE duplicate trial upfront; retries/continuations handle failures.
   if (step.priority >= 88 || linkedHighSignal) return Math.min(2, concurrencyCap)
   return 1
 }
@@ -1364,12 +1364,13 @@ export function reconcileUnavailableOriginSteps(
 
 /**
  * Worker slots a multi-trial fanout may spend without starving a distinct hypothesis: the fleet
- * minus the hypotheses already queued. With 6 slots and 19 planned steps this is 0, so each planned
- * hypothesis gets its own worker; with 1 planned step and 6 slots it is 5, so the intended
- * deterministic-trial fanout still happens.
+ * minus the hypotheses already queued and the assignments already running. With 6 slots and 19
+ * planned steps this is 0, so each planned hypothesis gets its own worker; with 1 planned step and
+ * 6 idle slots it is 5, so the intended deterministic-trial fanout still happens.
  */
-export function multiTrialSurplusSlots(distinctQueued: number, concurrency: number): number {
-  return Math.max(0, Math.max(1, Math.floor(concurrency)) - Math.max(0, Math.floor(distinctQueued)))
+export function multiTrialSurplusSlots(distinctQueued: number, concurrency: number, activeAssignments = 0): number {
+  const busy = Math.max(0, Math.floor(distinctQueued)) + Math.max(0, Math.floor(activeAssignments))
+  return Math.max(0, Math.max(1, Math.floor(concurrency)) - busy)
 }
 
 export interface MultiTrialExpansion<T> {
@@ -1381,7 +1382,8 @@ export interface MultiTrialExpansion<T> {
 /**
  * Choose which queued hypotheses fan out into duplicate trials this tick. Expansion is capped by
  * {@link multiTrialSurplusSlots} so duplicate trials can never occupy a slot a distinct planned
- * hypothesis could use. Order is the caller's (priority/seq) order, so the choice is deterministic.
+ * hypothesis could use. Running assignments count as occupied slots, so a busy fleet never spawns
+ * upfront duplicates. Order is the caller's (priority/seq) order, so the choice is deterministic.
  */
 export function planMultiTrialExpansion<T extends DispatchFunnelStep & {
   priority: number
@@ -1389,6 +1391,8 @@ export function planMultiTrialExpansion<T extends DispatchFunnelStep & {
 }>(input: {
   steps: readonly T[]
   concurrency: number
+  /** Assignments already holding a worker slot; duplicate trials only spend truly idle slots. */
+  activeAssignments?: number
   multiTrialEnabled?: boolean
   highSignalFactIds?: ReadonlySet<string>
 }): MultiTrialExpansion<T>[] {
@@ -1401,17 +1405,13 @@ export function planMultiTrialExpansion<T extends DispatchFunnelStep & {
   // accumulate across ticks beyond actual idle worker capacity.
   const queuedInTrialGroups = input.steps.filter(step =>
     (step.status === 'pending' || step.status === 'ready') && Boolean(step.trialGroupId)).length
-  let surplus = multiTrialSurplusSlots(queued.length + queuedInTrialGroups, concurrency)
+  let surplus = multiTrialSurplusSlots(queued.length + queuedInTrialGroups, concurrency, input.activeAssignments ?? 0)
   if (surplus <= 0) return []
   const expansions: MultiTrialExpansion<T>[] = []
   for (const step of queued) {
     const requested = computeMultiTrialFanout(
       { multiTrialEnabled: true, workerConcurrency: concurrency },
-      {
-        priority: step.priority,
-        dependsOnFactIds: [...(step.dependsOnFactIds ?? [])],
-        trialGroupId: step.trialGroupId ?? null,
-      },
+      { priority: step.priority, dependsOnFactIds: [...(step.dependsOnFactIds ?? [])], trialGroupId: step.trialGroupId ?? null },
       input.highSignalFactIds,
     )
     const fanout = Math.min(requested, surplus + 1)

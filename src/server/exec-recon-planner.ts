@@ -49,7 +49,7 @@ import {
 import {
   CapabilityLedger, DERIVED_CAPABILITY_HANDLE_RE, computeArtifactDigest, finalizeHopCheckpointBrief, formatDerivedCapabilityHandle,
   sanitizeCheckpointHandleRef, sanitizeCheckpointText, type AddCapabilityInput, type CapabilityKind, type CapabilitySurface,
-  type HopCheckpointBrief, type HopProofDraft, type HopWorkflowNotebook,
+  type CausalEdge, type HopCheckpointBrief, type HopProofDraft, type HopWorkflowNotebook,
   // R2 proof-carrying rotation handoff: parent-context resolution, repair budget & prompt context.
   collectParentHopCheckpointBriefs, isActiveProofDraft, parseDeclaredHopsFromText, parseHopCheckpointBriefJson,
   renderHopContinuationRepairContext, resolveContinuationParentContext, resolveHopContinuationBudget,
@@ -60,75 +60,24 @@ import { normalizeRouteTemplate } from './route-template.ts'
 import { buildWave1UncoveredOriginFallbackSteps, canonicalPlannerDedupeFamily, classifyRepoDirTier, resolveWave1MultiOriginFallback, selectBalancedRepoSourceCandidates } from './exec-recon-multiorigin.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
-  CHAIN_CONTINUATION_SKILL_PREFIX,
-  DEFAULT_MAX_ORIGIN_SHARE,
-  DET_LEAD_STEP_PRIORITY,
-  DRY_ROUND_LIMIT,
-  FrontierDispatcher,
-  FrontierWaveController,
-  MAX_CHAIN_CONTINUATIONS,
-  MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS,
-  MAX_RETRYABLE_STEP_RETRIES,
-  RunOrchestrationStateStore,
-  TIER_A_MAX_SEEDED_STEPS,
-  TIER_A_STEP_PRIORITY,
-  WHITEBOX_BLACKBOX_CAP_PRIORITY,
-  WHITEBOX_TIER_A_MAX_SEEDED_STEPS,
-  applyCrownJewelStepBudget,
-  buildBolaTestQueue,
-  classifyHostHeuristic,
-  collectAllPages,
-  compactChainTitle,
-  compactText,
-  computeDynamicStepBudget,
-  computeHostTiers,
-  confirmedCategoryFamily,
-  coordinatorSchedulerDecision,
-  detLeadCategory,
-  detLeadEvidenceGate,
-  detLeadSkills,
-  detLeadUnlocksReinvestigation,
-  detectQuarantinedOrigins,
-  dispatchableReadySteps,
-  emptyDispatchFunnel,
-  enforcePerOriginFairness,
-  evaluateDispatchStop,
-  hasAuthenticatedPersonaForOrigin,
-  isGenericWave1BoundaryChainStep,
-  extractContinuationDepth,
-  formatHopCheckpointForAssignment,
-  hardChainStepsCeiling,
-  hostTierOrder,
-  isDetLeadDispatchStep,
-  isLiveNon401HttpStatus,
-  isMultiHopChainStep,
-  isRetryableChainStepStatus,
-  nextPlannerDryRounds,
-  passOneCoverage,
-  permanentlyBlockedStepIds,
-  plannerResponseSchema,
-  plannerWaveDispatchCap,
-  prioritizeMountedSourceInitialSteps,
-  readChainHopsFromFacts,
-  reconcileUnavailableOriginSteps,
-  reinvestigationKey,
-  selectUncoveredHighRiskEndpoints,
-  shouldInvokeLlmPlanner,
-  stripJsonFences,
-  structuredCoverageKey,
-  structuredCoverageRouteMethodKey,
-  templatesMentionedInText,
-  threatModelResponseSchema,
-  type BolaTestQueueItem,
-  type DetectQuarantinedOriginsInput,
-  type DetectQuarantinedOriginsResult,
-  type DispatchFunnelCounts,
-  type DispatchStopReason,
-  type FrontierWaveControllerOptions,
-  type QuarantineObservedExchange,
-  type QuarantinedOriginRecord,
-  type ReinvestigationGuard,
-  type StructuredStepTarget,
+  CHAIN_CONTINUATION_SKILL_PREFIX, DEFAULT_MAX_ORIGIN_SHARE, DET_LEAD_STEP_PRIORITY, DRY_ROUND_LIMIT,
+  FrontierDispatcher, FrontierWaveController, MAX_CHAIN_CONTINUATIONS, MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS,
+  MAX_RETRYABLE_STEP_RETRIES, RunOrchestrationStateStore, TIER_A_MAX_SEEDED_STEPS, TIER_A_STEP_PRIORITY,
+  WHITEBOX_BLACKBOX_CAP_PRIORITY, WHITEBOX_TIER_A_MAX_SEEDED_STEPS, applyCrownJewelStepBudget,
+  buildBolaTestQueue, classifyHostHeuristic, collectAllPages, compactChainTitle, compactText,
+  computeDynamicStepBudget, computeHostTiers, confirmedCategoryFamily, coordinatorSchedulerDecision,
+  detLeadCategory, detLeadEvidenceGate, detLeadSkills, detLeadUnlocksReinvestigation, detectQuarantinedOrigins,
+  dispatchableReadySteps, emptyDispatchFunnel, enforcePerOriginFairness, evaluateDispatchStop,
+  hasAuthenticatedPersonaForOrigin, isGenericWave1BoundaryChainStep, extractContinuationDepth,
+  formatHopCheckpointForAssignment, hardChainStepsCeiling, hostTierOrder, isDetLeadDispatchStep,
+  isLiveNon401HttpStatus, isMultiHopChainStep, isRetryableChainStepStatus, nextPlannerDryRounds, passOneCoverage,
+  permanentlyBlockedStepIds, plannerResponseSchema, plannerWaveDispatchCap, prioritizeMountedSourceInitialSteps,
+  readChainHopsFromFacts, reconcileUnavailableOriginSteps, reinvestigationKey, selectUncoveredHighRiskEndpoints,
+  shouldInvokeLlmPlanner, stripJsonFences, structuredCoverageKey, structuredCoverageRouteMethodKey,
+  templatesMentionedInText, threatModelResponseSchema, type BolaTestQueueItem,
+  type DetectQuarantinedOriginsInput, type DetectQuarantinedOriginsResult, type DispatchFunnelCounts,
+  type DispatchStopReason, type FrontierWaveControllerOptions, type QuarantineObservedExchange,
+  type QuarantinedOriginRecord, type ReinvestigationGuard, type StructuredStepTarget,
 } from './exec-dispatch.ts'
 import {
   ExecServiceModule,
@@ -1604,6 +1553,36 @@ export const MAX_WORKSPACE_DIGEST_BYTES = 8 * 1024
 // sealed capability handles stay valid within that script (they are not reusable across separate scripts).
 export const HOP_CONTINUATION_DIRECTIVE =
   'Skip redundant discovery/recon but re-execute the full ordered hop chain from root to terminal in ONE verification script (sealed handles stay valid) using ctx.prove_composite.'
+
+/**
+ * Shared chain lineage of a host-verified ledger edge (E1). Walks the edge's preconditions back
+ * through their producing edges to the chain's root capability, so every hop of one chain reports
+ * the SAME stable `lineageKey` and a depth advancing one per verified hop (edges whose
+ * preconditions are all roots keep the legacy `preconditions + 1` depth). Bounded, cycle-safe.
+ */
+export function resolveCausalEdgeLineage(
+  ledger: Pick<CapabilityLedger, 'getIncomingEdges'>,
+  edge: Pick<CausalEdge, 'edgeId' | 'preconditionCapIds' | 'postconditionCapId'>,
+  maxWalk = 32,
+): { lineageKey: string; depth: number } {
+  const roots = new Set<string>()
+  const memo = new Map<string, number>()
+  const hopsAbove = (capId: string, path: ReadonlySet<string>): number => {
+    const cached = memo.get(capId)
+    if (cached !== undefined) return cached
+    const incoming = path.has(capId) || path.size >= maxWalk ? [] : ledger.getIncomingEdges(capId)
+    if (!incoming.length) roots.add(capId)
+    const next = new Set(path).add(capId)
+    const hops = incoming.length ? 1 + Math.max(...incoming.map(e => Math.max(0, ...e.preconditionCapIds.map(pre => hopsAbove(pre, next))))) : 0
+    memo.set(capId, hops)
+    return hops
+  }
+  const pres = edge.preconditionCapIds
+  const above = Math.max(0, ...pres.map(pre => hopsAbove(pre, new Set())))
+  const legacyDepth = Math.max(1, pres.length + 1)
+  const root = [...roots].sort()[0] ?? edge.postconditionCapId ?? edge.edgeId
+  return { lineageKey: `ledger:${root}`, depth: pres.length ? Math.max(legacyDepth, above + 2) : legacyDepth }
+}
 
 export function extractCheckpointCapIdFromStep(step: { skills?: readonly string[] }): string | null {
   for (const skill of step.skills ?? []) {
@@ -5577,6 +5556,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     return counts
   }
 
+  /** R2 parent-hypothesis context of a step (shared by hop continuation and sibling-trial early stop). */
+  private continuationParentContext(step: ChainStep, parentFacts: readonly Fact[], structuredHops: readonly ChainHop[], confirmedCompositeHopCount?: number, proofDraft?: HopProofDraft) {
+    return resolveContinuationParentContext({
+      parentBriefs: collectParentHopCheckpointBriefs(parentFacts, this.persistedStepCheckpoints.get(step.id)?.checkpointJson),
+      predictedHops: structuredHops.length ? structuredHops : parseDeclaredHopsFromText([step.hypothesis, ...parentFacts.flatMap(f => [f.summary, typeof f.data?.hypothesis === 'string' ? f.data.hypothesis : undefined])]),
+      ...(confirmedCompositeHopCount ? { confirmedCompositeHopCount } : {}), ...(proofDraft ? { proofDraft } : {}),
+    })
+  }
+
+  /**
+   * R2 partial-composite rule for a freshly persisted composite proof: true when a confirmed
+   * composite of `compositeHopCount` hops stops short of the step's declared/predicted chain and
+   * therefore still needs continuation (sibling trials must keep running). 0 hops is never partial.
+   */
+  isPartialCompositeConfirmation(run: Pick<Run, 'id'>, step: ChainStep, compositeHopCount: number): boolean {
+    if (!(compositeHopCount > 0)) return false
+    const byId = new Map(this.pageAll((offset, limit) => this.storage.listFacts(run.id, { includeTainted: false, limit, offset })).map(f => [f.id, f]))
+    const parentFacts = step.dependsOnFactIds.flatMap(id => byId.get(id) ?? [])
+    return this.continuationParentContext(step, parentFacts, readChainHopsFromFacts(parentFacts), compositeHopCount).partialComposite
+  }
+
   /**
    * Automatically enqueue ONE bounded Hop-Continuation `chain` step when a multi-hop worker exits
    * with `wall_clock_rotated`, has not yet confirmed a finding, and made concrete progress
@@ -5591,11 +5591,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const liveFactIds = new Set(liveFactById.keys())
     const parentFacts = step.dependsOnFactIds.flatMap(id => liveFactById.get(id) ?? [])
     const structuredHops = readChainHopsFromFacts(parentFacts)
-    const parentCtx = resolveContinuationParentContext({
-      parentBriefs: collectParentHopCheckpointBriefs(parentFacts, this.persistedStepCheckpoints.get(step.id)?.checkpointJson),
-      predictedHops: structuredHops.length ? structuredHops : parseDeclaredHopsFromText([step.hypothesis, ...parentFacts.flatMap(f => [f.summary, typeof f.data?.hypothesis === 'string' ? f.data.hypothesis : undefined])]),
-      ...(input.confirmedCompositeHopCount ? { confirmedCompositeHopCount: input.confirmedCompositeHopCount } : {}), ...(input.proofDraft ? { proofDraft: input.proofDraft } : {}),
-    })
+    const parentCtx = this.continuationParentContext(
+      step, parentFacts, structuredHops,
+      input.confirmedCompositeHopCount,
+      input.proofDraft,
+    )
     const allowNonChainSealedExit = input.trigger === 'sealed_handle_exit'
       && Boolean(input.allowNonChainWithSealedCap)
       && input.sealedCapHandles.length > 0
@@ -6511,7 +6511,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       newHopEvents.push({
         hopReceiptId: edge.hopReceiptId,
         branchKey: edge.postconditionCapId ?? edge.edgeId,
-        depth: Math.max(1, edge.preconditionCapIds.length + 1),
+        ...resolveCausalEdgeLineage(ledgerForProgress, edge),
         hostVerified: true,
         tenantScope: normalizedTenant,
         ...(edge.actorContext.roleLabel ? { roleLabel: edge.actorContext.roleLabel } : {}),
