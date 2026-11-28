@@ -1026,8 +1026,9 @@ describe('Playwright E2E — Deduped Queue, Scoped Approvals, Blast-Radius Previ
       { timeout: 10_000 },
     )
 
-    // Open header Approval leases popover and verify Prefix + HOST leases display & revoke in 1 click.
-    await page.locator('button[data-rl-btn]', { hasText: 'Leases' }).click()
+    // Open header Approval leases popover via More telemetry and verify Prefix + HOST leases display & revoke in 1 click.
+    await page.locator('button[data-rl-btn]', { hasText: 'More telemetry' }).click()
+    await page.getByTestId('more-telemetry').getByRole('button', { name: /active/i }).click()
     const leasesList = page.getByTestId('approval-leases-list')
     await leasesList.waitFor({ state: 'visible', timeout: 10_000 })
     const hostLeaseItem = leasesList.locator('[data-lease-scope="host_nondestructive"]')

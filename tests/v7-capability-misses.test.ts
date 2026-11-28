@@ -29,7 +29,7 @@ import type {
   EnginePersona,
 } from '../src/server/deterministic-engine.ts'
 import { declarativeReplaySpecSchema } from '../src/replay-spec.ts'
-import { baseFields } from '../src/server/deterministic-specs.ts'
+import { baseFields } from '../src/server/floor-heuristics.ts'
 
 const origin = 'http://127.0.0.1:4100'
 
@@ -299,7 +299,6 @@ describe('capability-misses: minted bearer headers', () => {
 
 import { wiredRecipeForSpecKind } from '../src/server/floor-recipes.ts'
 import { planFloorRecipe } from '../src/server/floor-recipe-engine.ts'
-import { synthSqlTime } from '../src/server/deterministic-specs.ts'
 
 describe('capability-misses: token-boundary selection', () => {
   test('a cookie-denied read outranks cookie-200 credential routes', () => {
@@ -415,9 +414,6 @@ describe('capability-misses: blind SQLi timing follow-up', () => {
       exchangeIds: [],
       durationMs: 1,
     } as never
-    const specs = synthSqlTime(hyp, result)
-    assert.equal(specs.length, 1)
-    assert.equal(specs[0]!.kind, 'sql_time_diff')
     assert.equal(wiredRecipeForSpecKind('sql_time_diff', 'sqli'), 'boolean_or_timing')
     const plan = planFloorRecipe({ hypothesis: hyp, probe: result, specKind: 'sql_time_diff', vulnClass: 'sqli', personas })
     assert.ok(plan)

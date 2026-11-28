@@ -143,10 +143,12 @@ EXCLUDE_SPECS=(
   # playwright-e2e: Real Playwright Chromium browser E2E suites
   "playwright-e2e|tests/e2e-ui-journeys.test.ts|launches real Playwright Chromium browser UI journeys (~27s)"
   "playwright-e2e|tests/ui-bucket-b1-state-settings.test.ts|launches real Playwright Chromium Desktop Bucket B PR B1 StatePanel/Settings assertions (~45s)"
+  "playwright-e2e|tests/ui-bucket-b2-telemetry-workers.test.ts|launches real Playwright Chromium Desktop Bucket B PR B2 Telemetry/Hero/Workers assertions (~55s)"
   "playwright-e2e|tests/ui-bucket-b3-findings-proof.test.ts|launches real Playwright Chromium Desktop Bucket B PR B3 Findings/Proof/Exchanges assertions (~60s)"
   "playwright-e2e|tests/ui-polish-foundation.test.ts|launches real Playwright Chromium Foundation/Settings Bucket A geometry/motion assertions (~55s)"
   "playwright-e2e|tests/ui-polish-projects.test.ts|launches real Playwright Chromium Projects/Modals Bucket A geometry/motion assertions (~25s)"
   "playwright-e2e|tests/ui-polish-run-workbench.test.ts|launches real Playwright Chromium Run Workbench Bucket A geometry/motion assertions (~80s)"
+  "playwright-e2e|tests/ui-wave2a-palette-rail-micro.test.ts|launches real Playwright Chromium Desktop Wave 2A Palette/Rail/Micro-interactions assertions (~45s)"
   "playwright-e2e|tests/v7-realism1-spa.test.ts|launches real Playwright Chromium ScopedBrowser (>60s)"
 
   # batch-boundary-slow: Batch-boundary / regression-floor tier (run by scripts/regression-floor.sh)

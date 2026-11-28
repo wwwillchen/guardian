@@ -1,13 +1,257 @@
 /**
- * Single-source field, route, role, and authorization heuristics for the deterministic floor.
+ * Single-source field, route, role, shared engine types, and authorization heuristics for the
+ * deterministic floor.
  *
- * Shared by `deterministic-engine.ts`, `deterministic-specs.ts`, and `floor-recipe-engine.ts` so
- * live recipe planning, legacy spec synthesis, and hypothesis enumeration never silently drift.
+ * Shared by `deterministic-engine.ts` and `floor-recipe-engine.ts` so live recipe planning and
+ * hypothesis enumeration never silently drift.
  *
  * All regular expressions here are static literals (zero dynamic `RegExp` construction).
  */
 import { randomBytes } from 'node:crypto'
 import type { RoleName } from './oracle-invariants.ts'
+import type { DifferentialProbeClass, SurfaceParamLocation } from './surface-engine.ts'
+
+// ---------------------------------------------------------------------------------------------
+// Shared deterministic-floor engine types & copy templates (consolidated from deleted deterministic-specs.ts)
+// ---------------------------------------------------------------------------------------------
+
+export interface EngineParam {
+  name: string
+  location: SurfaceParamLocation
+  isObjectId?: boolean
+  isCsrf?: boolean
+  /** Schema-declared type from an OpenAPI/route map (string, integer, number, boolean, array, object). */
+  declaredType?: string
+  /** Runtime value shape observed in the target's own responses (url, path, xml, jwt, uuid, ...). */
+  observedShape?: string
+}
+
+export interface EngineEndpoint {
+  id: string
+  origin: string
+  method: string
+  pathTemplate: string
+  params: EngineParam[]
+  riskScore?: number
+  sinkKinds?: string[]
+  source?: string
+}
+
+export type EngineIntent =
+  | 'authz' | 'sqli' | 'ssti' | 'command_injection' | 'xxe' | 'ssrf' | 'traversal' | 'redirect' | 'xss' | 'graphql'
+  | 'mass_assignment' | 'cache' | 'stored_xss' | 'csrf' | 'workflow' | 'race' | 'webhook' | 'auth_protocol' | 'secret_disclosure'
+
+export interface EngineHypothesis {
+  key: string
+  endpoint: EngineEndpoint
+  probeClass: DifferentialProbeClass
+  intent: EngineIntent
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  /** Probe/replay path. Object-level authz hypotheses keep a `{{id}}` placeholder. */
+  pathAndQuery: string
+  param?: EngineParam
+  location?: SurfaceParamLocation
+  ownerPersona?: string
+  otherPersona?: string
+  resourceIds?: string[]
+  jsonBody?: Record<string, unknown>
+  formBody?: Record<string, string>
+  xmlTemplate?: string
+  graphqlQuery?: string
+  baselineValue?: string
+  candidateFields?: string[]
+  candidateValues?: Record<string, string | boolean | number>
+  ssrfParams?: string[]
+  functionLevel?: boolean
+  idParamName?: string
+  triggerPath?: string
+  readPath?: string
+  workflowListPath?: string
+  workflowReadPath?: string
+  workflowTargetTemplate?: string
+  repeatTransition?: boolean
+  quantityField?: string
+  headers?: Record<string, string>
+  flowCreatePath?: string
+  priceTrust?: boolean
+  raceBurst?: boolean
+  session?: string
+  graphqlRoots?: string[]
+  graphqlSeedsByRoot?: Record<string, string[]>
+  stateField?: string
+  bodyField?: string
+  createReadTemplate?: string
+  secretScan?: boolean
+  viewerPersona?: string
+  csrfBind?: boolean
+  readbackPath?: string
+  readbackPersona?: string
+  functionState?: {
+    bindings: Array<{ field: string; value: string }>
+    reset?: Array<{ field: string; value: string }>
+    body?: Record<string, unknown>
+  }
+  authzRequiredRole?: 'viewer' | 'member' | 'admin' | 'owner'
+  reservedVictimId?: string
+  tokenFields?: string[]
+  identityClaims?: Record<string, string>
+  webhookBody?: Record<string, unknown>
+  webhookHeader?: string
+  risk: number
+  notes?: string[]
+}
+
+export type Severity = 'critical' | 'high' | 'medium' | 'low'
+
+export interface SynthesizedEngineSpec {
+  kind: string
+  /** Canonical class label used for attribution/dedupe (benchmark-compatible spelling). */
+  vulnClass: string
+  endpoint: string
+  spec: Record<string, unknown>
+  /** Runtime evidence collected for durable `pending_oob` correlation. */
+  evidence?: Record<string, unknown>
+}
+
+interface FloorClassCopyTemplate {
+  impact: string
+  remediation: string
+}
+
+const FLOOR_COPY_BY_CLASS: Readonly<Record<string, FloorClassCopyTemplate>> = {
+  bola: {
+    impact: 'An authenticated actor can read or alter resources belonging to another user or tenant.',
+    remediation: 'Enforce server-side object-level ownership and tenant authorization checks on every request naming a resource identifier.',
+  },
+  bfla: {
+    impact: 'A lower-privileged actor can invoke a privileged administrative or role-gated function.',
+    remediation: 'Enforce explicit server-side role and capability checks on every privileged endpoint rather than relying on client-side controls.',
+  },
+  sqli: {
+    impact: 'Untrusted input alters server-side database query structure or evaluation.',
+    remediation: 'Use parameterized queries or prepared statements and strict input validation; never concatenate untrusted input into queries.',
+  },
+  xxe: {
+    impact: 'The XML parser resolves attacker-supplied external entities, enabling server-side file reads or out-of-band network callbacks.',
+    remediation: 'Disable external entity resolution and DTD processing in the XML parser configuration.',
+  },
+  ssrf: {
+    impact: 'The server issues outbound network requests to attacker-controlled destinations, exposing internal services or metadata endpoints.',
+    remediation: 'Validate and allowlist outbound destination hosts and schemes; block private, loopback, and link-local IP ranges after DNS resolution.',
+  },
+  path_traversal: {
+    impact: 'Attacker-supplied path input escapes the intended server root directory, allowing arbitrary file reads.',
+    remediation: 'Canonicalize file paths server-side and verify the resolved path remains strictly inside the permitted base directory.',
+  },
+  open_redirect: {
+    impact: 'Unvalidated redirect targets send users to attacker-controlled external origins.',
+    remediation: 'Restrict redirect destinations to relative paths or an explicit allowlist of trusted origins.',
+  },
+  mass_assignment: {
+    impact: 'Over-posted request fields persist privileged or protected attributes that the caller is not permitted to set.',
+    remediation: 'Explicitly allowlist client-assignable fields and bind protected attributes server-side from trusted session context.',
+  },
+  csrf: {
+    impact: 'A cross-site request can trigger state-changing actions using the victim’s ambient session credentials without an anti-CSRF token.',
+    remediation: 'Require a validated per-session anti-CSRF token on state-changing routes and enforce SameSite cookie attributes.',
+  },
+  info_disclosure: {
+    impact: 'Sensitive credentials, secrets, or audit records are exposed in responses returned to unentitled callers.',
+    remediation: 'Remove credentials and internal secrets from response payloads and audit logs, and enforce server-side field filtering.',
+  },
+  xss: {
+    impact: 'Untrusted input is rendered as executable script markup in a victim’s browser context.',
+    remediation: 'Apply context-appropriate output encoding, sanitize rich HTML safely, and enforce a strict Content-Security-Policy.',
+  },
+  ssti: {
+    impact: 'Untrusted input is evaluated as server-side template expressions, enabling server-side code execution.',
+    remediation: 'Pass user input strictly as template data rather than template source, and use a sandboxed or logic-less template engine.',
+  },
+  cmdi: {
+    impact: 'Untrusted input injects shell metacharacters into server-side operating system commands, enabling arbitrary command execution.',
+    remediation: 'Execute commands with explicit argv arrays without invoking a shell, and strictly allowlist dynamic arguments.',
+  },
+  business_logic: {
+    impact: 'Application workflow or state-machine invariants can be bypassed or replayed out of sequence.',
+    remediation: 'Enforce state-transition and business-rule invariants atomically server-side before committing state changes.',
+  },
+  price_tampering: {
+    impact: 'Client-supplied pricing or amount parameters override server-side authoritative totals during checkout or payment processing.',
+    remediation: 'Compute prices, discounts, and totals strictly server-side from authoritative catalog records and ignore client-supplied amounts.',
+  },
+  race_double_spend: {
+    impact: 'Concurrent requests race a non-atomic balance or quota check, allowing double-spend or duplicate state transitions.',
+    remediation: 'Serialize balance and quota transitions using database transactions, row locks, unique constraints, or idempotency keys.',
+  },
+  jwt: {
+    impact: 'Forged or unsigned authentication tokens bypass signature verification and grant authenticated session access.',
+    remediation: 'Verify token signatures against an explicit algorithm allowlist and server-managed keys; reject unsigned (alg=none) and unverified tokens.',
+  },
+  webhook: {
+    impact: 'Unsigned or forged webhook deliveries are accepted and processed without valid cryptographic signature verification.',
+    remediation: 'Verify webhook HMAC signatures in constant time against the raw request body using a server-managed secret before processing events.',
+  },
+}
+
+const DEFAULT_FLOOR_COPY: FloorClassCopyTemplate = {
+  impact: 'A deterministic verification differential confirmed exploitable server-side behavior on the target endpoint.',
+  remediation: 'Validate untrusted input and enforce strict server-side security controls on the affected endpoint.',
+}
+
+const FLOOR_COPY_BY_CWE: Readonly<Record<number, string>> = {
+  639: 'bola', 284: 'bola', 566: 'bola',
+  285: 'bfla', 269: 'bfla', 862: 'bfla', 863: 'bfla',
+  89: 'sqli', 564: 'sqli', 943: 'sqli',
+  611: 'xxe', 918: 'ssrf',
+  22: 'path_traversal', 23: 'path_traversal', 73: 'path_traversal',
+  601: 'open_redirect', 915: 'mass_assignment', 352: 'csrf',
+  200: 'info_disclosure', 359: 'info_disclosure', 522: 'info_disclosure', 532: 'info_disclosure',
+  79: 'xss', 80: 'xss', 83: 'xss',
+  1336: 'ssti', 94: 'ssti', 78: 'cmdi', 77: 'cmdi',
+  840: 'business_logic', 841: 'business_logic', 1284: 'business_logic',
+  472: 'price_tampering', 362: 'race_double_spend', 367: 'race_double_spend',
+  347: 'jwt', 287: 'jwt', 345: 'webhook',
+}
+
+function floorCopyTemplateFor(cwe: string, category: string): FloorClassCopyTemplate {
+  const cweMatch = /^CWE-(\d+)$/i.exec(cwe.trim())
+  if (cweMatch) {
+    const key = FLOOR_COPY_BY_CWE[Number(cweMatch[1])]
+    if (key && FLOOR_COPY_BY_CLASS[key]) return FLOOR_COPY_BY_CLASS[key]!
+  }
+  const normCat = category.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (normCat === 'broken_access_control' || normCat === 'idor' || normCat === 'cross_tenant_read' || normCat === 'cross_tenant_write') return FLOOR_COPY_BY_CLASS.bola!
+  if (normCat === 'sensitive_data_exposure' || normCat === 'information_disclosure' || normCat === 'secret_disclosure') return FLOOR_COPY_BY_CLASS.info_disclosure!
+  if (normCat === 'xss_reflected' || normCat === 'xss_stored' || normCat === 'dom_xss') return FLOOR_COPY_BY_CLASS.xss!
+  if (normCat === 'workflow_bypass' || normCat === 'workflow_skip') return FLOOR_COPY_BY_CLASS.business_logic!
+  if (normCat === 'webhook_forgery') return FLOOR_COPY_BY_CLASS.webhook!
+  if (normCat === 'url_redirect') return FLOOR_COPY_BY_CLASS.open_redirect!
+  return FLOOR_COPY_BY_CLASS[normCat] ?? DEFAULT_FLOOR_COPY
+}
+
+export function baseFields(
+  origin: string,
+  title: string,
+  cwe: string,
+  category: string,
+  severity: Severity,
+  jq?: string,
+) {
+  const copy = floorCopyTemplateFor(cwe, category)
+  return {
+    version: 1 as const,
+    origin,
+    title: title.slice(0, 200),
+    category,
+    cwe,
+    severity,
+    severityRationale: 'Deterministic differential evidence was reproduced by the Zero-LLM verifier.',
+    impact: copy.impact,
+    remediation: copy.remediation,
+    recheckInstructions: 'Replay the control and probe requests and compare the responses.',
+    ...(jq !== undefined ? { assertionsJq: jq } : {}),
+  }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Route, action, and identity classification
@@ -138,13 +382,6 @@ export const BASELINE_SELECTOR_FIELD_RE =
   /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|created|updated)(?:$|[_-])/i
 export const BASELINE_STATE_FIELD_RE =
   /^(?:status|state|stage|phase|payment_state|fulfil?lment_state|lifecycle|visibility|priority|archived?|active)$/i
-/** Columns a privileged-function mutation grants (role/plan/scope style escalation). */
-export const PRIVILEGE_TARGET_FIELD_RE =
-  /^(?:role|role_name|user_role|account_role|account_type|membership|plan|tier|level|scope|is_admin|is_owner|is_staff|admin|privilege|privileges|permissions|permission_level)$/i
-/** Literal values that name an elevated entitlement (never a benign content value). */
-export const PRIVILEGE_LITERAL_RE =
-  /^(?:admin|administrator|owner|superuser|root|staff)$/i
-
 export const CONSERVED_BALANCE_FIELD_RE = /balance|available|remaining|stock|on_?hand|quantity|credits?|points?/i
 export const CONSERVED_ECHO_FIELD_RE = /transfer|debit|charge|amount|count|redeem|used|quantity|qty|reserved/i
 export const CONSERVED_AMOUNT_FIELD_RE = /^(?:item_?|line_?|requested_?|reserved_?|redeem_?)?(?:amount|value|quantity|qty|count|units|seats|credits|points|total|redeem)$/i
@@ -155,8 +392,6 @@ export const CONSERVED_AMOUNT_FIELD_RE = /^(?:item_?|line_?|requested_?|reserved
 
 export const SAFE_RESOURCE_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
 export const SAFE_FIELD_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/
-export const SAFE_PERSONA_HANDLE_RE = /^[a-z0-9_-]{1,32}$/
-export const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/
 
 export function isSafeResourceId(value: unknown): value is string {
   return typeof value === 'string' && SAFE_RESOURCE_ID_RE.test(value)
@@ -164,14 +399,6 @@ export function isSafeResourceId(value: unknown): value is string {
 
 export function isSafeFieldName(value: unknown): value is string {
   return typeof value === 'string' && SAFE_FIELD_NAME_RE.test(value)
-}
-
-export function isSafePersonaHandle(value: unknown): value is string {
-  return typeof value === 'string' && SAFE_PERSONA_HANDLE_RE.test(value)
-}
-
-export function isSafeIdentifier(value: unknown): value is string {
-  return typeof value === 'string' && SAFE_IDENTIFIER_RE.test(value)
 }
 
 export function fillResourceId(pathAndQuery: string, id: string): string {
@@ -285,40 +512,6 @@ export interface BaselineWrite {
 }
 
 /**
- * Restore a non-privileged baseline for a privileged-function entitlement grant so the probe's
- * value produces a fresh delta rather than an idempotent no-op.
- */
-export function privilegeBaselineFor(bodyTemplate: unknown, requiredRole?: string | null): BaselineWrite | null {
-  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
-  const record = bodyTemplate as Record<string, unknown>
-  const entry = Object.entries(record).find(([field, value]) =>
-    PRIVILEGE_TARGET_FIELD_RE.test(field) && typeof value === 'string' && PRIVILEGE_LITERAL_RE.test(value))
-  if (!entry) return null
-  const [field, value] = entry
-  if (typeof value !== 'string') return null
-  const demotion = requiredRole === 'admin' ? 'member' : 'viewer'
-  if (value.toLowerCase() === demotion) return null
-  return { field, baselineValue: demotion, probeValue: value, baselineBody: { ...record, [field]: demotion } }
-}
-
-/**
- * Escalate an existing privilege field on a privileged-function body to `requiredRole`.
- * Only a field the body already carries is escalated (never an invented field name).
- */
-export function escalatePrivilegeBody(
-  bodyTemplate: unknown,
-  requiredRole?: string | null,
-): Record<string, unknown> | null {
-  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate) || !requiredRole) return null
-  const record = bodyTemplate as Record<string, unknown>
-  const field = Object.entries(record).find(([name, value]) =>
-    PRIVILEGE_TARGET_FIELD_RE.test(name) &&
-    (typeof value === 'string' || value === null || typeof value === 'number' || typeof value === 'boolean'))
-  if (!field) return null
-  return String(field[1]).toLowerCase() === requiredRole ? null : { ...record, [field[0]]: requiredRole }
-}
-
-/**
  * Choose a fresh baseline value for one mutable scalar field of a probe body so the probe write
  * creates a genuine non-idempotent delta against the pre-mutation readback.
  */
@@ -350,41 +543,3 @@ export function pickBaselineWrite(bodyTemplate: unknown): BaselineWrite | null {
   return { field, baselineValue, probeValue: `kovo-probe-${nonce}`, baselineBody: { ...record, [field]: baselineValue } }
 }
 
-export interface AuthzMatrixRow {
-  resourceId?: unknown
-  actor?: unknown
-  status?: unknown
-  bodyBytes?: unknown
-  bodySha256?: unknown
-  similarityToOwner?: unknown
-  accessible?: unknown
-}
-
-/**
- * Evaluate owner/probe admissibility and publicness veto for one `unauthorized_access` hit
- * against the recorded authorization matrix. Shared between live recipe routing and spec synthesis.
- */
-export function isAuthzMatrixHitAdmissible(
-  matrix: readonly AuthzMatrixRow[] | null,
-  hit: Record<string, unknown>,
-  opts: { mutating: boolean; functionLevel: boolean },
-): boolean {
-  if (!matrix) return true
-  const matrixId = String(hit.resourceId ?? '')
-  const probeActor = hit.actor === 'anonymous' ? 'anonymous' : 'other_persona'
-  const idRows = opts.functionLevel ? matrix : matrix.filter(r => String(r.resourceId ?? '') === matrixId)
-  const ownerRow = idRows.find(r => r.actor === 'owner')
-  const probeRow = idRows.find(r => r.actor === probeActor)
-  if (!ownerRow || ownerRow.accessible !== true || typeof ownerRow.status !== 'number' ||
-      ownerRow.status < 200 || ownerRow.status >= 300) return false
-  if (typeof ownerRow.bodyBytes === 'number' && ownerRow.bodyBytes <= 2) return false
-  if (!probeRow || probeRow.accessible !== true) return false
-  if (!opts.mutating && Number(probeRow.similarityToOwner ?? hit.similarityToOwner ?? 0) < 0.7) return false
-  const anonRow = idRows.find(r => r.actor === 'anonymous')
-  if (!opts.mutating && anonRow?.accessible === true) {
-    const sameBody = typeof anonRow.bodySha256 === 'string' && anonRow.bodySha256 === ownerRow.bodySha256
-    const similar = Number(anonRow.similarityToOwner ?? 0) >= 0.7
-    if (sameBody || similar) return false
-  }
-  return true
-}

@@ -34,7 +34,7 @@ import { classKey } from '../benchmarks/realistic-bench/grader/match.ts'
 import type { Finding } from '../src/domain.ts'
 import type { DeclarativeReplaySpec } from '../src/replay-spec.ts'
 import { categoryToOwaspCoverageCategory } from '../src/server/coverage-category.ts'
-import { baseFields, type Severity } from '../src/server/deterministic-specs.ts'
+import { baseFields, type Severity } from '../src/server/floor-heuristics.ts'
 import {
   IMMUTABLE_CONFIRMED_FINDING_FIELDS,
   agentProofAttribution,

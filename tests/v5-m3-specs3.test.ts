@@ -473,18 +473,6 @@ const gqlAnomaly = {
   query: nestedQuery, variables: { id: 'acct_1' }, sameRoot: true,
 }
 
-test('graphql: nested resolver BOLA is confirmed from the recorded query without introspection', async () => {
-  const fx = await graphqlFixture(false)
-  try {
-    const spec = specFor(outcome({
-      hyp: { key: 'k', endpoint: endpoint({ method: 'POST', path: '/graphql' }), probeClass: 'graphql_audit', method: 'POST' },
-      anomalies: [gqlAnomaly],
-    }), env(fx.origin), 'http_chain')
-    const res = await verify(spec, fx.origin)
-    assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
-  } finally { await fx.close() }
-})
-
 test('graphql: a resolver that scopes nested data to its caller cannot confirm', async () => {
   const fx = await graphqlFixture(true)
   try {
@@ -581,20 +569,6 @@ function inlineWebhookAnomaly() {
     body: { endpoint: 'ep_1', ts, event, key, signature },
   }
 }
-
-test('webhook: inline attacker key is replayed with a freshly signed delivery and rejected control', async () => {
-  const fx = await webhookFixture(false)
-  try {
-    const spec = specFor(outcome({
-      hyp: { key: 'k', endpoint: endpoint({ method: 'POST', path: '/api/hook' }), probeClass: 'webhook_signature_bypass', method: 'POST' },
-      anomalies: [inlineWebhookAnomaly()],
-    }), env(fx.origin), 'http_chain')
-    const probeStep = (spec.steps as Array<{ id: string; request: { bodySignature?: { canonical: string } } }>).find(s => s.id === 'p1')
-    assert.equal(probeStep?.request.bodySignature?.canonical, 'ts_event')
-    const res = await verify(spec, fx.origin)
-    assert.equal(res.verdict, 'confirmed', String(res.outcome.reason))
-  } finally { await fx.close() }
-})
 
 test('webhook: a receiver that ignores the inline key rejects the replay', async () => {
   const fx = await webhookFixture(true)

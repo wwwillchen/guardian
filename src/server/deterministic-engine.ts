@@ -25,9 +25,8 @@ import type { ScopedBrowser } from './scoped-browser.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
-import { synthesizeEngineSpecs, vulnClassOfSpec } from './deterministic-specs.ts'
-import type { EngineEndpoint, EngineHypothesis, EngineParam, SynthesizedEngineSpec } from './deterministic-specs.ts'
-import { TYPED_RECIPE_ASSERTION, planFloorRecipe, recipeSpecRecord, recipeVerificationResult, runPlannedRecipe, runTypedFloorSpec } from './floor-recipe-engine.ts'
+import type { EngineEndpoint, EngineHypothesis, EngineParam, SynthesizedEngineSpec } from './floor-heuristics.ts'
+import { TYPED_RECIPE_ASSERTION, planFloorCandidates, recipeSpecRecord, recipeVerificationResult, runPlannedRecipe, runTypedFloorSpec } from './floor-recipe-engine.ts'
 import {
   CONSERVED_AMOUNT_FIELD_RE,
   CONSERVED_BALANCE_FIELD_RE,
@@ -56,7 +55,7 @@ import {
 } from './floor-heuristics.ts'
 import { resolvePersonaIdentity, type RoleName } from './oracle-invariants.ts'
 
-export type { EngineEndpoint, EngineHypothesis, EngineParam } from './deterministic-specs.ts'
+export type { EngineEndpoint, EngineHypothesis, EngineParam } from './floor-heuristics.ts'
 export {
   hasDynamicIdSegment,
   IDENTITY_ASSUMPTION_ROUTE_RE,
@@ -1135,7 +1134,7 @@ function collectionPathOf(pathTemplate: string): string | null {
 // Authz readback inference
 //
 // A mutating authorization proof only proves impact when a *separate* GET shows the state change;
-// the mutation's own acknowledgement is an echo (see deterministic-specs synthAuthz). The engine
+// the mutation's own acknowledgement is an echo (see the persisted_mutation floor recipe). The engine
 // owns the harvest and the discovered route map, so it names that reading route here. Everything is
 // derived from routes and identifiers the target itself exposed: no app or route literals.
 // ---------------------------------------------------------------------------------------------
@@ -5311,9 +5310,14 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     report.signals += 1
     stats.signals += 1
 
-    const candidates = synthesizeEngineSpecs(hyp, probe).slice(0, 3)
+    const candidates = planFloorCandidates({
+      hypothesis: hyp,
+      probe,
+      personas: input.personas,
+      ...(staging.headers ? { headers: staging.headers } : {}),
+    }).slice(0, 3)
     if (candidates.length === 0) {
-      log('deterministic_engine.spec_skipped', `${hyp.probeClass} ${hyp.endpoint.pathTemplate}: signal had no schema-valid replay shape (${probe.anomalies.map(a => String(a.type)).join(',') || 'no anomaly'})`, {
+      log('deterministic_engine.spec_skipped', `${hyp.probeClass} ${hyp.endpoint.pathTemplate}: signal had no typed floor recipe or zero-jq runner shape (${probe.anomalies.map(a => String(a.type)).join(',') || 'no anomaly'})`, {
         intent: hyp.intent,
         endpoint: hyp.endpoint.pathTemplate,
       })
@@ -5322,28 +5326,13 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     const rejections: RejectedSpecEvidence[] = []
     for (const candidate of candidates) {
       if (input.signal.aborted || budget.requestsUsed >= maxRequests) break
-      const parsed = declarativeReplaySpecSchema.safeParse(candidate.spec)
-      if (!parsed.success) {
-        log('deterministic_engine.spec_invalid', `${hyp.probeClass} ${hyp.endpoint.pathTemplate}: ${parsed.error.issues[0]?.path.join('.') ?? 'schema'} ${parsed.error.issues[0]?.message ?? ''}`.slice(0, 300), {
-          intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate,
-        })
-        continue
-      }
       report.specsSubmitted += 1
       stats.specs += 1
-      // Cut 3a strict strangler: a wired kind/class pair runs its typed recipe and is confirmed by
-      // the receipt, never by `verifyReplaySpec`. The legacy synthesizer still supplies the
-      // candidate (kind/class attribution); it is not the confirmation artifact.
-      const candidateClass = candidate.vulnClass || vulnClassOfSpec(parsed.data as unknown as Record<string, unknown>)
-      const recipePlan = planFloorRecipe({
-        hypothesis: hyp, probe, specKind: candidate.kind, vulnClass: candidateClass, personas: input.personas,
-        ...(candidate.kind === 'browser_chain' || candidate.kind === 'http_chain' ? { candidateSpec: candidate.spec as unknown as Record<string, unknown> } : {}),
-        ...(staging.headers ? { headers: staging.headers } : {}),
-      })
-      if (recipePlan) {
+      if (candidate.mode === 'recipe') {
+        const recipePlan = candidate.plan
         if (recipePlan.skipReason) {
           report.rejectedSpecs += 1; stats.rejected += 1
-          rejections.push({ kind: candidate.kind, verdict: 'inconclusive', controlPassed: false, observed: `recipe ${recipePlan.recipeId} not expressible`, reason: recipePlan.skipReason, exchangeIds: [] })
+          rejections.push({ kind: recipePlan.specKind, verdict: 'inconclusive', controlPassed: false, observed: `recipe ${recipePlan.recipeId} not expressible`, reason: recipePlan.skipReason, exchangeIds: [] })
           log('deterministic_engine.recipe_skipped', `${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recipePlan.skipReason}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId })
           continue
         }
@@ -5365,7 +5354,7 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
         if (!execution.result.confirmed) {
           const failure = execution.failure
           report.rejectedSpecs += 1; stats.rejected += 1
-          rejections.push({ kind: candidate.kind, verdict: 'inconclusive', controlPassed: failure?.code !== 'precondition_unsatisfied', observed: `recipe ${execution.result.recipeId}: ${failure?.code ?? 'rejected'}`, reason: failure?.message ?? execution.result.verification.reason, exchangeIds: [...execution.result.exchangeIds] })
+          rejections.push({ kind: recipePlan.specKind, verdict: 'inconclusive', controlPassed: failure?.code !== 'precondition_unsatisfied', observed: `recipe ${execution.result.recipeId}: ${failure?.code ?? 'rejected'}`, reason: failure?.message ?? execution.result.verification.reason, exchangeIds: [...execution.result.exchangeIds] })
           log('deterministic_engine.recipe_rejected', `${execution.result.recipeId} ${hyp.endpoint.pathTemplate} -> ${failure?.code ?? 'rejected'}: ${(failure?.message ?? execution.result.verification.reason).slice(0, 200)}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: execution.result.recipeId, missingRoles: failure?.missingRoles ?? [] })
           continue
         }
@@ -5390,6 +5379,13 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
         report.confirmedPairs.push({ endpoint: hyp.endpoint.pathTemplate, vulnClass: recipePlan.vulnClass })
         break
       }
+      const parsed = declarativeReplaySpecSchema.safeParse(candidate.specRecord.spec)
+      if (!parsed.success) {
+        log('deterministic_engine.spec_invalid', `${hyp.probeClass} ${hyp.endpoint.pathTemplate}: ${parsed.error.issues[0]?.path.join('.') ?? 'schema'} ${parsed.error.issues[0]?.message ?? ''}`.slice(0, 300), {
+          intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate,
+        })
+        continue
+      }
       // Hard no-fallback assertion: wired pairs run above; non-recipe Cut-3e kinds run zero-jq Tier-1 runners.
       assertNotRecipeWiredLegacyCall(parsed.data)
       const runnerCtx = { broker: input.broker, ...(input.canaryBroker ? { canaryBroker: input.canaryBroker } : {}), backend: input.backend, ...(input.reposDir ? { reposDir: input.reposDir } : {}), grant: input.grant, signal: input.signal, ...(input.storage ? { storage: input.storage } : {}), runId: input.runId, assignmentId: input.assignmentId, onExchange: trackExchange }
@@ -5398,27 +5394,27 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
         replay = await runTypedFloorSpec(parsed.data, runnerCtx)
         if (!replay && input.verify) replay = await input.verify({ ...runnerCtx, spec: parsed.data, ...(input.browser ? { browser: input.browser } : {}) })
       } catch (error) {
-        report.notes.push(`verify ${candidate.kind} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
+        report.notes.push(`verify ${candidate.specRecord.kind} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
         continue
       }
       if (!replay) {
         report.rejectedSpecs += 1; stats.rejected += 1
-        rejections.push({ kind: candidate.kind, verdict: 'inconclusive', controlPassed: false, observed: `unplanned_floor_recipe:${candidate.kind}/${candidateClass}`, reason: 'No typed Tier-1 floor recipe exists for this candidate; legacy jq fallback is retired.', exchangeIds: [] })
+        rejections.push({ kind: candidate.specRecord.kind, verdict: 'inconclusive', controlPassed: false, observed: `unplanned_floor_recipe:${candidate.specRecord.kind}/${candidate.specRecord.vulnClass}`, reason: 'No typed Tier-1 floor recipe exists for this candidate; legacy jq fallback is retired.', exchangeIds: [] })
         continue
       }
       if (replay.verdict !== 'confirmed') {
-        log('deterministic_engine.spec_rejected', `${candidate.kind} ${hyp.endpoint.pathTemplate} -> ${replay.verdict}: ${(replay.outcome.reason ?? replay.outcome.observed).slice(0, 200)}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, kind: candidate.kind, verdict: replay.verdict, controlPassed: replay.outcome.controlPassed })
+        log('deterministic_engine.spec_rejected', `${candidate.specRecord.kind} ${hyp.endpoint.pathTemplate} -> ${replay.verdict}: ${(replay.outcome.reason ?? replay.outcome.observed).slice(0, 200)}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, kind: candidate.specRecord.kind, verdict: replay.verdict, controlPassed: replay.outcome.controlPassed })
         report.rejectedSpecs += 1; stats.rejected += 1
-        rejections.push({ kind: candidate.kind, verdict: replay.verdict, controlPassed: replay.outcome.controlPassed === true, observed: replay.outcome.observed, reason: replay.outcome.reason ?? null, exchangeIds: replay.exchangeIds })
+        rejections.push({ kind: candidate.specRecord.kind, verdict: replay.verdict, controlPassed: replay.outcome.controlPassed === true, observed: replay.outcome.observed, reason: replay.outcome.reason ?? null, exchangeIds: replay.exchangeIds })
         continue
       }
-      const vulnClass = candidate.vulnClass || vulnClassOfSpec(parsed.data as unknown as Record<string, unknown>)
+      const vulnClass = candidate.specRecord.vulnClass
       const unifiedSpec = { ...parsed.data, assertionsJq: TYPED_RECIPE_ASSERTION } as DeclarativeReplaySpec
       let persistedId: string | null = null
       try {
-        persistedId = await input.onConfirmed({ hypothesis: hyp, spec: unifiedSpec, specRecord: { ...candidate, spec: { ...candidate.spec, assertionsJq: TYPED_RECIPE_ASSERTION } }, vulnClass, endpoint: hyp.endpoint.pathTemplate, result: replay, exchangeIds: [...new Set([...probe.exchangeIds, ...replay.exchangeIds])] })
+        persistedId = await input.onConfirmed({ hypothesis: hyp, spec: unifiedSpec, specRecord: { ...candidate.specRecord, spec: { ...candidate.specRecord.spec, assertionsJq: TYPED_RECIPE_ASSERTION } }, vulnClass, endpoint: hyp.endpoint.pathTemplate, result: replay, exchangeIds: [...new Set([...probe.exchangeIds, ...replay.exchangeIds])] })
       } catch (error) {
-        report.notes.push(`persist ${candidate.kind} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
+        report.notes.push(`persist ${candidate.specRecord.kind} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
         continue
       }
       // A null return means the persistence layer recognized a structural duplicate; do not count

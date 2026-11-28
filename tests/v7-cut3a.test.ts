@@ -19,7 +19,7 @@ import {
   runPlannedRecipe,
 } from '../src/server/floor-recipe-engine.ts'
 import { wiredRecipeForSpecKind } from '../src/server/floor-recipes.ts'
-import type { EngineHypothesis } from '../src/server/deterministic-specs.ts'
+import type { EngineHypothesis } from '../src/server/floor-heuristics.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from '../src/server/broker.ts'
 

@@ -29,6 +29,8 @@ import type {
 } from './composite-receipt.ts'
 import { buildCoverageGapReport } from './coverage-gaps.ts'
 import type { CoverageGapReport } from './coverage-gaps.ts'
+import { summarizeVerifiedReplaySpec } from '../replay-spec.ts'
+import type { VerifiedReplaySpecSummary } from '../replay-spec.ts'
 import { FindingCodec } from './finding-codec.ts'
 import type { CompositePatchRetestVerdict } from './patch-workflow.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
@@ -102,6 +104,7 @@ export interface PortableReceiptRecord {
   proofKind: string | null
   proofRuntime: string | null
   proofScriptSha256: string | null
+  verifiedReplaySpec?: VerifiedReplaySpecSummary & { vulnClass?: string | null }
   receipt: ProofReceipt | null
   verification: {
     confirmed: boolean
@@ -924,6 +927,19 @@ function payloadSigningBytes(
  * (plus redacted transcripts, minimal reproducer metadata, patch-retest proofs, and honest
  * coverage gaps) for one run.
  */
+function buildVerifiedReplaySpecExport(
+  specRow: { spec: unknown; proofKind?: string | null; proofRuntime?: string | null; proofScriptSha256?: string | null } | undefined,
+  receipt: ProofReceipt | null,
+): PortableReceiptRecord['verifiedReplaySpec'] {
+  if (!specRow) return undefined
+  const summary = summarizeVerifiedReplaySpec(specRow.spec, {
+    proofKind: specRow.proofKind,
+    proofRuntime: specRow.proofRuntime,
+    proofScriptSha256: specRow.proofScriptSha256,
+  })
+  return { ...summary, ...(receipt?.vulnClass ? { vulnClass: receipt.vulnClass } : {}) }
+}
+
 export function exportRunReceiptBundle(
   storage: Store,
   runId: string,
@@ -1131,6 +1147,7 @@ export function exportRunReceiptBundle(
       }
     })
 
+    const verifiedSummary = buildVerifiedReplaySpecExport(specRow, receipt)
     const baseRecord: Omit<PortableReceiptRecord, 'recordSha256'> = {
       findingId: row.id,
       title: scrubText(f.title, secrets, zdr),
@@ -1145,21 +1162,14 @@ export function exportRunReceiptBundle(
       proofKind: specRow?.proofKind ?? null,
       proofRuntime: specRow?.proofRuntime ?? null,
       proofScriptSha256: specRow?.proofScriptSha256 ?? null,
+      ...(verifiedSummary ? { verifiedReplaySpec: verifiedSummary } : {}),
       receipt,
       verification,
       transcriptSlices,
-      reproducer: {
-        vulnClass: receipt?.vulnClass ?? (f.category || 'unknown'),
-        targetOrigin: receipt?.target.origin ?? f.origin,
-        steps: reproSteps,
-        commandHint: buildCommandHint(reproSteps),
-      },
+      reproducer: { vulnClass: receipt?.vulnClass ?? (f.category || 'unknown'), targetOrigin: receipt?.target.origin ?? f.origin, steps: reproSteps, commandHint: buildCommandHint(reproSteps) },
       patchRetests,
     }
-    records.push({
-      ...baseRecord,
-      recordSha256: recordDigest(baseRecord),
-    })
+    records.push({ ...baseRecord, recordSha256: recordDigest(baseRecord) })
   }
 
   const findingsMetaById = new Map(

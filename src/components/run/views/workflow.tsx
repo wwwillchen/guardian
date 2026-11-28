@@ -1,7 +1,9 @@
 // Workflow view (Agent W): execution trace in graph and list modes.
 // Graph mode: phase columns of worker cards, handoff + causal edges, stacks,
-// lineage highlight, camera, minimap, phase nav, replay. List mode: grouped
-// worker rows. Inspectors: worker, stack, queued steps, step, graph digest.
+// lineage highlight, camera, minimap, phase nav, replay. List mode, failure-first:
+// a pinned "Needs attention" lane (failed workers grouped by signature, approvals,
+// stalled workers), "Active now" capped at 6 rows, then grouped worker rows (each
+// worker listed once). Inspectors: worker, stack, queued steps, step, graph digest.
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { isTerminalRunStatus } from '../../../server/run-status.ts'
@@ -13,17 +15,31 @@ import { LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
 import { PHASE_LABEL, PHASE_ORDER, stLabel } from '../meta.ts'
-import { worstSeverity } from '../model.ts'
-import type { Assignment } from '../model.ts'
+import { ACTIVE_NOW_CAP, buildAttentionLane, capActiveNow, worstSeverity } from '../model.ts'
+import type { AttentionGroup, Assignment } from '../model.ts'
 import { useListNav, useNav, useViewState } from '../nav.tsx'
+import { Num } from '../num.tsx'
 import { usePaletteCommands } from '../palette.tsx'
-import type { InspectorMap } from '../pane.tsx'
+import type { InspectorMap, InspectorProps } from '../pane.tsx'
 import { cn, runBtn, runDdItem, RW } from '../tw.ts'
-import { DigestInspector, StackInspector, StepInspector, StepsInspector, WorkerInspector } from './workflow-inspector.tsx'
 import { isLive, QUEUE_ID, setExpanded, useWorkflowLayout } from './workflow-layout.ts'
 
 // The graph canvas is an opt-in mode (~45 KB); load it on demand so the run route chunk stays inside its budget.
 const WorkflowGraph = lazy(() => import('./workflow-graph.tsx').then(m => ({ default: m.WorkflowGraph })))
+// Inspectors (worker trace + timeline rail, stack, steps, digest) load on first selection, one shared chunk.
+let inspectorsModule: ReturnType<typeof importInspectors> | null = null
+function importInspectors() { return import('./workflow-inspector.tsx') }
+const loadInspectors = () => (inspectorsModule ??= importInspectors())
+// Start fetching on the client as soon as the workflow view is evaluated, so hydrating a
+// server-rendered inspector (deep link with `sel=worker:…`) never waits on a cold chunk.
+if (typeof window !== 'undefined') void loadInspectors()
+type InspectorName = 'WorkerInspector' | 'StackInspector' | 'StepsInspector' | 'StepInspector' | 'DigestInspector'
+function lazyInspector(name: InspectorName) {
+  const Lazy = lazy(() => loadInspectors().then(m => ({ default: m[name] as (props: InspectorProps) => ReactNode })))
+  return function LazyInspector(props: InspectorProps) {
+    return <Suspense fallback={<div className="min-h-0 flex-1" aria-busy="true" aria-label="Loading inspector" />}><Lazy {...props} /></Suspense>
+  }
+}
 
 type Filter = 'all' | 'live' | 'complete' | 'findings' | 'failed'
 type Mode = 'graph' | 'list'
@@ -288,21 +304,43 @@ function DigestMenu() {
 
 // ---------------------------------------------------------------- list mode
 
+const ATTENTION_ICON: Record<AttentionGroup['kind'], 'alert' | 'shield' | 'pause'> = { failed: 'alert', approval: 'shield', stalled: 'pause' }
+const ATTENTION_ACTION: Record<AttentionGroup['kind'], string> = { failed: 'Inspect', approval: 'Review approval', stalled: 'Inspect' }
+
+/** "4 failed · 1 awaiting approval · 1 stalled" for the Needs-attention header. */
+function attentionBreakdown(groups: readonly AttentionGroup[]): string {
+  const n = { failed: 0, approval: 0, stalled: 0 }
+  for (const g of groups) n[g.kind] += g.workers.length
+  return [n.failed && `${fmtN(n.failed)} failed`, n.approval && `${fmtN(n.approval)} awaiting approval`, n.stalled && `${fmtN(n.stalled)} stalled`].filter(Boolean).join(' · ')
+}
+
 function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean; terminal: boolean }) {
-  const { events } = useRun()
+  const { events, detail } = useRun()
   const model = useRunModel()
   const nav = useNav()
   const [group, setGroup] = useViewState<Group>('wf.group', 'phase')
   const [collapsed, setCollapsed] = useViewState<Record<string, boolean>>('wf.collapsed', {})
+  const [activeAll, setActiveAll] = useViewState('wf.activeAll', false)
+  const [attnOpen, setAttnOpen] = useViewState<Record<string, boolean>>('wf.attnOpen', {})
+  const runStatus = detail.activity?.lifecycle ?? detail.run.status
   const items = useMemo(() => model.detail.assignments.filter(matches).slice().sort((a, b) => a.createdAt - b.createdAt), [model, matches])
+  // Failure-first: everything that needs a human sits in its own lane and is not repeated below.
+  const lane = useMemo(() => buildAttentionLane(items, terminal ? 'complete' : runStatus), [items, terminal, runStatus])
   const { activeItems, restItems } = useMemo(() => {
-    if (terminal) return { activeItems: [] as Assignment[], restItems: items }
-    const active: Assignment[] = []
     const rest: Assignment[] = []
-    for (const a of items) (isLive(a) ? active : rest).push(a)
+    const active: Assignment[] = []
+    for (const a of items) {
+      if (lane.ids.has(a.id)) continue
+      if (!terminal && isLive(a)) active.push(a)
+      else rest.push(a)
+    }
     active.sort((a, b) => Number(a.status !== 'running') - Number(b.status !== 'running') || a.createdAt - b.createdAt)
     return { activeItems: active, restItems: rest }
-  }, [items, terminal])
+  }, [items, terminal, lane])
+  const activeView = capActiveNow(activeItems, activeAll)
+  const attentionN = lane.ids.size
+  const laneOpen = (g: AttentionGroup) => g.workers.length === 1 || !!attnOpen[g.key]
+  const laneIds = lane.groups.flatMap(g => (laneOpen(g) ? g.workers.map(a => a.id) : []))
   const groups = useMemo(() => {
     if (group === 'none') return null
     const by = new Map<string, Assignment[]>()
@@ -322,7 +360,7 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
   }, [restItems, group, model])
   const ck = (k: string) => group + ':' + k
   const restIds = groups ? groups.flatMap(g => (collapsed[ck(g.key)] ? [] : g.items.map(a => a.id))) : restItems.map(a => a.id)
-  const ids = [...activeItems.map(a => a.id), ...restIds]
+  const ids = [...laneIds, ...activeView.shown.map(a => a.id), ...restIds]
   const { index } = useListNav({ ids, kind: 'worker' })
   useShortcuts([{ key: 'G', run: () => setGroup(GROUPS[(GROUPS.findIndex(g => g[0] === group) + 1) % GROUPS.length][0]) }])
   const listRef = useRef<HTMLDivElement>(null)
@@ -331,7 +369,8 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
     listRef.current?.querySelector(`[data-id="${CSS.escape(ids[index])}"]`)?.scrollIntoView({ block: 'nearest' })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index])
-  const row = (a: Assignment, pinned = false) => {
+  const row = (a: Assignment, lanePin?: 'active' | 'attention') => {
+    const pinned = lanePin != null
     const fs = model.workerFindings.get(a.id) ?? []
     const nfa = (model.factsByWorker.get(a.id) ?? []).length
     const pct = a.maxTurns ? Math.min(100, a.turnsUsed / a.maxTurns * 100) : 0
@@ -340,7 +379,12 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
     const r0 = isRound0ThreatModelWorker(a) ? deriveRound0PipelineState({ assignment: a, detail: model.detail, events }) : null
     return <div
       key={a.id}
-      className={cn(RW.row, pinned && 'bg-panel/85 border-l-accent last:border-b-0 hover:bg-panel', cur && RW.rowCur)}
+      className={cn(
+        RW.row,
+        lanePin === 'active' && 'bg-panel/85 border-l-accent last:border-b-0 hover:bg-panel',
+        lanePin === 'attention' && 'bg-panel/85 border-l-danger last:border-b-0 hover:bg-panel',
+        cur && RW.rowCur,
+      )}
       data-id={a.id}
       data-n={a.id}
       data-wf-row=""
@@ -350,27 +394,69 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
         {live ? <StaticLiveDot paused={a.status !== 'running'} /> : <StatusGlyph status={a.status} />}
       </span>
       <span className={cn('min-w-[30%] flex-1 truncate text-fg', pinned && 'font-medium')} title={a.title}>{a.title}</span>
-      {pinned && <Tag tone={a.status === 'running' ? 'accent' : 'warn'}>{stLabel(a.status)}</Tag>}
+      {pinned && a.status !== 'failed' && <Tag tone={a.status === 'running' ? 'accent' : 'warn'} className="flex-none">{stLabel(a.status)}</Tag>}
       {fs.length > 0 && <span className={cn(PILL, 'bg-panel text-fg')} title="Findings"><SevGlyph sev={worstSeverity(fs)} />{fmtN(fs.length)}</span>}
       {!r0 && nfa > 0 && <span className={cn(PILL, 'bg-sunk text-fg-muted')}>{fmtN(nfa)} facts</span>}
       {r0 ? <>
         <Tag tone={live ? 'accent' : 'solid'}>{r0.stageShort}</Tag>
         {r0.counts.totalHosts > 0 && <span className="flex-none text-[12px] text-fg-subtle tabular-nums">{r0.counts.mappedHosts}/{r0.counts.totalHosts} hosts</span>}
       </> : <>
-        {(pinned || group !== 'phase') && <span className="min-w-0 max-w-[140px] shrink truncate"><Tag>{PHASE_LABEL[a.phase] ?? a.phase}</Tag></span>}
-        {a.status === 'failed' && a.outcome
-          ? <span className="min-w-0 max-w-[260px] shrink truncate text-[12px] text-danger" title={a.outcome} data-wf-reason="">{a.outcome}</span>
-          : <span className="w-[120px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle @max-[720px]/wfl:hidden">{host(a.sourceOrigins[0] ?? '')}</span>}
+        {(lanePin === 'active' || (!pinned && group !== 'phase')) && <span className="min-w-0 max-w-[140px] shrink truncate"><Tag>{PHASE_LABEL[a.phase] ?? a.phase}</Tag></span>}
+        {/* Attention rows drop the host column so the status tag and inline action always fit. */}
+        {lanePin === 'attention' && a.status !== 'failed' ? null
+          : a.status === 'failed' && a.outcome
+            ? <span className="min-w-0 max-w-[260px] shrink truncate text-[12px] text-danger" title={a.outcome} data-wf-reason="">{a.outcome}</span>
+            : <span className="w-[120px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle @max-[720px]/wfl:hidden">{host(a.sourceOrigins[0] ?? '')}</span>}
         <span className="flex min-w-[84px] flex-none items-center justify-end gap-1.5 whitespace-nowrap text-fg-subtle tabular-nums" title="Turns used" data-wf-turns="">
           <span className="relative h-[3px] w-8 flex-none overflow-hidden rounded bg-line-2"><i className={cn('absolute inset-y-0 left-0', live ? 'bg-accent' : 'bg-fg-subtle')} style={{ width: pct + '%' }} /></span>
-          {`${fmtN(a.turnsUsed)}/${fmtN(a.maxTurns)}`}
+          <Num value={a.turnsUsed} kind="turns" max={a.maxTurns} />/<Num value={a.maxTurns} kind="turns" />
         </span>
       </>}
-      <span className="min-w-[72px] flex-none whitespace-nowrap text-right text-fg-subtle tabular-nums" title="Requests" data-wf-req="">{fmtN(r0 ? r0.counts.requests : a.requestsUsed)} req</span>
+      <span className="min-w-[72px] flex-none whitespace-nowrap text-right text-fg-subtle tabular-nums" title="Requests" data-wf-req=""><Num value={r0 ? r0.counts.requests : a.requestsUsed} kind="count" unit="req" /></span>
+      {lanePin === 'attention' && a.status === 'waiting_approval' && <button
+        type="button"
+        className={cn(runBtn({ variant: 'ghost', size: 'xs' }), 'flex-none')}
+        onClick={e => { e.stopPropagation(); nav.setView('queue') }}
+      >Review approval</button>}
+    </div>
+  }
+  /** Grouped failure signature: one 36px row "signature ×N" with an inline action and expand toggle. */
+  const groupRow = (g: AttentionGroup) => {
+    const open = !!attnOpen[g.key]
+    const req = g.workers.reduce((s, a) => s + a.requestsUsed, 0)
+    const act = () => (g.kind === 'approval' ? nav.setView('queue') : nav.select({ kind: 'worker', id: g.workers[0]!.id }))
+    return <div key={g.key} data-attention-group={g.kind} data-attention-count={g.workers.length}>
+      <div className={cn(RW.row, 'bg-panel/85 border-l-danger pr-3 hover:bg-panel')} data-attention-row="">
+        <span className={cn(ICON_SLOT, g.kind === 'failed' ? 'text-danger' : 'text-warn')}><Icon name={ATTENTION_ICON[g.kind]} size={13} /></span>
+        <span className={cn('min-w-0 flex-1 truncate text-[12.5px]', g.kind === 'failed' ? 'text-danger' : 'text-fg')} title={g.reason} data-wf-reason="">{g.reason}</span>
+        <span className={cn(PILL, 'bg-danger-soft text-danger')} data-attention-multiplier="" title={plural(g.workers.length, 'worker')}>×{fmtN(g.workers.length)}</span>
+        <span className="min-w-[72px] flex-none whitespace-nowrap text-right text-fg-subtle tabular-nums" title="Requests"><Num value={req} kind="count" compact unit="req" /></span>
+        <button type="button" className={cn(runBtn({ variant: 'ghost', size: 'xs' }), 'flex-none')} onClick={act}>{ATTENTION_ACTION[g.kind]}</button>
+        <button
+          type="button"
+          className={cn(runBtn({ variant: 'ghost', size: 'xs' }), 'flex-none px-1')}
+          aria-expanded={open}
+          aria-label={`${open ? 'Hide' : 'Show'} ${plural(g.workers.length, 'worker')} with this signature`}
+          onClick={() => setAttnOpen(o => ({ ...o, [g.key]: !open }))}
+        >
+          <Icon name="chev" className={cn('transition-transform duration-[var(--d2)] ease-kovo motion-reduce:transition-none', !open && '-rotate-90')} />
+        </button>
+      </div>
+      {open && g.workers.map(a => row(a, 'attention'))}
     </div>
   }
   if (!items.length) return <EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80 }}>Try a different filter or switch tabs.</EmptyState>
   return <div className={cn(RW.list, '@container/wfl')} ref={listRef} tabIndex={-1} role="region" aria-label="Worker list">
+    {attentionN > 0 && (
+      <section data-testid="workflow-attention-section" aria-label={`Needs attention (${attentionN})`} className="mx-3 mt-2.5 overflow-hidden rounded-lg border border-[color-mix(in_oklch,var(--danger)_35%,transparent)] bg-danger-soft/40">
+        <div className="flex h-8 items-center gap-2 border-b border-[color-mix(in_oklch,var(--danger)_25%,transparent)] bg-danger-soft px-3 text-[12px] font-medium text-fg">
+          <Icon name="alert" size={13} className="flex-none text-danger" />
+          <span className="flex-none tabular-nums">Needs attention ({fmtN(attentionN)})</span>
+          <span className="ml-auto min-w-0 truncate text-[11.5px] font-normal text-fg-muted tabular-nums" data-wf-attention-breakdown="">{attentionBreakdown(lane.groups)}</span>
+        </div>
+        {lane.groups.map(g => (g.workers.length === 1 ? row(g.workers[0]!, 'attention') : groupRow(g)))}
+      </section>
+    )}
     {activeItems.length > 0 && (
       <section data-testid="workflow-active-section" aria-label={`Active now (${activeItems.length})`} className="mx-3 my-2.5 overflow-hidden rounded-lg border border-accent-line bg-accent-soft/45">
         <div className="flex h-8 items-center gap-2 border-b border-accent-line/60 bg-accent-soft px-3 text-[12px] font-medium text-fg">
@@ -378,7 +464,16 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
           <span className="flex-none tabular-nums">Active now ({fmtN(activeItems.length)})</span>
           <span className="ml-auto min-w-0 truncate text-[11.5px] font-normal text-fg-muted tabular-nums" data-wf-active-breakdown="">{phaseBreakdown(activeItems)}</span>
         </div>
-        {activeItems.map(a => row(a, true))}
+        {activeView.shown.map(a => row(a, 'active'))}
+        {activeItems.length > ACTIVE_NOW_CAP && <button
+          type="button"
+          className="flex h-auto min-h-8 w-full cursor-pointer items-center justify-center gap-1 whitespace-normal rounded-none border-0 border-t border-accent-line/60 bg-transparent px-3 py-1.5 text-[12px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-accent-soft hover:text-fg"
+          aria-expanded={activeAll}
+          data-testid="workflow-active-toggle"
+          onClick={() => setActiveAll(v => !v)}
+        >
+          {activeAll ? 'Show fewer' : `Show all ${fmtN(activeItems.length)}`}<Icon name={activeAll ? 'chevU' : 'chevD'} size={11} />
+        </button>}
       </section>
     )}
     {groups ? groups.map(g => {
@@ -392,7 +487,7 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
           <span className={ICON_SLOT}>{g.glyph}</span>
           <span>{g.label}</span>
           <span className="font-normal text-fg-subtle tabular-nums">{fmtN(g.items.length)}</span>
-          <span className="ml-auto flex items-center gap-2 font-normal text-fg-subtle tabular-nums">{fmtN(tu)} turns · {fmtN(req)} req</span>
+          <span className="ml-auto flex items-center gap-1 font-normal text-fg-subtle tabular-nums"><Num value={tu} kind="turns" unit="turns" /> · <Num value={req} kind="count" unit="req" /></span>
         </div>
         {!col && g.items.map(a => row(a))}
       </div>
@@ -405,9 +500,9 @@ function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean
 
 /** Inspectors this view owns, keyed by selection kind. */
 export const workflowInspectors: InspectorMap = {
-  worker: WorkerInspector,
-  stack: StackInspector,
-  steps: StepsInspector,
-  step: StepInspector,
-  digest: DigestInspector,
+  worker: lazyInspector('WorkerInspector'),
+  stack: lazyInspector('StackInspector'),
+  steps: lazyInspector('StepsInspector'),
+  step: lazyInspector('StepInspector'),
+  digest: lazyInspector('DigestInspector'),
 }

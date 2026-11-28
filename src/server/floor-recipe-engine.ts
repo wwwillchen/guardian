@@ -18,8 +18,8 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
 import { diffResponse } from '../../worker/analyzers.ts'
 import type { StateChangeApprovalContext } from './approval-judge.ts'
-import { baseFields } from './deterministic-specs.ts'
-import type { EngineHypothesis, Severity, SynthesizedEngineSpec } from './deterministic-specs.ts'
+import { baseFields } from './floor-heuristics.ts'
+import type { EngineHypothesis, Severity, SynthesizedEngineSpec } from './floor-heuristics.ts'
 import {
   POSTURE_CATEGORY_RE,
   POSTURE_CWES,
@@ -36,7 +36,7 @@ import { ScopedBrowser } from './scoped-browser.ts'
 import type { BrowserSessionStep } from './scoped-browser.ts'
 import type { EnginePersona } from './deterministic-engine.ts'
 import type { DifferentialResult } from './surface-engine.ts'
-import { injectUniversalParam } from './probes/context.ts'
+import { anomalyCandidatePairs, buildTypedRunnerCandidate, probeClassCandidatePairs, requestFromInjection } from './floor-candidate-planner.ts'
 import { CUT3_FLOOR_RECIPE_IDS, brokerFloorRecipeDeps, browserSinkEnvelopeFromSteps, cut3FloorRecipe, floorRecipe, isProtocolBrowserSpec, runCut3Recipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
 import type {
   AccessBoundaryArgs,
@@ -55,6 +55,7 @@ import type {
   FloorRecipeExecution,
   FloorRecipeId,
   FloorRequestSpec,
+  InjectionFingerprintArgs,
   PersistedMutationArgs,
   RaceBurstArgs,
 } from './floor-recipes.ts'
@@ -334,45 +335,6 @@ function booleanArm(input: {
     return input.template.replaceAll('{{baseline}}', input.baseline).replaceAll('{{sql_expr}}', expr)
   }
   return booleanExpression(input.style, input.baseline, input.key, input.arm)
-}
-
-function requestFromInjection(input: {
-  hyp: EngineHypothesis
-  value: string
-}): Pick<FloorRequestSpec, 'method' | 'pathAndQuery' | 'jsonBody' | 'textBody' | 'headers'> | null {
-  const hyp = input.hyp
-  const location = hyp.location ?? hyp.param?.location
-  if (!hyp.param || !location) return null
-  const injected = injectUniversalParam({
-    pathAndQuery: hyp.pathAndQuery,
-    param: hyp.param.name,
-    paramLocation: location,
-    value: input.value,
-    method: hyp.method === 'DELETE' ? 'POST' : hyp.method,
-    ...(hyp.headers ? { headers: hyp.headers } : {}),
-    ...(hyp.jsonBody ? { jsonBody: hyp.jsonBody } : {}),
-    ...(hyp.formBody ? { formBody: hyp.formBody } : {}),
-    ...(hyp.xmlTemplate ? { xmlTemplate: hyp.xmlTemplate.replaceAll('{{value}}', '{{val}}') } : {}),
-    ...(hyp.graphqlQuery ? { graphqlQuery: hyp.graphqlQuery } : {}),
-    ...(hyp.session ? { session: hyp.session } : {}),
-  })
-  let jsonBody: unknown
-  let textBody: string | undefined
-  if (typeof injected.body === 'string' && injected.body.length > 0) {
-    const contentType = Object.entries(injected.headers ?? {})
-      .find(([name]) => name.toLowerCase() === 'content-type')?.[1] ?? ''
-    if (contentType.includes('json') || /^[{[]/.test(injected.body.trim())) {
-      try { jsonBody = JSON.parse(injected.body) } catch { jsonBody = undefined }
-    }
-    if (jsonBody === undefined) textBody = injected.body
-  }
-  return {
-    method: injected.method ?? hyp.method,
-    pathAndQuery: injected.pathAndQuery,
-    ...(jsonBody !== undefined ? { jsonBody } : {}),
-    ...(textBody !== undefined ? { textBody } : {}),
-    ...(injected.headers ? { headers: injected.headers } : {}),
-  }
 }
 
 function armOverrideOf(req: Pick<FloorRequestSpec, 'pathAndQuery' | 'jsonBody' | 'textBody' | 'headers'>) {
@@ -825,6 +787,41 @@ function planOobCallbackRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   return { ...sketch, args }
 }
 
+function planInjectionFingerprintRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
+  const hyp = input.hypothesis
+  const sketch: FloorRecipePlan = {
+    recipeId: 'injection_fingerprint',
+    specKind: input.specKind,
+    vulnClass: input.vulnClass,
+    endpoint: hyp.endpoint.pathTemplate,
+    args: {} as FloorRecipeArgs,
+  }
+  const hit = input.probe.anomalies.find(anomaly => anomaly.type === 'db_error_fingerprint')
+  if (!hit || !hyp.param) return { ...sketch, skipReason: 'error-based injection signal has no injected parameter' }
+  const details = input.probe.details as Record<string, unknown>
+  const baseline = typeof details.baselineValue === 'string' ? details.baselineValue : (hyp.baselineValue ?? '1')
+  const payload = `${baseline}'`
+  const control = requestFromInjection({ hyp, value: baseline })
+  const probeReq = requestFromInjection({ hyp, value: payload })
+  if (!control || !probeReq) return { ...sketch, skipReason: 'error-based injection point could not be expressed as a recipe request' }
+  const actor = floorActorFor(hyp.ownerPersona ?? null, input.personas)
+  const headers = { ...(hyp.headers ?? {}), ...(input.headers ?? {}) }
+  const args: InjectionFingerprintArgs = {
+    origin: hyp.endpoint.origin,
+    method: probeReq.method,
+    pathAndQuery: probeReq.pathAndQuery,
+    vulnClass: 'injection',
+    param: hyp.param.name,
+    payload,
+    controlValue: baseline,
+    family: 'sqli',
+    actor,
+    ...(probeReq.jsonBody !== undefined ? { jsonBody: probeReq.jsonBody } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  }
+  return { ...sketch, args, paramLocation: hyp.location ?? hyp.param.location }
+}
+
 export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | null {
   const recipe = wiredRecipeForSpecKind(input.specKind, input.vulnClass)
   if (!recipe) return null
@@ -837,6 +834,7 @@ export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | 
     case 'persisted_mutation': return TIER1_MUTATION_CLASSES.has(input.vulnClass) ? planPersistedMutationRecipe(input) : planAuthzRecipe(input)
     case 'disclosure': return planDisclosureRecipe(input)
     case 'oob_callback': return planOobCallbackRecipe(input)
+    case 'injection_fingerprint': return planInjectionFingerprintRecipe(input)
     default: return {
       recipeId: recipe,
       specKind: input.specKind,
@@ -846,6 +844,49 @@ export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | 
       skipReason: `${recipe} is wired but has no planner for ${input.specKind}/${input.vulnClass}`,
     }
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Candidate enumeration: typed recipes and zero-jq runners (no legacy synthesizer / jq VM)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One confirmable candidate for a signaled floor hypothesis.
+ *
+ * - `recipe` — a wired legacy kind/class pair resolved to a typed floor recipe (Track A2 Tier-1
+ *   primitive + ProofReceipt owns the verdict).
+ * - `spec` — a zero-jq typed runner shape (`rce_proof`, `auth_protocol_proof`) whose declarative
+ *   spec is built directly from the hypothesis and probe evidence.
+ *
+ * Anything else (a class with no wired recipe and no zero-jq runner) is deliberately not emitted:
+ * the engine records a structured `spec_skipped` note instead of falling back to the retired jq VM.
+ */
+export type FloorCandidate =
+  | { mode: 'recipe'; plan: FloorRecipePlan }
+  | { mode: 'spec'; specRecord: SynthesizedEngineSpec }
+
+export type FloorCandidatePlanInput = Omit<FloorRecipePlanInput, 'specKind' | 'vulnClass'>
+
+/**
+ * Enumerate the confirmable candidates for a signaled probe: wired typed recipes first, then
+ * zero-jq typed runners. Replaces the deleted `deterministic-specs.ts` synthesizer; every emitted
+ * candidate is either a Track A2 Tier-1 recipe or a typed runner that never executes jq.
+ */
+export function planFloorCandidates(input: FloorCandidatePlanInput): FloorCandidate[] {
+  if (input.probe.verdict !== 'signal') return []
+  const anomalyPairs = anomalyCandidatePairs(input.probe)
+  const pairs = anomalyPairs.length > 0 ? anomalyPairs : probeClassCandidatePairs(input.hypothesis, input.probe)
+  const candidates: FloorCandidate[] = []
+  for (const pair of pairs) {
+    if (wiredRecipeForSpecKind(pair.specKind, pair.vulnClass)) {
+      const plan = planFloorRecipe({ ...input, specKind: pair.specKind, vulnClass: pair.vulnClass })
+      if (plan) candidates.push({ mode: 'recipe', plan })
+      continue
+    }
+    const specRecord = buildTypedRunnerCandidate(pair, input.hypothesis, input.probe)
+    if (specRecord) candidates.push({ mode: 'spec', specRecord })
+  }
+  return candidates
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2619,14 +2660,6 @@ function originHost(value: string | undefined): string {
   }
 }
 
-/** Route family: path only, lower-cased, trailing slash trimmed (query is compared separately). */
-export function routeKey(pathAndQuery: string | undefined): string {
-  if (!pathAndQuery) return ''
-  const pathOnly = pathAndQuery.split('?')[0].split('#')[0]
-  const collapsed = pathOnly.replace(/\/{2,}/g, '/').replace(/\/+$/, '')
-  return (collapsed || '/').toLowerCase()
-}
-
 interface HttpChainStepSnapshot {
   index: number
   id: string
@@ -2648,38 +2681,6 @@ interface HttpChainStepSnapshot {
 
 export function isSuccessStatus(status: number | null): boolean {
   return status !== null && status >= 200 && status < 300
-}
-
-export function snapshotHttpChainSteps(
-  spec: HttpChainSpec,
-  stepsOut: Record<string, unknown>,
-  stepExchanges: ReadonlyMap<string, BrokerExchangeResult[]>,
-): HttpChainStepSnapshot[] {
-  return spec.steps.map((step, index) => {
-    const entry = (stepsOut[step.id] ?? {}) as Record<string, unknown>
-    const exchange = stepExchanges.get(step.id)?.[0]
-    const body = typeof entry.body === 'string' ? entry.body : ''
-    const persona = step.request.persona ?? null
-    const session = step.request.session ?? null
-    return {
-      index,
-      id: step.id,
-      role: step.role,
-      method: step.request.method.toUpperCase(),
-      route: routeKey(exchange?.pathAndQuery ?? step.request.pathAndQuery),
-      pathAndQuery: exchange?.pathAndQuery ?? step.request.pathAndQuery,
-      actor: persona ? `persona:${persona}` : session ? `session:${session}` : 'anonymous',
-      status: typeof entry.status === 'number' ? entry.status : null,
-      body,
-      bodyBytes: typeof entry.bodyBytes === 'number' ? entry.bodyBytes : Buffer.byteLength(body, 'utf8'),
-      mediaType: typeof entry.mediaType === 'string' ? entry.mediaType : '',
-      json: entry.json ?? null,
-      ...(step.request.jsonBody !== undefined ? { requestJson: step.request.jsonBody } : {}),
-      ...(typeof step.request.textBody === 'string' ? { requestBody: step.request.textBody } : {}),
-      ...(step.request.headers ? { requestHeaders: step.request.headers } : {}),
-      secretMatches: exchange?.secretMatches?.length ?? 0,
-    }
-  })
 }
 
 export type HttpChainDifferential =
@@ -2724,7 +2725,8 @@ function detectHttpChainDifferential(
   }
 
   // 3. A declared response field carries a different value for the probe than for the control.
-  for (const ref of referencedJsonPaths(spec.assertionsJq)) {
+  const assertionsJq = spec.assertionsJq ?? ''
+  for (const ref of referencedJsonPaths(assertionsJq)) {
     const probe = probes.find(step => step.id === ref.stepId && isSuccessStatus(step.status))
     if (!probe) continue
     const probeValue = readJsonField(probe.json, ref.path)
@@ -2751,7 +2753,7 @@ function detectHttpChainDifferential(
   //    in the probe response.
   if (probes.some(step => isSuccessStatus(step.status) && step.secretMatches > 0)) return 'identifier_proof'
   const controlBodies = controls.map(step => step.body)
-  for (const literal of jqStringLiterals(spec.assertionsJq)) {
+  for (const literal of jqStringLiterals(assertionsJq)) {
     if (probes.some(step => step.body !== '' && step.body.includes(literal)) &&
         !controlBodies.some(body => body.includes(literal))) {
       return 'identifier_proof'
@@ -2771,7 +2773,7 @@ export function assessHttpChainProofStrength(
   spec: HttpChainSpec,
   snapshots: readonly HttpChainStepSnapshot[],
 ): HttpChainProofStrength {
-  const assertionEvidence = classifyHttpChainAssertion(spec.assertionsJq)
+  const assertionEvidence = classifyHttpChainAssertion(spec.assertionsJq ?? '')
   // Universal status-only ban: a bare 2xx -> 4xx/5xx divergence can never confirm ANY class. The
   // injection/authz/redirect oracles still run afterwards; this is a floor, not a substitute.
   if (assertionEvidence === 'status_only') {
@@ -2821,7 +2823,7 @@ export function assessHttpChainProofStrength(
   }
   // Canary / cryptographic proof is produced by the verifier itself (distinct control vs probe
   // tokens, non-destructive math), so it is already an identifier-bound execution differential.
-  if (/\.(?:canary|proof)\b/.test(spec.assertionsJq)) {
+  if (/\.(?:canary|proof)\b/.test(spec.assertionsJq ?? '')) {
     return {
       claim: 'authorization',
       assertionEvidence,
@@ -2855,100 +2857,6 @@ export function assessHttpChainProofStrength(
     differential,
     satisfied: true,
     reason: `Authorization differential proven: ${differential}.`,
-  }
-}
-
-export interface HttpChainEndpointBinding {
-  bound: boolean
-  verifiedEndpoint: { stepId: string; role: string; origin: string; method: string; pathAndQuery: string } | null
-  declaredEndpoint: { stepId: string; origin: string; method: string; pathAndQuery: string } | null
-  mismatches: Array<{ stepId: string; field: 'origin' | 'method' | 'redirectHost' | 'specOrigin'; declared: string; actual: string }>
-  reason: string
-}
-
-/**
- * Mechanical endpoint/method binding: the verified endpoint is the *actual* probe exchange, not the
- * spec's claim. Any disagreement between the declared step request and the wire exchange, a redirect
- * that leaves the declared host, or a primary probe step targeting a different origin than the
- * finding origin, invalidates the confirmation.
- */
-export function assessHttpChainEndpointBinding(
-  spec: HttpChainSpec,
-  stepRequests: ReadonlyMap<string, readonly BrokerHttpRequest[]>,
-  stepExchanges: ReadonlyMap<string, readonly BrokerExchangeResult[]>,
-): HttpChainEndpointBinding {
-  const mismatches: HttpChainEndpointBinding['mismatches'] = []
-  for (const step of spec.steps) {
-    const requests = stepRequests.get(step.id) ?? []
-    const exchanges = stepExchanges.get(step.id) ?? []
-    for (const [idx, exchange] of exchanges.entries()) {
-      const request = requests[Math.min(idx, Math.max(0, requests.length - 1))]
-      if (!request) continue
-      if (exchange.method.toUpperCase() !== request.method.toUpperCase()) {
-        mismatches.push({ stepId: step.id, field: 'method', declared: request.method.toUpperCase(), actual: exchange.method.toUpperCase() })
-      }
-      if (normalizeOriginValue(exchange.origin) !== normalizeOriginValue(request.origin)) {
-        mismatches.push({ stepId: step.id, field: 'origin', declared: normalizeOriginValue(request.origin), actual: normalizeOriginValue(exchange.origin) })
-      }
-    }
-  }
-
-  const primaryProbe = spec.steps.find(step => step.role === 'probe' && (stepExchanges.get(step.id)?.length ?? 0) > 0)
-  const primaryExchange = primaryProbe ? stepExchanges.get(primaryProbe.id)?.[0] : undefined
-  if (!primaryProbe || !primaryExchange) {
-    return {
-      bound: false,
-      verifiedEndpoint: null,
-      declaredEndpoint: null,
-      mismatches,
-      reason: 'No executed probe exchange is available to bind the finding endpoint.',
-    }
-  }
-
-  const declaredEndpoint = {
-    stepId: primaryProbe.id,
-    origin: normalizeOriginValue(primaryProbe.request.origin),
-    method: primaryProbe.request.method.toUpperCase(),
-    pathAndQuery: primaryProbe.request.pathAndQuery,
-  }
-  const verifiedEndpoint = {
-    stepId: primaryProbe.id,
-    role: primaryProbe.role,
-    origin: normalizeOriginValue(primaryExchange.origin),
-    method: primaryExchange.method.toUpperCase(),
-    pathAndQuery: primaryExchange.pathAndQuery,
-  }
-
-  if (normalizeOriginValue(spec.origin) !== declaredEndpoint.origin) {
-    mismatches.push({ stepId: primaryProbe.id, field: 'specOrigin', declared: declaredEndpoint.origin, actual: normalizeOriginValue(spec.origin) })
-  }
-  const declaredHost = originHost(primaryProbe.request.origin)
-  const finalHost = originHost(primaryExchange.finalOrigin)
-  if (declaredHost && finalHost && declaredHost !== finalHost) {
-    mismatches.push({ stepId: primaryProbe.id, field: 'redirectHost', declared: declaredHost, actual: finalHost })
-  }
-
-  if (mismatches.length > 0) {
-    const first = mismatches[0]
-    return {
-      bound: false,
-      verifiedEndpoint,
-      declaredEndpoint,
-      mismatches: mismatches.slice(0, 8),
-      reason: first.field === 'specOrigin'
-        ? `Finding origin ${normalizeOriginValue(spec.origin)} does not match the probe endpoint origin ${declaredEndpoint.origin} (step "${first.stepId}"); the verified exchange came from a different asset than the finding claims.`
-        : first.field === 'redirectHost'
-          ? `Probe step "${first.stepId}" redirected from ${first.declared} to ${first.actual}; the verified endpoint is not the declared asset.`
-          : `Probe step "${first.stepId}" ${first.field} mismatch: declared ${first.declared}, exchanged ${first.actual}.`,
-    }
-  }
-
-  return {
-    bound: true,
-    verifiedEndpoint,
-    declaredEndpoint,
-    mismatches: [],
-    reason: `Verified ${verifiedEndpoint.method} ${verifiedEndpoint.origin}${verifiedEndpoint.pathAndQuery} from step "${verifiedEndpoint.stepId}".`,
   }
 }
 
@@ -2998,10 +2906,6 @@ export function hasDestructiveContent(text: string): boolean {
     if (plusDecoded !== text && containsDestructivePayload(plusDecoded)) return true
   }
   return false
-}
-
-export function singleQuoteEscape(value: string): string {
-  return value.replaceAll("'", "'\\''")
 }
 
 export const RETIRED_LEGACY_SPEC_KINDS: ReadonlySet<string> = new Set([
@@ -3519,8 +3423,6 @@ export function applyReceiptGate(input: {
 export const RECEIPT_EXEMPT_HOST_SPEC_KINDS: ReadonlySet<DeclarativeReplaySpec['kind']> = new Set([
   'cache_differential',
   'auth_protocol_proof',
-  'upload_probe',
-  'ws_chain',
 ])
 
 export function isReceiptExemptHostSpec(

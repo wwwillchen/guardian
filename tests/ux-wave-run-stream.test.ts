@@ -379,7 +379,7 @@ test('A6: Board autocomplete drops non-wakeable handles, routes @coordinator/@al
 test('B5: RunBanners replaces duplicate budget form with Raise budget CTA and surfaces unresolved auth issues', () => {
   const { latestAuthIssue } = evalTsSlice<{
     latestAuthIssue: (events: readonly RunEvent[]) => RunEvent | null
-  }>(['src', 'components', 'run', 'shell.tsx'], 'export function latestAuthIssue(', 'function openHeaderBudgetPopover(')
+  }>(['src', 'components', 'run', 'shell.tsx'], 'export function latestAuthIssue(', 'export function budgetPausedCopy(')
 
   const fail1: RunEvent = { id: 10, runId: 'r1', kind: 'persona.auth_failed', message: 'Login failed', detail: { error: '401' }, createdAt: 1000 }
   const ok1: RunEvent = { id: 12, runId: 'r1', kind: 'persona.authenticated', message: 'Signed in', detail: { handle: 'user_a' }, createdAt: 1200 }
