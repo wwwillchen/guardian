@@ -138,15 +138,21 @@ describe('cut3f: floor recipe wiring', () => {
     assert.ok(recipeDispatch < retiredGate, 'recipe dispatch must run before retired-kind rejection')
   })
 
-  test('http_chain classes not yet flipped stay explicitly documented, never silently legacy', () => {
-    // Flipping these pairs changes the pinned no-fallback contract (v7-cut3a/cut3b) and the live
-    // engine's candidate routing. They remain on the legacy path with a named reason; the recipes
-    // themselves are executable for any spec that carries an envelope.
-    for (const vulnClass of ['mass_assignment', 'workflow_bypass', 'business_logic', 'csrf', 'info_disclosure', 'ssrf', 'xxe']) {
-      assert.equal(wiredRecipeForSpecKind('http_chain', vulnClass), null, `${vulnClass} must stay legacy in this cut`)
-      const row = LEGACY_UNWIRED_SPECKINDS.find(entry => entry.specKind === 'http_chain' && entry.vulnClasses.includes(vulnClass))
-      assert.ok(row, `${vulnClass} must have a documented legacy reason`)
-      assert.ok(row!.reason.length > 20)
+  test('Track D Cut 1: graduated http_chain classes are wired to Tier-1 recipes and LEGACY_UNWIRED_SPECKINDS is empty', () => {
+    assert.equal(LEGACY_UNWIRED_SPECKINDS.length, 0)
+    const expected: ReadonlyArray<readonly [string, string]> = [
+      ['mass_assignment', 'persisted_mutation'],
+      ['workflow_bypass', 'persisted_mutation'],
+      ['business_logic', 'persisted_mutation'],
+      ['price_tampering', 'persisted_mutation'],
+      ['csrf', 'persisted_mutation'],
+      ['info_disclosure', 'disclosure'],
+      ['ssrf', 'oob_callback'],
+      ['xxe', 'oob_callback'],
+      ['webhook_forgery', 'oob_callback'],
+    ]
+    for (const [vulnClass, recipe] of expected) {
+      assert.equal(wiredRecipeForSpecKind('http_chain', vulnClass), recipe, `${vulnClass} must be wired to ${recipe}`)
     }
   })
 })

@@ -280,6 +280,9 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
     ['http_chain', 'bola'],
     ['http_chain', 'bfla'],
     ['http_chain', 'cross_tenant_write'],
+    ['http_chain', 'mass_assignment'],
+    ['http_chain', 'info_disclosure'],
+    ['http_chain', 'xxe'],
     ['browser_chain', 'xss_reflected'],
   ] as const) {
     assert.equal(wiredRecipeForSpecKind(kind, vulnClass) !== null, true, `${kind} must be wired`)
@@ -296,7 +299,6 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
     ['http_chain', 'path_traversal'],
     ['http_chain', 'open_redirect'],
     ['http_chain', 'xss_reflected'],
-    ['http_chain', 'info_disclosure'],
     ['browser_chain', 'cors_client_side'],
     ['rce_proof', 'ssti'],
   ] as const) {
@@ -308,10 +310,9 @@ test('the no-fallback assertion throws for every wired pair and stays quiet for 
 test('unmapped families still synthesize legacy specs and never get a recipe plan', () => {
   const probe = booleanProbe()
   for (const [specKind, vulnClass] of [
-    ['http_chain', 'mass_assignment'],
-    ['http_chain', 'info_disclosure'],
-    ['http_chain', 'xxe'],
     ['http_chain', 'path_traversal'],
+    ['http_chain', 'open_redirect'],
+    ['rce_proof', 'ssti'],
   ] as const) {
     assert.equal(planFloorRecipe({
       hypothesis: booleanHypothesis(),
