@@ -551,3 +551,151 @@ export function projectRunFindings<T extends FindingsViewInputRow>(
     },
   }
 }
+
+// ---------------------------------------------------------------- triage-aware operator projection
+
+/**
+ * Operator-facing bucket for one projected finding. Every Findings tab, group tally, Queue
+ * reading view and Report triage line derives from this single mapping over `projectRunFindings`,
+ * so a tab total always equals the projection total. `needs_review` stays an unverified bucket
+ * (never `confirmed`); suppressed rows never reach an active severity bucket.
+ */
+export type FindingTriageBucket =
+  | 'confirmed' | 'static_verified' | 'needs_review' | 'pending' | 'inconclusive' | 'dismissed' | 'excluded' | 'suppressed'
+
+/** Active (non-suppressed) buckets in display order; `excluded` and `suppressed` fold into "More". */
+export const ACTIVE_TRIAGE_BUCKETS: readonly FindingTriageBucket[] = [
+  'confirmed', 'static_verified', 'needs_review', 'pending', 'inconclusive', 'dismissed', 'excluded',
+]
+
+/** Latest Verify Fix lifecycle for a finding, derived from retest runs + in-flight retest workers. */
+export type FindingFixState = 'none' | 'verifying' | 'verified_fixed' | 'still_reproducible'
+
+export interface FindingFixInfo {
+  state: FindingFixState
+  /** Timestamp of the latest retest verdict (null while verifying with no prior verdict, or never retested). */
+  at: number | null
+}
+
+export interface TriagedFindingRow<T extends FindingsViewInputRow = FindingsViewInputRow> {
+  item: ProjectedFindingItem<T>
+  finding: T
+  bucket: FindingTriageBucket
+  /** `severityOverride ?? severity`, normalized. */
+  effectiveSeverity: CanonicalSeverity
+  /** Machine-assigned severity before any operator override. */
+  machineSeverity: CanonicalSeverity
+  severityOverridden: boolean
+}
+
+export type TriageBucketCounts = Record<FindingTriageBucket, number> & { all: number }
+
+export interface TriagedFindingsProjection<T extends FindingsViewInputRow = FindingsViewInputRow> {
+  view: FindingsView<T>
+  /** Every projected row (active, excluded and suppressed), deduped exactly like the headline. */
+  rows: TriagedFindingRow<T>[]
+  /** Bucket totals; `all` counts every non-suppressed row. */
+  counts: TriageBucketCounts
+}
+
+export function findingTriageBucket(item: Pick<ProjectedFindingItem, 'disposition' | 'excludedReason' | 'finding'>): FindingTriageBucket {
+  if (item.excludedReason) return 'excluded'
+  if (item.disposition === 'suppressed') return 'suppressed'
+  if (item.disposition === 'confirmed') return 'confirmed'
+  if (item.disposition === 'advisory') return 'static_verified'
+  const s = item.finding.status
+  if (s === 'dismissed') return 'dismissed'
+  if (s === 'needs_review') return 'needs_review'
+  return s === 'pending' || s === 'proposed' ? 'pending' : 'inconclusive'
+}
+
+export function projectTriagedFindings<T extends FindingsViewInputRow>(
+  input: readonly T[],
+  ctx: FindingsScopeContext = {},
+): TriagedFindingsProjection<T> {
+  const view = projectRunFindings(input, ctx)
+  const counts: TriageBucketCounts = {
+    all: 0, confirmed: 0, static_verified: 0, needs_review: 0, pending: 0, inconclusive: 0, dismissed: 0, excluded: 0, suppressed: 0,
+  }
+  const rows = view.items.map(item => {
+    const bucket = findingTriageBucket(item)
+    counts[bucket]++
+    if (bucket !== 'suppressed') counts.all++
+    const machineSeverity = normalizeFindingSeverity(item.finding.severity)
+    return {
+      item,
+      finding: item.finding,
+      bucket,
+      effectiveSeverity: item.effectiveSeverity,
+      machineSeverity,
+      severityOverridden: item.effectiveSeverity !== machineSeverity,
+    }
+  })
+  return { view, rows, counts }
+}
+
+/** Minimal run shape for the operator scope context (mirrors `buildVerdict` in `components/run/model.ts`). */
+export interface RunScopeInput {
+  candidates?: ReadonlyArray<{ id: string; origin: string }> | null
+  approved?: readonly string[] | null
+  scopeRevision?: number | null
+  authOrigins?: readonly string[] | null
+  assetOrigins?: readonly string[] | null
+}
+
+/** Scope context identical to the headline verdict's, so Findings tabs agree with `buildVerdict`. */
+export function runFindingsScopeContext(run: RunScopeInput, facts: ReadonlyArray<{ id: string; tainted?: boolean | null }> = []): FindingsScopeContext {
+  const approvedSet = new Set(run.approved ?? [])
+  const approvedOrigins = (run.candidates ?? []).filter(c => approvedSet.has(c.id)).map(c => c.origin)
+  const hasScope = approvedOrigins.length > 0 || (run.scopeRevision ?? 0) > 0
+  const taintedFactIds = facts.filter(f => f.tainted).map(f => f.id)
+  return {
+    ...(hasScope
+      ? { approvedOrigins, approvedAssetIds: approvedSet, provenanceAllowedOrigins: [...(run.authOrigins ?? []), ...(run.assetOrigins ?? [])] }
+      : {}),
+    ...(taintedFactIds.length ? { taintedFactIds } : {}),
+  }
+}
+
+export interface FixStateSources {
+  retestRuns?: ReadonlyArray<{ findingId: string; verdict?: string | null; createdAt?: number | null } | null> | null
+  assignments?: ReadonlyArray<{ phase?: string | null; status?: string | null; stepId?: string | null; objective?: string | null } | null> | null
+  replaySpecs?: ReadonlyArray<{ id: string; findingId: string } | null> | null
+}
+
+const RETEST_FIX_STATE: Record<string, FindingFixState> = { fixed: 'verified_fixed', reproduced: 'still_reproducible' }
+
+/**
+ * Fix lifecycle for many findings at once: an in-flight retest worker reads `verifying`;
+ * otherwise the latest retest verdict decides (`fixed` / `reproduced`), and an inconclusive or
+ * missing retest reads `none`. Malformed rows are skipped, never thrown on.
+ */
+export function indexFindingFixStates(
+  findings: ReadonlyArray<{ id: string; replaySpecId?: string | null }>,
+  src: FixStateSources,
+): Map<string, FindingFixInfo> {
+  const latest = new Map<string, { verdict: string; at: number }>()
+  for (const r of src.retestRuns ?? []) {
+    if (!r || typeof r.findingId !== 'string') continue
+    const at = Number(r.createdAt) || 0
+    const prev = latest.get(r.findingId)
+    if (!prev || at >= prev.at) latest.set(r.findingId, { verdict: String(r.verdict ?? ''), at })
+  }
+  const active = (src.assignments ?? []).filter((a): a is NonNullable<typeof a> =>
+    Boolean(a && a.phase === 'retest' && (a.status === 'queued' || a.status === 'running')))
+  const specByFinding = new Map<string, string>()
+  for (const s of src.replaySpecs ?? []) if (s && typeof s.findingId === 'string') specByFinding.set(s.findingId, s.id)
+  // Objectives cite ids in free text: match whole id tokens so `f-1` never matches `f-12` (or "replay").
+  const tokens = active.map(a => new Set((a.objective ?? '').split(/[^A-Za-z0-9_:.-]+/).map(t => t.replace(/[.:]+$/, ''))))
+  const out = new Map<string, FindingFixInfo>()
+  for (const f of findings) {
+    const specId = f.replaySpecId ?? specByFinding.get(f.id)
+    const verifying = active.some((a, i) => a.stepId === f.id || tokens[i]!.has(f.id) || Boolean(specId && tokens[i]!.has(specId)))
+    const last = latest.get(f.id)
+    out.set(f.id, {
+      state: verifying ? 'verifying' : (last && RETEST_FIX_STATE[last.verdict]) || 'none',
+      at: last ? last.at || null : null,
+    })
+  }
+  return out
+}

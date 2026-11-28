@@ -1,15 +1,16 @@
 // Reading-view building blocks shared by the Queue inspector and the Finding
 // inspector (owned by Agent Q): exchange rows with the checked header,
 // coordinator context, cross-link blocks, and the per-kind reading views.
-import { useState } from 'react'
+import { lazy, Suspense, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
 import { formatExchangeAsCurl } from '../../curl-parser.ts'
+import { indexFindingFixStates, normalizeFindingSeverityOverride } from '../../../findings-view.ts'
 import { loadExchange, useFullExchange, useRun, useRunModel } from '../data.tsx'
 import { Disclosure, LinkRow, Section, Tag } from '../display.tsx'
 import { cap, capF, fmtDate, fmtN, fmtRel, fmtTime, fmtUsd, host, plural, prettyBody, words } from '../format.ts'
-import { CovSwatch, SevGlyph, StatusGlyph } from '../glyphs.tsx'
+import { CopyMorphIcon, CovSwatch, FixStatePill, SevGlyph, StatusGlyph, useCopyFlash } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import type { IconName } from '../icons.tsx'
 import { CHECK_HEADERS, COV_L, covCat, normFStatus, PHASE_LABEL, prettyCat, SEV_LABEL, stLabel } from '../meta.ts'
@@ -272,49 +273,54 @@ function evidenceFor(model: RunModel, it: FindingItem) {
 
 const obsText = (v: unknown) => v == null ? null : typeof v === 'string' ? v : JSON.stringify(v)
 
-/** Inline Copy-as-cURL button sourced from a finding's primary cited exchange. */
+/**
+ * The one cURL clipboard path (Finding footer, Queue, Exchanges drawer): sensitive request headers are
+ * masked before formatting, so a copied command never carries a live credential. Null when unavailable.
+ */
+export async function redactedCurlFor(runId: string, exchangeId: string, summary?: Exchange): Promise<string | null> {
+  const [full, { redactHeaders }] = await Promise.all([loadExchange(runId, exchangeId).catch(() => null), import('./proof-viewers.tsx')])
+  const ex = full ?? summary
+  if (!ex) return null
+  return formatExchangeAsCurl({
+    method: ex.method,
+    origin: ex.origin,
+    pathAndQuery: ex.pathAndQuery,
+    reqHeaders: full ? redactHeaders(full.reqHeaders) : undefined,
+    personaHandle: ex.personaHandle,
+  })
+}
+
+/** Inline Copy-as-cURL button sourced from a finding's primary cited exchange (in-button copy→check feedback). */
 export function CopyCurlButton({ exchangeId }: { exchangeId: string | undefined }) {
   const { detail } = useRun()
   const model = useRunModel()
   const toast = useToast()
-  const [busy, setBusy] = useState(false)
+  const [copied, flash] = useCopyFlash()
   if (!exchangeId) return null
-  const summary = model.exchangeById.get(exchangeId)
   const copy = async () => {
-    setBusy(true)
     try {
-      const full = await loadExchange(detail.run.id, exchangeId).catch(() => null)
-      const ex = full ?? summary
-      if (!ex) {
-        toast.show('Exchange details unavailable', { tone: 'error' })
-        return
-      }
-      const cmd = formatExchangeAsCurl({
-        method: ex.method,
-        origin: ex.origin,
-        pathAndQuery: ex.pathAndQuery,
-        reqHeaders: full?.reqHeaders,
-        personaHandle: ex.personaHandle,
-      })
+      const cmd = await redactedCurlFor(detail.run.id, exchangeId, model.exchangeById.get(exchangeId))
+      if (!cmd) { toast.show('Exchange details unavailable', { tone: 'error' }); return }
       await navigator.clipboard?.writeText(cmd)
-      toast.show('Copied as cURL', {
-        icon: 'check',
-        sub: full ? `${ex.method} ${host(ex.origin)}${ex.pathAndQuery}` : 'Request URL copied',
-      })
+      flash()
     } catch {
       toast.show('Could not copy to clipboard', { tone: 'error' })
-    } finally {
-      setBusy(false)
     }
   }
-  return <button type="button" className={runBtn()} disabled={busy} onClick={() => void copy()} title="Copy primary request as a sanitized cURL command">
-    <Icon name="copy" />{busy ? 'Copying…' : 'Copy as cURL'}
+  return <button type="button" className={runBtn()} onClick={() => void copy()} title="Copy primary request as a redacted cURL command">
+    <CopyMorphIcon copied={copied} />
+    <span className="grid"><span aria-hidden="true" className="invisible col-start-1 row-start-1">Copy as cURL</span><span className="col-start-1 row-start-1">{copied ? 'Copied' : 'Copy as cURL'}</span></span>
   </button>
 }
+
+const ChainProof = lazy(() => import('./proof-viewers.tsx').then(m => ({ default: m.ChainProof })))
 
 export function ReadFinding({ it }: { it: FindingItem }) {
   const model = useRunModel()
   const F = it.finding
+  const override = normalizeFindingSeverityOverride((F as { operatorTriage?: { severityOverride?: string | null } | null }).operatorTriage?.severityOverride)
+  const sev = override ?? it.sev
+  const fix = indexFindingFixStates([F], model.detail).get(F.id)?.state ?? 'none'
   const chain = F.findingKind === 'multi_step_chain'
   const checkId = F.check?.id ?? ''
   const hl = CHECK_HEADERS[checkId] ?? []
@@ -335,10 +341,12 @@ export function ReadFinding({ it }: { it: FindingItem }) {
   const obs = obsText(F.check?.observed)
   const replay = model.detail.replaySpecs.find(r => (F.replaySpecId && r.id === F.replaySpecId) || r.findingId === F.id)
   const replayInfraFailure = extractReplayInfraFailure(F, replay?.lastVerificationDiff)
+  const retests = model.detail.retestRuns.filter(r => r.findingId === F.id).sort((a, b) => b.createdAt - a.createdAt)
   const techCount = [ev.ids.length ? plural(ev.ids.length, 'exchange') : '', ws.length ? plural(ws.length, 'worker') : ''].filter(Boolean).join(' · ')
   return <>
     <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-fg-subtle">
-      <span className="inline-flex items-center gap-1.5 font-medium text-fg-muted"><SevGlyph sev={it.sev} />{SEV_LABEL[it.sev]}</span><span>·</span><VState status={it.status} /><span>·</span>
+      <span className="inline-flex items-center gap-1.5 font-medium text-fg-muted" title={override && override !== it.sev ? `Operator override; machine severity ${SEV_LABEL[it.sev] ?? it.sev}` : undefined}><SevGlyph sev={sev} />{SEV_LABEL[sev] ?? sev}</span><span>·</span><VState status={it.status} /><span>·</span>
+      {fix !== 'none' && <><FixStatePill state={fix} /><span>·</span></>}
       <span>{chain ? 'Multi-step chain' : 'Baseline check'}</span>
       {F.cwe && <><span>·</span><span className="font-mono text-[12px]">{F.cwe}</span></>}
     </div>
@@ -374,6 +382,7 @@ export function ReadFinding({ it }: { it: FindingItem }) {
       </div>}
     </Section>}
     {replayInfraFailure && <ReplayFailureCallout reason={replayInfraFailure} />}
+    {chain && replay && <Suspense fallback={null}><ChainProof replay={replay} retests={retests} compact /></Suspense>}
 
     {F.impact && <Section title="Why it matters">
       <p>{F.impact}</p>

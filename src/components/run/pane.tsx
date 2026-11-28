@@ -59,13 +59,17 @@ export function PaneHeader({ title, sub, extra }: { title: ReactNode; sub?: Reac
   </div>
 }
 
+/**
+ * Scrolling inspector body. The pane is a flex column (header · body · footer): the body alone
+ * scrolls (`min-h-0 flex-1`), so a `<PaneFooter>` after it stays pinned however long the content is.
+ */
 export function PaneBody({ children, className }: { children: ReactNode; className?: string }) {
   return <div className={cn('min-h-0 flex-1 overflow-auto', className)}>{children}</div>
 }
 
-/** Sticky action bar at the bottom of the pane. */
+/** Sticky action bar pinned to the bottom of the pane (never scrolls away with long bodies). */
 export function PaneFooter({ children, stamped }: { children: ReactNode; stamped?: ReactNode }) {
-  return <div className="relative flex min-h-12 flex-none items-center gap-1.5 border-t border-line bg-panel px-3 py-2.5">
+  return <div data-slot="pane-footer" className="sticky bottom-0 z-[2] flex min-h-12 shrink-0 items-center gap-1.5 border-t border-line bg-panel px-3 py-2.5">
     <div className={cn('flex min-w-0 flex-1 items-center gap-1.5 transition-opacity duration-[var(--d1)]', stamped && 'pointer-events-none opacity-0')}>
       {children}
     </div>

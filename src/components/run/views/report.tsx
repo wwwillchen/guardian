@@ -4,12 +4,12 @@
 // Verify Fix retest, verified patch generation), baseline checks by origin,
 // coverage by category, threat-model ranking, open proof gaps, patch
 // proposals, gaps and methodology. Evidence opens in the inspector.
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { downloadReportMarkdown, exportSarifAction, generatePatchAction } from '../../../actions.ts'
 import type { CapabilityTier, Finding as ReportFinding } from '../../../domain.ts'
-import { projectRunFindings } from '../../../findings-view.ts'
-import type { FindingsViewInputRow } from '../../../findings-view.ts'
+import { indexFindingFixStates, projectTriagedFindings } from '../../../findings-view.ts'
+import type { FindingsViewInputRow, TriageBucketCounts } from '../../../findings-view.ts'
 import {
   callerCompatibilityLabels, capabilityTierLabel, checkLabels, dynamicRetestLabels, findingVerificationTier,
   owaspCategoryTitles, owaspStatusLabels, patchStatusLabels, reportEvidenceSource, reportHighlights, reportPlanLabel,
@@ -20,7 +20,7 @@ import { Dropdown } from '../controls.tsx'
 import { useRun, useRunModel, useVerdict } from '../data.tsx'
 import { Disclosure, EmptyState, Tag } from '../display.tsx'
 import { fmtDate, fmtN, fmtUsd, host, plural, readRunUrlParam, syncRunUrlParam } from '../format.ts'
-import { CovSwatch, SevGlyph, StatusGlyph, TierBars } from '../glyphs.tsx'
+import { CovSwatch, FixStatePill, SevGlyph, StatusGlyph, TierBars } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { CATS, COV_L, FSTAT_ORDER, normFStatus, PHASE_LABEL, prettyCat, RISKL, SEV, SEV_COL, SEV_LABEL, SEV_ORDER, stLabel } from '../meta.ts'
 import type { RiskTier } from '../meta.ts'
@@ -35,6 +35,7 @@ import {
   canVerifyFix,
   CompositeProofDagCard,
   extractCompositeProofSummary,
+  LazyDagRail,
   PatchProposalReview,
 } from './findings-inspector.tsx'
 import type { CompositeDagSummary } from './findings-inspector.tsx'
@@ -70,6 +71,14 @@ const Tile = ({ l, v, s }: { l: string; v: ReactNode; s?: ReactNode }) => (
 )
 const Dl = ({ k, v, mono }: { k: string; v: ReactNode; mono?: boolean }) =>
   v ? <><dt>{k}</dt><dd className={mono ? MONO_12 : undefined}>{v}</dd></> : null
+
+/** Projection-backed triage tallies (same buckets as the Findings tabs): confirmed · needs review · dismissed · suppressed. */
+function TriageCounts({ counts }: { counts: TriageBucketCounts }) {
+  const parts: [keyof TriageBucketCounts, string][] = [['confirmed', 'confirmed'], ['needs_review', 'needs review'], ['dismissed', 'dismissed'], ['suppressed', 'suppressed']]
+  return <p data-slot="report-triage-counts" className="m-0 mt-1 text-[12px] leading-[19px] tabular-nums text-fg-subtle">
+    {parts.map(([k, l], i) => <Fragment key={k}>{i > 0 && ' · '}<span data-count={k}>{fmtN(counts[k])}</span> {l}</Fragment>)}
+  </p>
+}
 
 /** Safely coerce potentially null/object/malformed report fields into text so React never throws. */
 export function safeReportText(value: unknown, fallback = ''): string {
@@ -204,13 +213,15 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
     () => (latest && Array.isArray(detail.facts) ? detail.facts.filter(f => f.tainted).map(f => f.id) : []),
     [latest, detail.facts],
   )
-  const view = useMemo(
-    () => projectRunFindings(hydratedFindings, {
+  const triaged = useMemo(
+    () => projectTriagedFindings(hydratedFindings, {
       approvedOrigins: b.scope.map(a => a.origin),
       ...(taintedFactIds.length ? { taintedFactIds } : {}),
     }),
     [hydratedFindings, b.scope, taintedFactIds],
   )
+  const view = triaged.view
+  const fixById = useMemo(() => indexFindingFixStates(view.items.map(x => x.finding), detail), [view, detail])
   const projectedRows = useMemo(
     () => [...view.confirmed, ...view.advisories, ...view.unverified].sort(
       (x, y) => ((SEV_ORDER[x.effectiveSeverity] ?? 9) - (SEV_ORDER[y.effectiveSeverity] ?? 9))
@@ -287,9 +298,6 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
     }
     return out
   }, [fs, compositeByFinding])
-  const activeRetest = (Array.isArray(detail.assignments) ? detail.assignments : [])
-    .filter(a => a && a.phase === 'retest' && (a.status === 'queued' || a.status === 'running'))
-    .map(a => safeReportText(a.objective))
   const evidenceTitle = (id: string) => model.evidenceById.get(id)?.title ?? 'Evidence ' + id.slice(0, 8)
   const ev = (id: string) => { if (model.evidenceById.has(id)) links.evidence(id); else toast.show('This evidence isn’t in the run snapshot', { tone: 'error' }) }
   const modeMeta = capabilityTierMeta[b.capabilityTier as CapabilityTier]
@@ -407,6 +415,7 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
         covLine,
       ].filter(Boolean).join(' · ')}
     </p>
+    <TriageCounts counts={triaged.counts} />
 
     {priority && <div className={cn(CALLOUT, 'mb-3 mt-4 items-start')}>
       <Icon name="flag" className="mt-0.5 flex-none text-fg-muted" />
@@ -437,7 +446,9 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
         const rs = (f.replaySpecId ? replayById.get(f.replaySpecId) : undefined) ?? replayByFinding.get(f.id)
         const rk = rs?.spec && typeof rs.spec === 'object' ? REPLAY[String((rs.spec as Record<string, unknown>).kind)] : undefined
         const rt = retests.get(f.id)?.[0]
-        const queued = activeRetest.some(o => o.includes(f.id))
+        const fix = fixById.get(f.id)?.state ?? 'none'
+        const queued = fix === 'verifying'
+        const machineSev = safeReportText(f.severity)
         const canRetest = canVerifyFix(f)
         const canPatch = canGeneratePatch(f)
         const live = model.findingById.has(f.id)
@@ -449,10 +460,10 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
         const rtEvidenceIds = Array.isArray(rt?.evidenceIds) ? rt.evidenceIds.filter((x): x is string => typeof x === 'string') : []
         return <Fragment key={f.id}>
           <tr className={cn('scroll-mt-4', ROW_HOVER)} data-fid={f.id} onClick={() => setOpen(o => ({ ...o, [f.id]: !isOpen }))} aria-expanded={isOpen}>
-            <td className={cn(ROW_TOP, rowBorder)}><SevGlyph sev={sev} /></td>
+            <td className={cn(ROW_TOP, rowBorder)} title={machineSev && machineSev !== sev ? `${SEV_LABEL[sev] ?? sev} (operator override; machine severity ${SEV_LABEL[machineSev] ?? machineSev})` : SEV_LABEL[sev]}><SevGlyph sev={sev} /></td>
             <td className={cn(ROW_TOP, rowBorder)} title={stLabel(f.status)}><StatusGlyph status={st} /></td>
             <td className={cn('py-[7px] align-top [overflow-wrap:anywhere]', rowBorder)}>
-              <div className="text-fg">{f.title}</div>
+              <div className="flex min-w-0 items-center gap-2"><span className="min-w-0 text-fg">{f.title}</span>{fix !== 'none' && <FixStatePill state={fix} />}</div>
               <div className={cn(MONO_12, 'text-fg-subtle')}>{hOrU(f.origin)}{f.cwe ? ' · ' + safeReportText(f.cwe) : ''}{f.category ? ' · ' + prettyCat(f.category) : ''}{f.findingKind === 'multi_step_chain' ? ' · chain' : ''}</div>
             </td>
             <td className={cn('w-6 pb-[7px] pt-2.5 text-right align-top text-fg-faint', rowBorder)}>
@@ -483,7 +494,9 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
                 <Dl k={st === 'confirmed' || st === 'static_verified' ? 'Remediation' : 'Follow-up'} v={f.remediation} />
                 <Dl k="Check the fix" v={safeReportText(f.recheck)} />
               </dl>
-              {compositeByFinding.get(f.id) && <CompositeProofDagCard summary={compositeByFinding.get(f.id)!} compact />}
+              {compositeByFinding.get(f.id) && <CompositeProofDagCard summary={compositeByFinding.get(f.id)!} compact>
+                <Suspense fallback={null}><LazyDagRail summary={compositeByFinding.get(f.id)!} /></Suspense>
+              </CompositeProofDagCard>}
               {(tier || rk || f.confidence || f.confidenceRationale || f.counterevidence || f.runtimeProofGap || f.verification || (f.chainFactIds?.length ?? 0) > 0) && <Disclosure title="Verification details" right={rk ?? (tier ? verificationTierLabels[tier] : undefined)}>
                 <dl className={cn(DL, 'mb-0')}>
                   <Dl k="Verification" v={tier ? verificationTierLabels[tier] : ''} />
@@ -533,7 +546,9 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
     {compositeEntries.length > 0 && <>
       <h2 className={H2}>Multi-hop causal chains</h2>
       {compositeEntries.map(entry => (
-        <CompositeProofDagCard key={entry.summary.chainId} summary={entry.summary} title={entry.title} />
+        <CompositeProofDagCard key={entry.summary.chainId} summary={entry.summary} title={entry.title}>
+          <Suspense fallback={null}><LazyDagRail summary={entry.summary} /></Suspense>
+        </CompositeProofDagCard>
       ))}
     </>}
 

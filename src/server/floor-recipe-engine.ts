@@ -15,7 +15,7 @@
  * declarative-spec assertion. A wired pair must not fall back to `verifyReplaySpec`; the verifier
  * throws if it is called for one (`assertRecipeWiredKind`).
  */
-import { createHash, createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
 import { diffResponse } from '../../worker/analyzers.ts'
 import type { StateChangeApprovalContext } from './approval-judge.ts'
 import { baseFields } from './deterministic-specs.ts'
@@ -44,6 +44,8 @@ import type {
   BrowserSinkArgs,
   ConservedBalanceArgs,
   Cut3FloorRecipeArgs,
+  DisclosureArgs,
+  OobCallbackArgs,
   Cut3FloorRecipeArgsMap,
   Cut3FloorRecipeId,
   FloorActor,
@@ -64,10 +66,12 @@ import { HostFactLog } from './host-fact-log.ts'
 import { isPureJobOrHandleStubChain, proofReceiptMode } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
+import { evaluateUniversalPrimitive, resolveUniversalPrimitive } from './v8-oracle-families.ts'
+import type { HostSignedRecord, SignatureVerifier, UniversalEvidencePrimitive, UniversalPrimitiveDecision } from './v8-oracle-families.ts'
 import type { ProofReceiptMode, ReplayReceiptCheck, ReplayVerdict, ReplayVerificationResult, RetestVerdict } from './replay-verifier.ts'
 
 export { proofReceiptMode }
-import { cacheBusterValueRegex, containsDestructivePayload, extractCacheBusterParam, replayAssertionOutcomeSchema } from '../replay-spec.ts'
+import { cacheBusterValueRegex, containsDestructivePayload, extractCacheBusterParam } from '../replay-spec.ts'
 import type { AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
@@ -111,7 +115,7 @@ export async function executeFloorRecipeById(
     { kind: 'single_hop', receipt: exec.receipt },
     { strictHostDerivation: false },
   )
-  if (oracle.confirmed) return exec
+  if (oracle.confirmed) return applyTier1Gate(recipeId, args, exec)
   const verification: ReceiptVerification = oracle.singleHop ?? {
     confirmed: false,
     vulnClass: exec.receipt.vulnClass,
@@ -132,6 +136,105 @@ export async function executeFloorRecipeById(
 }
 
 /** The exact target a wired recipe confirmed; the record spec re-uses it. */
+// ---------------------------------------------------------------------------------------------
+// Track D Cut 1 — Track A2 Tier-1 universal primitive gate (receipt -> terminal oracle -> primitive)
+// ---------------------------------------------------------------------------------------------
+
+const TIER1_MUTATION_CLASSES: ReadonlySet<string> = new Set(['mass_assignment', 'workflow_bypass', 'business_logic', 'price_tampering', 'csrf'])
+type Tier1Rec = { role: string; record: HostSignedRecord }
+type Tier1Signer = { sign: (r: Omit<HostSignedRecord, 'hostSignature'>) => HostSignedRecord; verify: SignatureVerifier }
+
+/** Tier-1 primitive that must also confirm a recipe execution (null = the receipt rule alone gates it). */
+export function tier1PrimitiveForRecipe(recipeId: PersistedFloorRecipeId, vulnClass: string): UniversalEvidencePrimitive | null {
+  if (recipeId === 'disclosure') return 'access_differential'
+  if (recipeId === 'oob_callback') return 'oob_and_execution_witness'
+  return recipeId === 'persisted_mutation' && TIER1_MUTATION_CLASSES.has(vulnClass) ? 'state_delta_and_conservation' : null
+}
+
+const stableJson = (v: unknown): string => v === null || typeof v !== 'object' ? JSON.stringify(v) ?? 'null'
+  : Array.isArray(v) ? `[${v.map(stableJson).join(',')}]`
+    : `{${Object.entries(v as Record<string, unknown>).filter(([, x]) => x !== undefined).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, x]) => `${JSON.stringify(k)}:${stableJson(x)}`).join(',')}}`
+
+/** Per-evaluation host signer: every primitive input record is HMAC-bound to the host transcript and re-verified. */
+export function tier1HostSigner(): Tier1Signer {
+  const key = randomBytes(32), mac = (r: Omit<HostSignedRecord, 'hostSignature'>): Buffer => createHmac('sha256', key).update(stableJson(r)).digest()
+  return {
+    sign: r => ({ ...r, hostSignature: mac(r).toString('hex') }),
+    verify: ({ hostSignature, ...rest }) => /^[0-9a-f]{64}$/.test(hostSignature) && timingSafeEqual(Buffer.from(hostSignature, 'hex'), mac(rest)),
+  }
+}
+
+/** Host transcript entries as signed records; timestamps are the host transcript order (never worker-supplied). */
+export function tier1TranscriptRecords(transcript: ReceiptTranscript, signer: Tier1Signer): Tier1Rec[] {
+  return (transcript.entries ?? []).map((e, i) => ({
+    role: e.evidenceRole ?? e.step.evidenceRole ?? '',
+    record: signer.sign({ id: e.exchangeId, timestampMs: i + 1, status: e.step.status, method: e.step.method, route: e.step.route ?? e.step.pathAndQuery, pathAndQuery: e.step.pathAndQuery, actorId: e.step.actor.handle ?? null, tenantId: e.step.actor.tenant ?? null, body: e.step.body, json: e.step.json, requestHeaders: e.step.requestHeaders ?? null, responseHeaders: e.step.responseHeaders ?? null }),
+  }))
+}
+
+const roleRec = (recs: readonly Tier1Rec[], role: string): HostSignedRecord => recs.find(r => r.role === role)?.record as HostSignedRecord
+const isScalar = (v: unknown): v is string | number | boolean => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'
+function jsonHasField(node: unknown, key: string, value: string | number | boolean, depth = 0): boolean {
+  if (!node || typeof node !== 'object' || depth > 6) return false
+  if (Array.isArray(node)) return node.some(n => jsonHasField(n, key, value, depth + 1))
+  const rec = node as Record<string, unknown>
+  return (Object.hasOwn(rec, key) && isScalar(rec[key]) && String(rec[key]) === String(value)) || Object.values(rec).some(v => jsonHasField(v, key, value, depth + 1))
+}
+
+/** Field binding: a probe-only body value must be newly persisted, and no control-write-only value may appear. */
+export function mutationBindingError(args: Pick<PersistedMutationArgs, 'body' | 'baselineWrite'>, before: unknown, after: unknown): string | null {
+  const control = args.baselineWrite?.body ?? {}, newly = (k: string, v: unknown) => isScalar(v) && jsonHasField(after, k, v) && !jsonHasField(before, k, v)
+  if (Object.entries(control).some(([k, v]) => args.body[k] !== v && newly(k, v))) return 'control_write_value_leaked_into_readback'
+  return Object.entries(args.body).some(([k, v]) => control[k] !== v && newly(k, v)) ? null : 'probe_value_not_newly_persisted'
+}
+
+function tier1Decision(primitive: UniversalEvidencePrimitive, args: PersistedFloorRecipeArgs, transcript: ReceiptTranscript): UniversalPrimitiveDecision {
+  const signer = tier1HostSigner(), recs = tier1TranscriptRecords(transcript, signer), verifySignature = signer.verify
+  if (primitive === 'access_differential') {
+    const a = args as DisclosureArgs, control = roleRec(recs, 'denied_control'), variant = roleRec(recs, 'probe_request'), entitled = roleRec(recs, 'entitled_read')
+    if (control && !control.actorId) return { primitive, required: true, satisfied: false, reason: 'anonymous_denied_control' }
+    if ((a.owner.handle && a.probe.handle && a.owner.handle === a.probe.handle) || (entitled?.actorId && variant?.actorId && entitled.actorId === variant.actorId)) {
+      return { primitive, required: true, satisfied: false, reason: 'probe_reuses_entitled_owner_actor' }
+    }
+    const deniedRank = rolePrivilegeRank(a.denied?.role), probeRank = rolePrivilegeRank(a.probe.role)
+    const sameScope = (a.denied?.tenant && a.probe.tenant && a.denied.tenant === a.probe.tenant) || (!a.denied?.tenant && !a.probe.tenant) || (a.owner.tenant && a.probe.tenant && a.owner.tenant === a.probe.tenant)
+    if (sameScope && deniedRank !== null && probeRank !== null && deniedRank < probeRank) {
+      return { primitive, required: true, satisfied: false, reason: 'denied_control_lower_privilege_than_probe' }
+    }
+    return evaluateUniversalPrimitive(primitive, { control, variant, bindRoute: true, requireChronology: true, controlPrincipal: 'any', ownTenants: a.probe.tenant ? [a.probe.tenant] : [], verifySignature })
+  }
+  if (primitive === 'oob_and_execution_witness') {
+    const a = args as OobCallbackArgs, events = transcript.oobEvents ?? [], controlRec = recs.find(r => r.role === 'benign_control')?.record, triggerRec = roleRec(recs, 'injection_exchange')
+    const hit = events.find(e => e.token === a.token && e.delivered), ctl = a.controlToken ? events.find(e => e.token === a.controlToken && e.delivered) : undefined
+    if (hit && (typeof hit.receivedAtMs !== 'number' || !Number.isFinite(hit.receivedAtMs) || typeof hit.injectedAtMs !== 'number' || !Number.isFinite(hit.injectedAtMs))) {
+      return { primitive, required: true, satisfied: false, reason: 'missing_oob_host_timestamps' }
+    }
+    const resignTs = (r: HostSignedRecord | undefined, timestampMs: number): HostSignedRecord | undefined => {
+      if (!r) return undefined
+      const { hostSignature: _sig, ...rest } = r
+      return signer.sign({ ...rest, timestampMs })
+    }
+    const trigger = hit && triggerRec ? resignTs(triggerRec, hit.injectedAtMs!)! : triggerRec
+    const control = hit && controlRec ? resignTs(controlRec, hit.injectedAtMs! - 1) : controlRec
+    const witness = hit ? signer.sign({ id: hit.id, timestampMs: hit.receivedAtMs, status: 200, surface: 'webhook' }) : undefined
+    return evaluateUniversalPrimitive(primitive, { kind: 'oob_callback', trigger, witness: witness as HostSignedRecord, hostCanary: a.token, observedCanary: hit?.token ?? null, ...(control ? { control, controlObservedCanary: ctl ? a.token : null } : {}), verifySignature })
+  }
+  const a = args as PersistedMutationArgs, baselineReadback = roleRec(recs, 'baseline_read'), finalReadback = roleRec(recs, 'post_mutation_read')
+  const decision = evaluateUniversalPrimitive('state_delta_and_conservation', { baselineReadback, finalReadback, actions: recs.filter(r => r.role === 'mutation_probe').map(r => r.record), structuralOnly: true, verifySignature })
+  const bindErr = decision.satisfied ? mutationBindingError(a, baselineReadback.json, finalReadback.json) : null
+  return bindErr ? { ...decision, satisfied: false, reason: bindErr } : decision
+}
+
+/** Gate a receipt-confirmed execution through its Tier-1 primitive; a primitive denial is a fail-closed rejection. */
+export function applyTier1Gate(recipeId: PersistedFloorRecipeId, args: PersistedFloorRecipeArgs, exec: FloorRecipeExecution): FloorRecipeExecution {
+  const primitive = tier1PrimitiveForRecipe(recipeId, args.vulnClass)
+  if (!primitive || !exec.result.confirmed) return exec
+  const decision = tier1Decision(primitive, args, exec.result.transcript)
+  if (decision.satisfied) return { ...exec, primitive: decision }
+  const reason = `tier1_primitive_rejected: ${primitive} ${decision.reason}`
+  return { ...exec, primitive: decision, result: { ...exec.result, confirmed: false, verification: { ...exec.result.verification, confirmed: false, reason } }, failure: { code: 'receipt_rejected', message: reason, missingRoles: ['tier1_primitive'] } }
+}
+
 export interface FloorRecipePlan {
   recipeId: PersistedFloorRecipeId
   /** Legacy spec kind this plan replaces (used for attribution and the no-fallback assertion). */
@@ -649,6 +752,79 @@ function planBrowserRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   return { ...sketch, vulnClass: input.vulnClass || envelope.args.vulnClass, args: envelope.args }
 }
 
+type CandidateStepView = { role?: string; request?: { method?: string; pathAndQuery?: string; persona?: string; jsonBody?: unknown; textBody?: string; headers?: Record<string, string>; session?: string; csrfBind?: boolean } }
+const candidateStepsOf = (spec?: Record<string, unknown>): CandidateStepView[] => Array.isArray(spec?.steps) ? spec.steps as CandidateStepView[] : []
+const isPlainRecord = (v: unknown): v is Record<string, unknown> => Boolean(v && typeof v === 'object' && !Array.isArray(v))
+
+function planPersistedMutationRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
+  const hyp = input.hypothesis, sketch: FloorRecipePlan = { recipeId: 'persisted_mutation', specKind: input.specKind, vulnClass: input.vulnClass, endpoint: hyp.endpoint.pathTemplate, args: {} as FloorRecipeArgs }
+  const steps = candidateStepsOf(input.candidateSpec), probeStep = steps.find(s => s.role === 'probe')?.request
+  const ctrlWrite = steps.find(s => s.role === 'control' && s.request?.method && s.request.method.toUpperCase() !== 'GET')?.request
+  const readStep = steps.find(s => s.request?.method?.toUpperCase() === 'GET' && s.role !== 'setup')?.request
+  const primeStep = steps.find(s => s.role === 'setup' && s.request?.method?.toUpperCase() === 'GET')?.request
+  const body = isPlainRecord(probeStep?.jsonBody) ? probeStep.jsonBody : authzBodyOf(input)
+  if (!body || Object.keys(body).length === 0) return { ...sketch, skipReason: `${input.vulnClass} persisted_mutation requires a mutating JSON body` }
+  const id = resourceIdOf(input), realPath = probeStep?.pathAndQuery ?? (id ? fillResourceId(hyp.pathAndQuery, id) : hyp.pathAndQuery)
+  const readbackPath = readStep?.pathAndQuery ?? authzReadbackPath(input, id, false) ?? (hyp.method !== 'GET' ? realPath : null)
+  if (!readbackPath) return { ...sketch, skipReason: `${input.vulnClass} persisted_mutation requires a separate readback route` }
+  const actor = floorActorFor(probeStep?.persona ?? hyp.otherPersona ?? hyp.ownerPersona, input.personas)
+  const readbackActor = floorActorFor(readStep?.persona ?? hyp.readbackPersona ?? hyp.ownerPersona ?? hyp.otherPersona, input.personas)
+  const baselinePicked = isPlainRecord(ctrlWrite?.jsonBody) ? { body: ctrlWrite.jsonBody, actor: floorActorFor(ctrlWrite.persona ?? hyp.ownerPersona, input.personas), method: ctrlWrite.method ?? hyp.method, ...(ctrlWrite.csrfBind ? { csrfBind: true } : {}), restoreOriginal: true }
+    : (() => { const p = pickBaselineWrite(body); return p ? { body: p.baselineBody, actor: readbackActor, method: hyp.method, field: p.field, restoreOriginal: true } : undefined })()
+  const headers = { ...(hyp.headers ?? {}), ...(input.headers ?? {}) }
+  const session = probeStep?.session ?? ctrlWrite?.session
+  const args: PersistedMutationArgs = {
+    origin: hyp.endpoint.origin, method: probeStep?.method ?? hyp.method, pathAndQuery: realPath, vulnClass: input.vulnClass, actor, body,
+    baselineMethod: 'GET', baselinePathAndQuery: readbackPath, readbackMethod: 'GET', readbackPathAndQuery: readbackPath, readbackActor,
+    ...(baselinePicked ? { baselineWrite: baselinePicked } : {}), ...(session ? { session } : {}), ...(primeStep?.pathAndQuery ? { primePath: primeStep.pathAndQuery } : {}),
+    ...(probeStep?.headers ? { probeHeaders: probeStep.headers } : {}), ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  }
+  return { ...sketch, args, paramLocation: 'json' }
+}
+
+function planDisclosureRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
+  const hyp = input.hypothesis, sketch: FloorRecipePlan = { recipeId: 'disclosure', specKind: input.specKind, vulnClass: input.vulnClass, endpoint: hyp.endpoint.pathTemplate, args: {} as FloorRecipeArgs }
+  const ownerHandle = hyp.ownerPersona, probeHandle = hyp.otherPersona
+  if (!ownerHandle || !probeHandle || ownerHandle === probeHandle) return { ...sketch, skipReason: 'disclosure requires distinct authenticated owner and probe personas' }
+  const owner = floorActorFor(ownerHandle, input.personas), probe = floorActorFor(probeHandle, input.personas)
+  const probeRank = rolePrivilegeRank(probe.role)
+  const peerAllowed = (peer: FloorActor): boolean => {
+    const rank = rolePrivilegeRank(peer.role)
+    const sameScope = (peer.tenant && probe.tenant && peer.tenant === probe.tenant) || (!peer.tenant && !probe.tenant) || (owner.tenant && probe.tenant && owner.tenant === probe.tenant)
+    return !(sameScope && rank !== null && probeRank !== null && rank < probeRank)
+  }
+  const peers = input.personas.filter(p => p.handle !== owner.handle && p.handle !== probe.handle).map(p => floorActorFor(p.handle, input.personas)).filter(peerAllowed)
+  const lower = selectLowerRoleDeniedPeer(owner, probe, input.personas)
+  const denied = (lower && peerAllowed(lower) ? lower : undefined) ?? peers[0]
+  if (!denied || denied.handle === ANONYMOUS_HANDLE) return { ...sketch, skipReason: 'disclosure requires an authenticated non-lower-role peer persona for the denied control arm' }
+  const id = resourceIdOf(input), realPath = id ? fillResourceId(hyp.pathAndQuery, id) : hyp.pathAndQuery
+  const headers = { ...(hyp.headers ?? {}), ...(input.headers ?? {}) }
+  const args: DisclosureArgs = {
+    origin: hyp.endpoint.origin, method: hyp.method || 'GET', pathAndQuery: realPath, vulnClass: input.vulnClass,
+    owner, probe, denied, ...(hyp.readbackPath ? { baselinePathAndQuery: hyp.readbackPath } : {}), ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  }
+  return { ...sketch, args, paramLocation: 'path' }
+}
+
+function planOobCallbackRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
+  const hyp = input.hypothesis, sketch: FloorRecipePlan = { recipeId: 'oob_callback', specKind: input.specKind, vulnClass: input.vulnClass, endpoint: hyp.endpoint.pathTemplate, args: {} as FloorRecipeArgs }
+  const steps = candidateStepsOf(input.candidateSpec), probeStep = steps.find(s => s.role === 'probe')?.request, ctrlStep = steps.find(s => s.role === 'control')?.request
+  const hit = input.probe.anomalies.find(a => typeof (a.canaryToken ?? a.token ?? a.canaryId) === 'string')
+  const token = String(hit?.canaryToken ?? hit?.token ?? hit?.canaryId ?? '').trim()
+  if (token.length < 8) return { ...sketch, skipReason: `${input.vulnClass} oob_callback requires a host-minted canary token` }
+  const controlToken = typeof hit?.controlToken === 'string' && hit.controlToken.trim().length >= 8 ? hit.controlToken.trim() : undefined
+  if (!controlToken) return { ...sketch, skipReason: `${input.vulnClass} oob_callback requires a benign control canary token` }
+  const actor = floorActorFor(probeStep?.persona ?? hyp.ownerPersona, input.personas)
+  const headers = { ...(hyp.headers ?? {}), ...(input.headers ?? {}) }
+  const args: OobCallbackArgs = {
+    origin: hyp.endpoint.origin, method: probeStep?.method ?? hyp.method, pathAndQuery: probeStep?.pathAndQuery ?? hyp.pathAndQuery, vulnClass: input.vulnClass, token, actor,
+    ...(probeStep?.jsonBody !== undefined ? { injectJsonBody: probeStep.jsonBody } : {}), ...(probeStep?.textBody !== undefined ? { injectTextBody: probeStep.textBody } : {}), ...(probeStep?.headers ? { injectHeaders: probeStep.headers } : {}),
+    controlToken, ...(ctrlStep?.pathAndQuery ? { controlPathAndQuery: ctrlStep.pathAndQuery } : {}), ...(ctrlStep?.jsonBody !== undefined ? { controlJsonBody: ctrlStep.jsonBody } : {}), ...(ctrlStep?.textBody !== undefined ? { controlTextBody: ctrlStep.textBody } : {}), ...(ctrlStep?.headers ? { controlHeaders: ctrlStep.headers } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  }
+  return { ...sketch, args }
+}
+
 export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | null {
   const recipe = wiredRecipeForSpecKind(input.specKind, input.vulnClass)
   if (!recipe) return null
@@ -657,8 +833,10 @@ export function planFloorRecipe(input: FloorRecipePlanInput): FloorRecipePlan | 
     case 'race_burst':
     case 'conserved_balance': return planRaceRecipe(input)
     case 'browser_sink': return planBrowserRecipe(input)
-    case 'access_boundary':
-    case 'persisted_mutation': return planAuthzRecipe(input)
+    case 'access_boundary': return planAuthzRecipe(input)
+    case 'persisted_mutation': return TIER1_MUTATION_CLASSES.has(input.vulnClass) ? planPersistedMutationRecipe(input) : planAuthzRecipe(input)
+    case 'disclosure': return planDisclosureRecipe(input)
+    case 'oob_callback': return planOobCallbackRecipe(input)
     default: return {
       recipeId: recipe,
       specKind: input.specKind,
@@ -750,6 +928,33 @@ export function browserSessionSeam(input: {
   }
 }
 
+const parseCanaryHitMs = (hit: { timestamp?: unknown }): number => typeof hit.timestamp === 'number' ? hit.timestamp : Date.parse(String(hit.timestamp ?? ''))
+
+function replaceTokenDeep<T>(value: T, from: string, to: string): T {
+  if (!from || from === to) return value
+  if (typeof value === 'string') return value.replaceAll(from, to) as T
+  if (Array.isArray(value)) return value.map(item => replaceTokenDeep(item, from, to)) as T
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, replaceTokenDeep(v, from, to)])) as T
+  return value
+}
+
+/** Host canary relay seam for `oob_callback` floor recipes (never reads HTTP response reflection or stale pre-injection hits). */
+export function oobCanarySeam(input: { canaryBroker: Pick<CanaryBroker, 'checkCanary'>; origin: string; signal?: AbortSignal; storage?: Store; runId?: string; injectedAtMs?: number }): NonNullable<FloorRecipeDeps['oob']> {
+  const seamCreatedAtMs = Date.now()
+  return async ({ token, injectedAtMs }) => {
+    input.signal?.throwIfAborted()
+    const opts = input.storage || input.runId ? { ...(input.storage ? { storage: input.storage } : {}), ...(input.runId ? { runId: input.runId } : {}) } : undefined
+    const check = input.canaryBroker.checkCanary(token, opts)
+    if (!check?.triggered) return null
+    const minTs = injectedAtMs ?? input.injectedAtMs ?? seamCreatedAtMs
+    const hits = Array.isArray(check.hits) ? check.hits : []
+    const qualifying = hits.map(parseCanaryHitMs).filter(ts => Number.isFinite(ts) && ts >= minTs)
+    if (qualifying.length === 0) return null
+    const receivedAtMs = Math.min(...qualifying)
+    return { id: `oob-${token.slice(0, 12)}`, callbackId: `oob:${token.slice(0, 16)}`, token, targetOrigin: input.origin, delivered: true, stage: 'immediate', receivedAtMs, injectedAtMs: minTs }
+  }
+}
+
 export interface RunPlannedRecipeInput {
   plan: FloorRecipePlan
   hypothesis: EngineHypothesis
@@ -761,6 +966,10 @@ export interface RunPlannedRecipeInput {
   headers?: Record<string, string>
   /** Scoped browser used by browser recipes; omitted by callers that never plan one. */
   browser?: ScopedBrowser
+  /** Host canary relay used by `oob_callback` recipes. */
+  canaryBroker?: CanaryBroker
+  storage?: Store
+  oob?: FloorRecipeDeps['oob']
   recordExchange?: (exchange: BrokerExchangeResult) => string | void
 }
 
@@ -771,15 +980,30 @@ export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<Fl
     input.grant.audit('denied', input.plan.args.origin || input.hypothesis.endpoint.origin)
     throw new BrokerDenied('Timing differential recipes require Tier 3 verification scope.')
   }
+  const targetOrigin = input.plan.args.origin || input.hypothesis.endpoint.origin
+  const runId = (input.runId ?? '').trim() || `floor_ephemeral_${randomUUID()}`
+  let args = input.plan.args
+  if (input.plan.recipeId === 'oob_callback' && input.canaryBroker && !input.oob && typeof input.canaryBroker.mintCanary === 'function') {
+    const oobArgs = args as OobCallbackArgs
+    const freshProbe = input.canaryBroker.mintCanary(runId, `floor_oob_probe:${input.plan.vulnClass}`, undefined, { ...(input.storage ? { storage: input.storage } : {}), ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}) })
+    let updated = replaceTokenDeep(oobArgs, oobArgs.token, freshProbe.token)
+    if (oobArgs.controlToken) {
+      const freshCtrl = input.canaryBroker.mintCanary(runId, `floor_oob_control:${input.plan.vulnClass}`, undefined, { ...(input.storage ? { storage: input.storage } : {}), ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}) })
+      updated = replaceTokenDeep(updated, oobArgs.controlToken, freshCtrl.token)
+    }
+    args = updated
+  }
+  const oob = input.oob ?? (input.plan.recipeId === 'oob_callback' && input.canaryBroker ? oobCanarySeam({ canaryBroker: input.canaryBroker, origin: targetOrigin, signal: input.signal, ...(input.storage ? { storage: input.storage } : {}), runId }) : undefined)
   const deps = brokerFloorRecipeDeps({
     broker: input.broker,
     grant: input.grant,
     signal: input.signal,
-    origin: input.plan.args.origin || input.hypothesis.endpoint.origin,
+    origin: targetOrigin,
     probeClass: input.hypothesis.probeClass,
-    runId: (input.runId ?? '').trim() || `floor_ephemeral_${randomUUID()}`,
+    runId,
     ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
     ...(input.headers ? { headers: input.headers } : {}),
+    ...(oob ? { oob } : {}),
     ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
   })
   const browser = input.browser ?? new ScopedBrowser(input.broker)
@@ -797,7 +1021,7 @@ export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<Fl
         }),
       }
     : deps
-  return executeFloorRecipeById(input.plan.recipeId, input.plan.args, withBrowser)
+  return executeFloorRecipeById(input.plan.recipeId, args, withBrowser)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -872,120 +1096,12 @@ const TITLE_BY_RECIPE: Readonly<Record<PersistedFloorRecipeId, string>> = {
   conserved_balance: 'Conserved-balance concurrency violation',
 }
 
-const is2xxJq = (id: string) => `(.steps.${id}.status >= 200 and .steps.${id}.status < 300)`
-const isDeniedJq = (id: string) =>
-  `(.steps.${id}.status == 401 or .steps.${id}.status == 403 or .steps.${id}.status == 404)`
-
 /**
- * Replay assertion for a receipt-confirmed spec. This is the *retest* re-check of an already
- * persisted proof (reproduced vs fixed), not the confirmation path: it restates the receipt's
- * structural precondition over the recorded steps so a hardened fixture cannot replay as reproduced.
+ * Fail-closed attribution assertion stamped on every recipe record (Track D Cut 1). The recipe
+ * envelope owns confirmation and retest (receipt + Tier-1 primitive): no jq program is synthesized
+ * on the floor path, and a record whose envelope is stripped can never confirm through the DSL.
  */
-function retestAssertion(recipe: PersistedFloorRecipeId, steps: readonly { id: string; role: string; description?: string }[], args?: PersistedFloorRecipeArgs): string {
-  // Evidence roles (`entitled_read`, `baseline_read`, ...) are carried in the step description: the
-  // persisted http_chain schema only allows arm roles. Match the description first so a replay
-  // assertion never silently references a step it does not have.
-  const ids = (role: string) => steps
-    .filter(step => step.description === role || (step.description === undefined && step.role === role))
-    .map(step => step.id)
-  const first = (role: string) => ids(role)[0] ?? null
-  const all = (predicate: (id: string) => string) => {
-    const parts = steps.map(step => predicate(step.id))
-    return parts.length > 0 ? `(${parts.join(' and ')})` : 'true'
-  }
-  switch (recipe) {
-    case 'access_boundary': {
-      const entitled = first('entitled_read') ?? first('probe_baseline')
-      const denied = first('denied_control')
-      const probe = first('probe_request')
-      // A collection-reference negative control is selective through a different 2xx body, not a
-      // denial; the retest must assert the same predicate the proof used.
-      const distinctControl = (args as AccessBoundaryArgs | undefined)?.controlEvidence === 'denial_or_distinct'
-      const deniedJq = denied
-        ? distinctControl && entitled
-          ? `(${is2xxJq(denied)} and (.steps.${denied}.body != .steps.${entitled}.body))`
-          : isDeniedJq(denied)
-        : 'true'
-      const confirmed = [probe, denied].filter((id): id is string => Boolean(id))
-      return `{ controlPassed: (${entitled ? is2xxJq(entitled) : 'true'}), `
-        + `confirmed: (${confirmed.length ? confirmed.map(id => (id === denied ? deniedJq : is2xxJq(id))).join(' and ') : 'true'}), `
-        + 'observed: "recipe replay: boundary arms re-observed", expected: "the denied control is refused while the probe is served" }'
-    }
-    case 'disclosure': {
-      const probe = first('probe_request')
-      const denied = first('denied_control')
-      const confirmed = [probe, denied].filter((id): id is string => Boolean(id))
-      return `{ controlPassed: (${first('probe_baseline') ? is2xxJq(first('probe_baseline')!) : 'true'}), `
-        + `confirmed: (${confirmed.length ? confirmed.map(id => (id === denied ? isDeniedJq(id) : is2xxJq(id))).join(' and ') : 'true'}), `
-        + 'observed: "recipe replay: disclosure arms re-observed", expected: "a peer is denied while the probe reads owner-scoped data" }'
-    }
-    case 'persisted_mutation': {
-      const baseline = first('baseline_read')
-      const probe = first('mutation_probe')
-      const after = first('post_mutation_read')
-      const reset = first('state_reset')
-      const baselineWrite = first('baseline_write')
-      const diff = baseline && after ? `(.steps.${after}.body != .steps.${baseline}.body)` : 'true'
-      const controls = [baseline, reset, baselineWrite].filter((id): id is string => Boolean(id))
-      return `{ controlPassed: (${controls.length ? controls.map(is2xxJq).join(' and ') : 'true'}), `
-        + `confirmed: (${probe ? is2xxJq(probe) : 'true'} and ${diff}), `
-        + 'observed: "recipe replay: mutation and readback re-observed", expected: "the readback shows no persisted change" }'
-    }
-    case 'boolean_or_timing': {
-      const controls = ids('boolean_control')
-      const probes = ids('boolean_probe')
-      const pairs = probes.map((probe, index) => {
-        const control = controls[index] ?? controls[0]
-        return control ? `(.steps.${probe}.body != .steps.${control}.body)` : 'true'
-      })
-      return `{ controlPassed: (${all(is2xxJq)}), `
-        + `confirmed: (${all(is2xxJq)} and (${pairs.length ? pairs.join(' and ') : 'true'})), `
-        + 'observed: "recipe replay: paired boolean rounds re-observed", expected: "the boolean predicate separates every pair" }'
-    }
-    case 'race_burst':
-    case 'conserved_balance': {
-      const burst = steps.filter(step => (step.description ?? step.role).startsWith('burst_')).map(step => step.id)
-      const successes = burst.length >= 2
-        ? burst.map(id => is2xxJq(id)).slice(0, 2).join(' and ')
-        : 'true'
-      const baseline = first('baseline_read')
-      const post = first('post_read')
-      if (recipe === 'conserved_balance') {
-        const readOk = [baseline, post].filter((id): id is string => Boolean(id)).map(is2xxJq).join(' and ') || 'true'
-        return `{ controlPassed: (${readOk}), `
-          + `confirmed: ((${readOk}) and (${successes})), `
-          + 'observed: "recipe replay: conserved-balance burst re-observed", expected: "concurrent mutations preserve conservation identically to serial execution" }'
-      }
-      const divergence = burst.slice(1)
-        .map((id, index) => `(.steps.${id}.body != .steps.${burst[index]}.body)`)
-        .join(' or ') || 'true'
-      return `{ controlPassed: true, `
-        + `confirmed: ((${successes}) and (${divergence})), `
-        + 'observed: "recipe replay: burst re-observed", expected: "a repeated terminal transition never produces divergent outcomes" }'
-    }
-    case 'redirect': {
-      const probe = first('redirect_probe')
-      const control = first('same_origin_control')
-      const is3xx = (id: string) => `(.steps.${id}.status >= 300 and .steps.${id}.status < 400)`
-      return `{ controlPassed: (${control ? `(.steps.${control}.status >= 200 and .steps.${control}.status < 400)` : 'true'}), `
-        + `confirmed: (${probe ? is3xx(probe) : 'true'}), `
-        + 'observed: "recipe replay: off-origin redirect re-observed", expected: "redirect stays on origin" }'
-    }
-    case 'browser_sink': {
-      return '{ controlPassed: true, confirmed: true, observed: "recipe replay: browser sink re-observed", expected: "no untrusted browser sink execution" }'
-    }
-    case 'injection_fingerprint': {
-      const control = first('benign_control')
-      const probe = first('injection_probe')
-      const diff = control && probe ? `(.steps.${probe}.body != .steps.${control}.body)` : 'true'
-      return `{ controlPassed: (${control ? is2xxJq(control) : 'true'}), `
-        + `confirmed: (${diff}), `
-        + 'observed: "recipe replay: injection fingerprint re-observed", expected: "no parser/engine error fingerprint on probe" }'
-    }
-    default:
-      return '{ controlPassed: true, confirmed: true, observed: "recipe replay", expected: "recipe evidence reproduced" }'
-  }
-}
+export const TYPED_RECIPE_ASSERTION = '{ controlPassed: false, confirmed: false, observed: "typed floor recipe: verdict owned by the recipe envelope", expected: "Tier-1 primitive and ProofReceipt verdict" }'
 
 function recordSteps(
   origin: string,
@@ -1021,8 +1137,7 @@ function recordSpecFor(
   const cwe = CWE_BY_CLASS[plan.vulnClass] ?? 'CWE-639'
   const title = TITLE_BY_RECIPE[plan.recipeId]
   const steps = recordSteps(origin, execution)
-  const jq = retestAssertion(plan.recipeId, steps, plan.args)
-  const base = baseFields(origin, title, cwe, plan.vulnClass, severity, jq)
+  const base = baseFields(origin, title, cwe, plan.vulnClass, severity, TYPED_RECIPE_ASSERTION)
   if (plan.specKind === 'sql_boolean_diff') {
     const args = plan.args as BooleanOrTimingArgs
     return {
@@ -1254,6 +1369,9 @@ function recipeResult(
     replayedAt: null,
     confirmation: 'proof_receipt',
     recipe: plan.recipeId,
+    tier1Primitive: execution.primitive
+      ? { primitive: execution.primitive.primitive, subRule: execution.primitive.subRule, satisfied: execution.primitive.satisfied, reason: execution.primitive.reason }
+      : { primitive: resolveUniversalPrimitive(plan.vulnClass), satisfied: confirmed, rule: verification.rule },
     receipt: execution.receipt,
     verification,
     ...(burstResults && burstResults.length > 0 ? { burst: { results: burstResults } } : {}),
@@ -1562,9 +1680,30 @@ export async function runStaticAstProofRecipe(
   }
 }
 
+/** Shared runner verdict projection (confirmed results carry the runtime tier). */
+function runnerResult(verdict: ReplayVerdict, outcome: ReplayVerificationResult['outcome'], exchanges: BrokerExchangeResult[], exchangeIds: string[], evidencePayload: Record<string, unknown>, evidenceSha256: string, extra: Partial<ReplayVerificationResult> = {}): ReplayVerificationResult {
+  return { verdict, ...(verdict === 'confirmed' ? { verificationTier: 'runtime_confirmed' as const } : {}), outcome, exchangeIds, exchanges, evidencePayload, evidenceSha256, ...extra }
+}
+
+const jsonOfExchange = (ex: BrokerExchangeResult): unknown => { if (!ex.mediaType.includes('json')) return undefined; try { return JSON.parse(ex.body) } catch { return undefined } }
+/** Host-signed Tier-1 record for a runner exchange; the timestamp is the host call order. */
+function exchangeRecord(signer: Tier1Signer, id: string, ordinal: number, ex: BrokerExchangeResult, artifactDigest?: string): HostSignedRecord {
+  return signer.sign({ id, timestampMs: ordinal, status: ex.status, method: ex.method.toUpperCase(), route: ex.pathAndQuery.split('?')[0] || '/', pathAndQuery: ex.pathAndQuery, actorId: ex.personaHandle, body: ex.body, json: jsonOfExchange(ex), requestHeaders: ex.reqHeaders, responseHeaders: ex.respHeaders, ...(artifactDigest ? { artifactDigest } : {}) })
+}
+
+/** rce_proof Tier-1 verdict: host-evaluated expression (math/split) or OOB canary witness, with the benign control. */
+export function rceWitnessDecision(input: { controlEx: BrokerExchangeResult; probeEx: BrokerExchangeResult; controlId: string; probeId: string; hostCanary: string; expected?: string; oob?: { triggered: boolean; controlTriggered: boolean; token: string } }): UniversalPrimitiveDecision {
+  const signer = tier1HostSigner(), control = exchangeRecord(signer, input.controlId, 1, input.controlEx), trigger = exchangeRecord(signer, input.probeId, 2, input.probeEx), oob = input.oob
+  if (oob) {
+    const witness = oob.triggered ? signer.sign({ id: `${input.probeId}:oob`, timestampMs: 3, status: 200, surface: 'webhook' }) : undefined
+    return evaluateUniversalPrimitive('oob_and_execution_witness', { kind: 'oob_callback', trigger, witness: witness as HostSignedRecord, hostCanary: oob.token, observedCanary: oob.triggered ? oob.token : null, control, controlObservedCanary: oob.controlTriggered ? oob.token : null, verifySignature: signer.verify })
+  }
+  return evaluateUniversalPrimitive('oob_and_execution_witness', { kind: 'host_evaluated_expression', trigger, witness: trigger, hostCanary: input.hostCanary, ...(input.expected ? { expectedValue: input.expected } : {}), control, verifySignature: signer.verify })
+}
+
 /**
  * Cut 3e typed runner for `rce_proof` (zero-jq; Tier-3 + HITL gate, non-reflectable math/split_echo,
- * and ProofReceipt-verified OOB callbacks).
+ * and ProofReceipt-verified OOB callbacks), gated by the Tier-1 execution witness.
  */
 export async function runRceProofRecipe(
   spec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' }>,
@@ -1609,6 +1748,7 @@ export async function runRceProofRecipe(
   let probeCanaryToken: string | undefined
   let expectedNonceProduct: string | undefined
   let expectedSplitAssembled: string | undefined
+  let hostCanary = '', oobWitness: { triggered: boolean; controlTriggered: boolean; token: string } | undefined
 
   try {
     if (spec.proofMode === 'dynamic_math') {
@@ -1620,6 +1760,7 @@ export async function runRceProofRecipe(
       proofMeta.nonceA = a
       proofMeta.nonceB = b
       proofMeta.expectedProduct = expectedNonceProduct
+      hostCanary = `kovo-rce-math-${a}-${b}`
     } else if (spec.proofMode === 'split_echo') {
       const part1 = runnerAlphaToken(7)
       const part2 = runnerAlphaToken(7)
@@ -1627,6 +1768,7 @@ export async function runRceProofRecipe(
       probeVars.nonce_part1 = part1
       probeVars.nonce_part2 = part2
       proofMeta.expectedAssembled = expectedSplitAssembled
+      hostCanary = `kovo-rce-split-${part1}-${part2}`
     } else {
       canarySession = await openCanarySession(ctx.canaryBroker, ctx.storage, ctx.runId, ctx.assignmentId, spec.origin)
       const controlCanary = canarySession.mint(`rce_proof:control:${spec.title}`)
@@ -1655,7 +1797,7 @@ export async function runRceProofRecipe(
     }
 
     const controlEx = await ctx.broker.executeHttp(controlReq, ctx.grant, ctx.signal)
-    recordExchange(controlEx)
+    const controlExchangeId = recordExchange(controlEx)
     const injectedAtMs = Date.now()
     const probeEx = await ctx.broker.executeHttp(probeReq, ctx.grant, ctx.signal)
     const probeExchangeId = recordExchange(probeEx)
@@ -1708,9 +1850,13 @@ export async function runRceProofRecipe(
         injectedAtMs,
       })
       deterministicProofPassed = probeWait.triggered && !controlCheck.triggered && receiptCheck.verification.confirmed
+      oobWitness = { triggered: probeWait.triggered, controlTriggered: controlCheck.triggered, token: probeCanaryToken }
       observed = `probeCanary=${probeWait.triggered}, controlCanary=${controlCheck.triggered}`
     }
 
+    const primitive = rceWitnessDecision({ controlEx, probeEx, controlId: controlExchangeId, probeId: probeExchangeId, hostCanary, expected: expectedNonceProduct ?? expectedSplitAssembled, oob: oobWitness })
+    deterministicProofPassed &&= primitive.satisfied
+    proofMeta.tier1Primitive = { primitive: primitive.primitive, subRule: primitive.subRule, satisfied: primitive.satisfied, reason: primitive.reason }
     proofMeta.cryptographicProofPassed = deterministicProofPassed
     const evidencePayload = redactJsonValue({
       ...basePayload,
@@ -1723,40 +1869,15 @@ export async function runRceProofRecipe(
 
     const controlPassed = !isUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus) &&
       controlEx.status >= 200 && controlEx.status < 500
+    const expected = 'Untrusted input is never evaluated as template or command code.'
+    const receiptExtra = receiptCheck ? { receipt: receiptCheck } : {}
     if (deterministicProofPassed && controlPassed) {
-      return {
-        verdict: 'confirmed',
-        verificationTier: 'runtime_confirmed',
-        outcome: {
-          confirmed: true,
-          controlPassed: true,
-          observed: observed.slice(0, 1200),
-          expected: 'Untrusted input is never evaluated as template or command code.',
-        },
-        exchangeIds,
-        exchanges,
-        evidencePayload,
-        evidenceSha256,
-        ...(receiptCheck ? { receipt: receiptCheck } : {}),
-      }
+      return runnerResult('confirmed', { confirmed: true, controlPassed: true, observed: observed.slice(0, 1200), expected }, exchanges, exchangeIds, evidencePayload, evidenceSha256, receiptExtra)
     }
-    return {
-      verdict: controlPassed ? 'dismissed' : 'inconclusive',
-      outcome: {
-        confirmed: false,
-        controlPassed,
-        observed: observed.slice(0, 1200),
-        expected: 'Untrusted input is never evaluated as template or command code.',
-        reason: deterministicProofPassed
-          ? `Control step returned unexpected HTTP ${controlEx.status}.`
-          : 'Cryptographic non-destructive proof-of-execution check did not pass (possible reflection or unexecuted payload).',
-      },
-      exchangeIds,
-      exchanges,
-      evidencePayload,
-      evidenceSha256,
-      ...(receiptCheck ? { receipt: receiptCheck } : {}),
-    }
+    const reason = deterministicProofPassed
+      ? `Control step returned unexpected HTTP ${controlEx.status}.`
+      : 'Cryptographic non-destructive proof-of-execution check did not pass (possible reflection or unexecuted payload).'
+    return runnerResult(controlPassed ? 'dismissed' : 'inconclusive', { confirmed: false, controlPassed, observed: observed.slice(0, 1200), expected, reason }, exchanges, exchangeIds, evidencePayload, evidenceSha256, receiptExtra)
   } catch (err) {
     return runnerHandleError(err, ctx, exchanges, exchangeIds, basePayload)
   } finally {
@@ -1764,41 +1885,51 @@ export async function runRceProofRecipe(
   }
 }
 
+const digestText = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 32)
+const cacheExchangeRecord = (signer: Tier1Signer, id: string, ordinal: number, ex: BrokerExchangeResult, artifactDigest: string): HostSignedRecord => {
+  const json = jsonOfExchange(ex)
+  return signer.sign({ id, timestampMs: ordinal, status: ex.status, method: ex.method.toUpperCase(), route: ex.pathAndQuery.split('?')[0] || '/', pathAndQuery: ex.pathAndQuery, actorId: ex.personaHandle, ...(json !== undefined ? { json, body: ex.body } : {}), requestHeaders: ex.reqHeaders, responseHeaders: ex.respHeaders, artifactDigest })
+}
+
+/** cache_differential Tier-1 verdict: host-signed wire_framing_and_cache_differential (cache_priming). */
+export function cacheDifferentialDecision(input: {
+  controlEx: BrokerExchangeResult; probeEx: BrokerExchangeResult; verifyEx: BrokerExchangeResult
+  controlId: string; probeId: string; verifyId: string
+  victimDigest: string; controlDigest: string; verifyDigest: string
+  controlContainsVictimData: boolean; requireDistinctPrincipals?: boolean
+}): UniversalPrimitiveDecision {
+  const signer = tier1HostSigner()
+  const control = cacheExchangeRecord(signer, input.controlId, 1, input.controlEx, input.controlDigest)
+  const prime = cacheExchangeRecord(signer, input.probeId, 2, input.probeEx, input.victimDigest)
+  const variant = cacheExchangeRecord(signer, input.verifyId, 3, input.verifyEx, input.verifyDigest)
+  return evaluateUniversalPrimitive('wire_framing_and_cache_differential', {
+    property: 'cache_priming', control, prime, variant,
+    victimDigest: input.victimDigest, controlContainsVictimData: input.controlContainsVictimData,
+    ...(input.requireDistinctPrincipals ? { requireDistinctPrincipals: true } : {}), verifySignature: signer.verify,
+  })
+}
+
 /**
- * Cut 3e typed runner for `cache_differential` (zero-jq).
- * Enforces unique ?_gcb= isolation, header-hit / body_repeat persistence, requireControlNonError,
- * and optional SPA catch-all control.
+ * Cut 3e typed runner for `cache_differential` (zero-jq), gated by Tier-1 wire_framing_and_cache_differential.
  */
 export async function runCacheDifferentialRecipe(
   spec: Extract<DeclarativeReplaySpec, { kind: 'cache_differential' }>,
   ctx: LegacySpecRunnerContext,
 ): Promise<ReplayVerificationResult> {
   const { exchanges, exchangeIds, recordExchange } = makeRunnerRecorder(ctx, 'cache')
-  const basePayload: Record<string, unknown> = {
-    kind: spec.kind,
-    origin: spec.origin,
-    replayedAt: new Date().toISOString(),
-  }
+  const basePayload: Record<string, unknown> = { kind: spec.kind, origin: spec.origin, replayedAt: new Date().toISOString() }
 
   try {
-    const controlGcb = randomUUID()
-    const probeGcb = randomUUID()
-    const repeatGcb = randomUUID()
+    const controlGcb = randomUUID(), probeGcb = randomUUID(), repeatGcb = randomUUID()
     const resolveCachePath = (raw: string, token: string): string =>
-      raw.replaceAll('{{control_gcb}}', controlGcb)
-        .replaceAll('{{probe_gcb}}', probeGcb)
-        .replaceAll('{{repeat_gcb}}', repeatGcb)
-        .replaceAll('{{cache_buster}}', token)
+      raw.replaceAll('{{control_gcb}}', controlGcb).replaceAll('{{probe_gcb}}', probeGcb).replaceAll('{{repeat_gcb}}', repeatGcb).replaceAll('{{cache_buster}}', token)
 
-    const controlPath = resolveCachePath(spec.controlPath, controlGcb)
-    const probePath = resolveCachePath(spec.probePath, probeGcb)
+    const controlPath = resolveCachePath(spec.controlPath, controlGcb), probePath = resolveCachePath(spec.probePath, probeGcb)
     const verifyPath = spec.verifyPath ? resolveCachePath(spec.verifyPath, probeGcb) : probePath
     const repeatPath = spec.repeatPath ? resolveCachePath(spec.repeatPath, repeatGcb) : null
 
-    const actualCtrlGcb = extractCacheBusterParam(controlPath)
-    const actualProbeGcb = extractCacheBusterParam(probePath)
-    if (!actualCtrlGcb || !cacheBusterValueRegex.test(actualCtrlGcb) ||
-        !actualProbeGcb || !cacheBusterValueRegex.test(actualProbeGcb)) {
+    const actualCtrlGcb = extractCacheBusterParam(controlPath), actualProbeGcb = extractCacheBusterParam(probePath)
+    if (!actualCtrlGcb || !cacheBusterValueRegex.test(actualCtrlGcb) || !actualProbeGcb || !cacheBusterValueRegex.test(actualProbeGcb)) {
       return inconclusiveResult('cache_differential requires valid ?_gcb=<16-36 hex/uuid> tokens.', exchanges, exchangeIds, { kind: spec.kind })
     }
     if (actualCtrlGcb.toLowerCase() === actualProbeGcb.toLowerCase()) {
@@ -1809,78 +1940,38 @@ export async function runCacheDifferentialRecipe(
     }
 
     const executeCacheReq = (pathAndQuery: string, extra: Partial<BrokerHttpRequest>) =>
-      ctx.broker.executeHttp({
-        origin: spec.targetOrigin,
-        method: spec.method,
-        pathAndQuery,
-        followRedirects: false,
-        runId: ctx.runId,
-        assignmentId: ctx.assignmentId,
-        ...extra,
-      }, ctx.grant, ctx.signal)
+      ctx.broker.executeHttp({ origin: spec.targetOrigin, method: spec.method, pathAndQuery, followRedirects: false, runId: ctx.runId, assignmentId: ctx.assignmentId, ...extra }, ctx.grant, ctx.signal)
 
-    const controlEx = await executeCacheReq(controlPath, {
-      ...(spec.controlPersona ? { persona: spec.controlPersona } : {}),
-      probeClass: 'cache_differential',
-    })
-    recordExchange(controlEx)
-
-    const probeEx = await executeCacheReq(probePath, {
-      headers: spec.poisonHeaders,
-      persona: spec.poisonPersona,
-      probeClass: 'cache_poison_deception',
-    })
-    recordExchange(probeEx)
-
-    const verifyEx = await executeCacheReq(verifyPath, {
-      ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}),
-      probeClass: 'cache_differential',
-      cacheVerify: true,
-    })
-    recordExchange(verifyEx)
+    const controlEx = await executeCacheReq(controlPath, { ...(spec.controlPersona ? { persona: spec.controlPersona } : {}), probeClass: 'cache_differential' })
+    const controlId = recordExchange(controlEx)
+    const probeEx = await executeCacheReq(probePath, { headers: spec.poisonHeaders, persona: spec.poisonPersona, probeClass: 'cache_poison_deception' })
+    const probeId = recordExchange(probeEx)
+    const verifyEx = await executeCacheReq(verifyPath, { ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}), probeClass: 'cache_differential', cacheVerify: true })
+    const verifyId = recordExchange(verifyEx)
 
     let repeatEx: BrokerExchangeResult | null = null
     if (spec.proofMode === 'body_repeat' && repeatPath) {
       await runnerSleepAbortable(150, ctx.signal)
-      repeatEx = await executeCacheReq(repeatPath, {
-        ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}),
-        probeClass: 'cache_differential',
-        cacheVerify: true,
-      })
+      repeatEx = await executeCacheReq(repeatPath, { ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}), probeClass: 'cache_differential', cacheVerify: true })
       recordExchange(repeatEx)
     }
 
     const guardControlErrors = spec.requireControlNonError ?? defaultRequireControlNonError(spec)
     let forcedInconclusiveReason: string | null = null
     if (guardControlErrors) {
-      if (isUnexpectedErrorStatus(controlEx.status, spec.expectedStatus)) {
-        forcedInconclusiveReason = `Unexpected HTTP ${controlEx.status} on cache_differential control step (requireControlNonError).`
-      } else if (isUnexpectedErrorStatus(verifyEx.status, spec.expectedStatus)) {
-        forcedInconclusiveReason = `Unexpected HTTP ${verifyEx.status} on cache_differential verify step (requireControlNonError).`
-      }
+      if (isUnexpectedErrorStatus(controlEx.status, spec.expectedStatus)) forcedInconclusiveReason = `Unexpected HTTP ${controlEx.status} on cache_differential control step (requireControlNonError).`
+      else if (isUnexpectedErrorStatus(verifyEx.status, spec.expectedStatus)) forcedInconclusiveReason = `Unexpected HTTP ${verifyEx.status} on cache_differential verify step (requireControlNonError).`
     }
 
-    const ageRaw = verifyEx.respHeaders.age
-    const age = ageRaw !== undefined ? Number(ageRaw) : NaN
-    const cacheHeaderSignal = [
-      verifyEx.respHeaders['x-cache'],
-      verifyEx.respHeaders['cf-cache-status'],
-      verifyEx.respHeaders['x-cache-status'],
-      verifyEx.respHeaders['x-proxy-cache'],
-      verifyEx.respHeaders['cache-status'],
-    ].some(v => typeof v === 'string' && /\bhit\b/i.test(v))
-    const normVerifyBody = normalizeStructuralTokens(verifyEx.body)
-    const simControlVsVerify = structuralDiffNormalized(normalizeStructuralTokens(controlEx.body), normVerifyBody).similarity
-    const simProbeVsVerify = structuralDiffNormalized(normalizeStructuralTokens(probeEx.body), normVerifyBody).similarity
+    const ageRaw = verifyEx.respHeaders.age, age = ageRaw !== undefined ? Number(ageRaw) : NaN
+    const cacheHeaderSignal = [verifyEx.respHeaders['x-cache'], verifyEx.respHeaders['cf-cache-status'], verifyEx.respHeaders['x-cache-status'], verifyEx.respHeaders['x-proxy-cache'], verifyEx.respHeaders['cache-status']].some(v => typeof v === 'string' && /\bhit\b/i.test(v))
+    const normControlBody = normalizeStructuralTokens(controlEx.body), normProbeBody = normalizeStructuralTokens(probeEx.body), normVerifyBody = normalizeStructuralTokens(verifyEx.body)
+    const simControlVsVerify = structuralDiffNormalized(normControlBody, normVerifyBody).similarity
+    const simProbeVsVerify = structuralDiffNormalized(normProbeBody, normVerifyBody).similarity
 
-    let cacheHitObserved: boolean
-    let poisonPersistedToVictim: boolean
-    let markerInControl = false
-    let markerInProbe = false
-    let markerInVerify = false
-    let markerInRepeat = false
-    let repeatBodyMatches = false
-    let timingSignal = false
+    let cacheHitObserved: boolean, poisonPersistedToVictim: boolean
+    let markerInControl = false, markerInProbe = false, markerInVerify = false, markerInRepeat = false, repeatBodyMatches = false, timingSignal = false
+    let victimDigest: string, controlDigest: string, verifyDigest: string, controlContainsVictimData: boolean
     if (spec.proofMode === 'body_repeat') {
       const marker = spec.marker
       markerInControl = Boolean(marker && controlEx.body.includes(marker))
@@ -1894,36 +1985,40 @@ export async function runCacheDifferentialRecipe(
       cacheHitObserved = Boolean(marker) ? markerPersisted : bodyPersisted
       poisonPersistedToVictim = actorDifferential && cacheHitObserved && repeatBodyMatches && (!marker || markerInRepeat)
       timingSignal = Boolean(repeatEx) && repeatBodyMatches
+      victimDigest = marker ? digestText(`marker:${marker}`) : digestText(probeEx.body)
+      controlDigest = marker && markerInControl ? victimDigest : digestText(controlEx.body)
+      verifyDigest = (marker ? markerInVerify && repeatBodyMatches : verifyEx.body === probeEx.body) ? victimDigest : digestText(verifyEx.body)
+      controlContainsVictimData = marker ? markerInControl : controlEx.body === probeEx.body
     } else {
       cacheHitObserved = (Number.isFinite(age) && age > 0) || cacheHeaderSignal
-      poisonPersistedToVictim =
-        (simControlVsVerify < 0.95 || verifyEx.status !== controlEx.status) &&
-        (simProbeVsVerify >= 0.85 || verifyEx.status === probeEx.status)
+      const poisonValues = Object.values(spec.poisonHeaders ?? {}).map(v => String(v ?? '').trim()).filter(v => v.length >= 4)
+      const poisonReflected = poisonValues.length === 0 || poisonValues.some(v =>
+        (probeEx.body.includes(v) || String(probeEx.respHeaders.location ?? '').includes(v)) &&
+        (verifyEx.body.includes(v) || String(verifyEx.respHeaders.location ?? '').includes(v)) &&
+        !controlEx.body.includes(v) && !String(controlEx.respHeaders.location ?? '').includes(v))
+      poisonPersistedToVictim = (simControlVsVerify < 0.95 || verifyEx.status !== controlEx.status) && simProbeVsVerify >= 0.85 && verifyEx.status === probeEx.status && poisonReflected
+      controlDigest = digestText(`${controlEx.status}|${normControlBody}`)
+      victimDigest = digestText(`${probeEx.status}|${normProbeBody}`)
+      verifyDigest = digestText(`${verifyEx.status}|${normVerifyBody}`)
+      controlContainsVictimData = controlDigest === victimDigest
     }
 
-    const deterministicProofPassed = cacheHitObserved && poisonPersistedToVictim
-    const proofFailureReason = deterministicProofPassed
-      ? ''
-      : spec.proofMode === 'body_repeat'
-        ? (!cacheHitObserved
-          ? 'Header-free cache proof: the clean verify did not receive the warm marker/body.'
-          : 'Header-free cache proof: repeat fetch did not reproduce the poisoned body, or the control did not differ.')
-        : !cacheHitObserved
-          ? 'Verify request did not observe a cache hit (missing HIT header or Age > 0).'
-          : 'Clean unauthenticated verify response matched clean control rather than poisoned probe.'
+    const primitive = cacheDifferentialDecision({
+      controlEx, probeEx, verifyEx, controlId, probeId, verifyId, victimDigest, controlDigest, verifyDigest, controlContainsVictimData,
+      ...((spec.proofMode === 'body_repeat' || (Boolean(spec.poisonPersona) && Object.keys(spec.poisonHeaders ?? {}).length === 0)) ? { requireDistinctPrincipals: true } : {}),
+    })
+    const deterministicProofPassed = cacheHitObserved && poisonPersistedToVictim && primitive.satisfied
+    const proofFailureReason = deterministicProofPassed ? ''
+      : !primitive.satisfied ? `tier1_primitive_rejected: ${primitive.primitive} ${primitive.reason}`
+        : spec.proofMode === 'body_repeat'
+          ? (!cacheHitObserved ? 'Header-free cache proof: the clean verify did not receive the warm marker/body.' : 'Header-free cache proof: repeat fetch did not reproduce the poisoned body, or the control did not differ.')
+          : !cacheHitObserved ? 'Verify request did not observe a cache hit (missing HIT header or Age > 0).' : 'Clean unauthenticated verify response matched clean control rather than poisoned probe.'
 
     let spaCatchall: Record<string, unknown> | undefined
     if (spec.spaCatchallControl) {
-      const catchall = await runRunnerSpaCatchall({
-        origin: spec.targetOrigin,
-        ctx,
-        recordExchange,
-        targets: [{ id: 'verify', exchange: verifyEx }],
-      })
+      const catchall = await runRunnerSpaCatchall({ origin: spec.targetOrigin, ctx, recordExchange, targets: [{ id: 'verify', exchange: verifyEx }] })
       spaCatchall = catchall.summary
-      if (catchall.allProbesMatchedCatchall) {
-        forcedInconclusiveReason = 'cache_differential verify response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
-      }
+      if (catchall.allProbesMatchedCatchall) forcedInconclusiveReason = 'cache_differential verify response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
     }
 
     const controlSummary = { id: 'control', role: 'control', ...summarizeExchange(controlEx) }
@@ -1932,110 +2027,137 @@ export async function runCacheDifferentialRecipe(
     const repeatSummary = repeatEx ? { id: 'repeat', role: 'probe', ...summarizeExchange(repeatEx) } : undefined
 
     const evidencePayload = redactJsonValue({
-      ...basePayload,
-      targetOrigin: spec.targetOrigin,
-      mode: spec.mode,
-      control: controlSummary,
-      probe: probeSummary,
-      verify: verifySummary,
-      ...(repeatSummary ? { repeat: repeatSummary } : {}),
+      ...basePayload, targetOrigin: spec.targetOrigin, mode: spec.mode,
+      control: controlSummary, probe: probeSummary, verify: verifySummary, ...(repeatSummary ? { repeat: repeatSummary } : {}),
       steps: { control: controlSummary, probe: probeSummary, verify: verifySummary, ...(repeatSummary ? { repeat: repeatSummary } : {}) },
       ...(spaCatchall ? { spaCatchall } : {}),
       cacheProof: {
-        mode: spec.mode,
-        proofMode: spec.proofMode,
-        controlGcb: actualCtrlGcb,
-        probeGcb: actualProbeGcb,
-        cacheHitObserved,
-        poisonPersistedToVictim,
-        simControlVsVerify,
-        simProbeVsVerify,
-        age: Number.isFinite(age) ? age : null,
-        markerPresent: Boolean(spec.marker),
-        markerInControl,
-        markerInProbe,
-        markerInVerify,
-        markerInRepeat,
-        repeatBodyMatches,
-        timingSignal,
+        mode: spec.mode, proofMode: spec.proofMode, controlGcb: actualCtrlGcb, probeGcb: actualProbeGcb,
+        cacheHitObserved, poisonPersistedToVictim, simControlVsVerify, simProbeVsVerify, age: Number.isFinite(age) ? age : null,
+        markerPresent: Boolean(spec.marker), markerInControl, markerInProbe, markerInVerify, markerInRepeat, repeatBodyMatches, timingSignal,
+        tier1Primitive: { primitive: primitive.primitive, subRule: primitive.subRule, satisfied: primitive.satisfied, reason: primitive.reason },
       },
     }, runnerSecrets(ctx.grant, ctx.broker))
     const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload)).digest('hex')
 
+    const expected = 'Unkeyed input or victim response is not cached and served across clients.'
     if (forcedInconclusiveReason) {
-      return {
-        verdict: 'inconclusive',
-        outcome: {
-          confirmed: false,
-          controlPassed: false,
-          observed: verifyEx.bodyPreview.slice(0, 400),
-          expected: 'Clean uncached or isolated response.',
-          reason: forcedInconclusiveReason,
-        },
-        exchangeIds,
-        exchanges,
-        evidencePayload,
-        evidenceSha256,
-      }
+      return runnerResult('inconclusive', { confirmed: false, controlPassed: false, observed: verifyEx.bodyPreview.slice(0, 400), expected: 'Clean uncached or isolated response.', reason: forcedInconclusiveReason }, exchanges, exchangeIds, evidencePayload, evidenceSha256)
     }
     const controlPassed = controlEx.status >= 200 && controlEx.status < 500
     if (deterministicProofPassed && controlPassed) {
-      return {
-        verdict: 'confirmed',
-        verificationTier: 'runtime_confirmed',
-        outcome: {
-          confirmed: true,
-          controlPassed: true,
-          observed: `Cache ${spec.mode} persisted poisoned response to clean verify (simControl=${simControlVsVerify.toFixed(2)}, simProbe=${simProbeVsVerify.toFixed(2)}).`,
-          expected: 'Unkeyed input or victim response is not cached and served across clients.',
-        },
-        exchangeIds,
-        exchanges,
-        evidencePayload,
-        evidenceSha256,
-      }
+      return runnerResult('confirmed', { confirmed: true, controlPassed: true, observed: `Cache ${spec.mode} persisted poisoned response to clean verify (simControl=${simControlVsVerify.toFixed(2)}, simProbe=${simProbeVsVerify.toFixed(2)}).`, expected }, exchanges, exchangeIds, evidencePayload, evidenceSha256)
     }
-    return {
-      verdict: controlPassed ? 'dismissed' : 'inconclusive',
-      outcome: {
-        confirmed: false,
-        controlPassed,
-        observed: verifyEx.bodyPreview.slice(0, 400) || `verifyStatus=${verifyEx.status}`,
-        expected: 'Unkeyed input or victim response is not cached and served across clients.',
-        reason: proofFailureReason || `Control step returned HTTP ${controlEx.status}.`,
-      },
-      exchangeIds,
-      exchanges,
-      evidencePayload,
-      evidenceSha256,
-    }
+    return runnerResult(controlPassed ? 'dismissed' : 'inconclusive', { confirmed: false, controlPassed, observed: verifyEx.bodyPreview.slice(0, 400) || `verifyStatus=${verifyEx.status}`, expected, reason: proofFailureReason || `Control step returned HTTP ${controlEx.status}.` }, exchanges, exchangeIds, evidencePayload, evidenceSha256)
   } catch (err) {
     return runnerHandleError(err, ctx, exchanges, exchangeIds, basePayload)
   }
 }
 
+const AUTH_WIRE_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|x-auth-token|x-access-token|x-csrf-token|x-(?:hub-|webhook-)?signature(?:-256)?)$/i
+const PRIV_BOOL_KEYS = ['isAdmin', 'is_admin', 'admin', 'bypassed', 'elevated', 'superuser', 'isSuperuser', 'is_superuser', 'staff', 'is_staff'] as const
+const ROLE_STR_KEYS = ['role', 'privilege', 'accountRole', 'userRole'] as const
+const IDENTITY_CLAIM_KEYS = ['sub', 'userId', 'user_id', 'tenant', 'tenantId', 'tenant_id', 'orgId', 'org_id'] as const
+const ELEVATED_SCOPE_RE = /^(?:admin|owner|superadmin|root|\*|write:admin|manage(?::.*)?)$/i
+
+const JWT_LITERAL_RE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g
+function hasBodyMintedTokenDiff(cBody: string | undefined, pBody: string | undefined, minted: readonly string[] | undefined): boolean {
+  if (!cBody || !pBody || !minted?.length) return false
+  if (!minted.some(t => t.length >= 12 && pBody.includes(t) && !cBody.includes(t))) return false
+  const strip = (s: string) => minted.reduce((acc, t) => (t.length >= 12 ? acc.replaceAll(t, '<TOKEN>') : acc), s).replace(JWT_LITERAL_RE, '<TOKEN>')
+  return strip(cBody) === strip(pBody)
+}
+
+function authWireFingerprint(ex: BrokerExchangeResult, authMutation?: AuthMutation, bodyTokenDigest?: string): string {
+  const hdrs = Object.entries(ex.reqHeaders ?? {}).filter(([k]) => AUTH_WIRE_HEADER_RE.test(k)).sort(([a], [b]) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1)).map(([k, v]) => `${k.toLowerCase()}=${v}`)
+  const prov = ex.wireCredentialProvenance
+  return digestText([...hdrs, `mut=${prov?.authMutated === true ? (authMutation?.kind ?? 'mutated') : 'none'}`, `caller=${(prov?.callerAuthHeaderNames ?? []).join(',')}`, `vault=${(prov?.vaultHeaderNames ?? []).join(',')}`, `jar=${(prov?.jarCookieNames ?? []).join(',')}`, ...(bodyTokenDigest ? [`bodyTok=${bodyTokenDigest}`] : [])].join('|'))
+}
+
+const authRequestText = (ex: BrokerExchangeResult, extra?: string): string => [ex.pathAndQuery, ...Object.entries(ex.reqHeaders ?? {}).map(([k, v]) => `${k}:${v}`), extra ?? ''].join('\n').toLowerCase()
+const TOKEN_MINT_KEY_RE = /^(?:access_?token|id_?token|session_?token|jwt|bearer_?token|auth_?token)$/i
+const TOKEN_MINT_DISQ_RE = /^(?:job_?id|export_?id|task_?id|upload_?id|delivery_?id|webhook_?id|signed_?url|presigned_?url|download_?url|url|href|link|location|error|err|errorCode|error_description)$/i
+function isTokenMintGrant(json: unknown, status: number, method: string, secretMatches?: readonly unknown[], minted?: readonly string[], reqBody?: string): boolean {
+  if (status !== 200 || !/^(?:POST|PUT)$/i.test(method) || !json || typeof json !== 'object' || Array.isArray(json)) return false
+  const entries = Object.entries(json as Record<string, unknown>)
+  if (entries.some(([k, v]) => TOKEN_MINT_DISQ_RE.test(k) || ((k === 'ok' || k === 'success' || k === 'valid' || k === 'authenticated' || k === 'active' || k === 'verified') && v === false))) return false
+  return entries.some(([k, v]) => {
+    if (!TOKEN_MINT_KEY_RE.test(k) || typeof v !== 'string') return false
+    const tv = v.trim()
+    if (minted?.includes(tv) || (reqBody && tv.length >= 8 && reqBody.includes(tv))) return false
+    return tv.length >= 12 || (/^\[redacted(?::[^\]]+)?\]$/i.test(tv) && (secretMatches?.length ?? 0) > 0)
+  })
+}
+
+function hasAuthPrivilegeEscalation(cJson: unknown, pJson: unknown): boolean {
+  if (!cJson || typeof cJson !== 'object' || Array.isArray(cJson) || !pJson || typeof pJson !== 'object' || Array.isArray(pJson)) return false
+  const c = cJson as Record<string, unknown>, p = pJson as Record<string, unknown>
+  if (p.ok === false || p.authenticated === false || p.success === false || p.valid === false || Boolean(p.error || p.err || p.errorCode || p.error_description)) return false
+  if (PRIV_BOOL_KEYS.some(k => p[k] === true && c[k] !== true)) return true
+  if (ROLE_STR_KEYS.some(k => typeof c[k] === 'string' && typeof p[k] === 'string' && c[k] !== p[k] && ((rolePrivilegeRank(p[k] as RoleName) ?? -1) > (rolePrivilegeRank(c[k] as RoleName) ?? 99) || (ELEVATED_SCOPE_RE.test(p[k]) && !ELEVATED_SCOPE_RE.test(c[k]))))) return true
+  if ((['roles', 'scopes', 'permissions'] as const).some(k => Array.isArray(p[k]) && (p[k] as unknown[]).some(v => ELEVATED_SCOPE_RE.test(String(v)) && !new Set((Array.isArray(c[k]) ? c[k] : []).map(x => String(x).toLowerCase())).has(String(v).toLowerCase())))) return true
+  return IDENTITY_CLAIM_KEYS.some(k => typeof c[k] === 'string' && typeof p[k] === 'string' && c[k].trim().length > 0 && p[k].trim().length > 0 && c[k] !== p[k])
+}
+
+/** auth_protocol_proof Tier-1 verdict (zero-jq): OOB witness, signature_validity wire diff, access_differential, or request-injected redirect canary. */
+export function authProtocolTier1Decision(input: {
+  control?: { exchange: BrokerExchangeResult; exchangeId: string; requestText?: string; requestBody?: string }
+  probe?: { exchange: BrokerExchangeResult; exchangeId: string; authMutation?: AuthMutation; requestText?: string; requestBody?: string }
+  origin?: string; hasTokenMints?: boolean; mintedTokenValues?: readonly string[]; oob?: { triggered: boolean; controlTriggered: boolean; token: string }
+}): UniversalPrimitiveDecision {
+  const signer = tier1HostSigner(), verifySignature = signer.verify
+  if (!input.control || !input.probe) return { primitive: 'access_differential', required: true, satisfied: false, reason: 'missing_control_or_probe_exchange' }
+  const cEx = input.control.exchange, pEx = input.probe.exchange
+  const cRec = exchangeRecord(signer, input.control.exchangeId, 1, cEx), pRec = exchangeRecord(signer, input.probe.exchangeId, 2, pEx)
+  if (input.oob) {
+    const witness = input.oob.triggered ? signer.sign({ id: `${input.probe.exchangeId}:oob`, timestampMs: 3, status: 200, surface: 'webhook' }) : undefined
+    return evaluateUniversalPrimitive('oob_and_execution_witness', { kind: 'oob_callback', trigger: pRec, witness: witness as HostSignedRecord, hostCanary: input.oob.token, observedCanary: input.oob.triggered ? input.oob.token : null, control: cRec, controlObservedCanary: input.oob.controlTriggered ? input.oob.token : null, verifySignature })
+  }
+  const bodyTokenForged = hasBodyMintedTokenDiff(input.control.requestBody, input.probe.requestBody, input.mintedTokenValues)
+  const hasMutation = Boolean(input.probe.authMutation?.kind || input.hasTokenMints)
+  const cWire = authWireFingerprint(cEx, undefined, bodyTokenForged ? digestText(input.control.requestBody!) : undefined)
+  const pWire = authWireFingerprint(pEx, input.probe.authMutation, bodyTokenForged ? digestText(input.probe.requestBody!) : undefined)
+  if (cEx.status === 401 || cEx.status === 403) {
+    if (!hasMutation) return evaluateUniversalPrimitive('access_differential', { control: cRec, variant: pRec, bindRoute: true, requireChronology: true, verifySignature })
+    const res = evaluateUniversalPrimitive('wire_framing_and_cache_differential', { property: 'signature_validity', control: cRec, variant: pRec, controlWireValue: cWire, variantWireValue: pWire, bindActor: true, verifySignature })
+    return !res.satisfied && res.reason === 'terminal_impact_unproven_intermediate_stub' && (bodyTokenForged || pEx.wireCredentialProvenance?.authMutated === true) && isTokenMintGrant(pRec.json, pEx.status, pEx.method, pEx.secretMatches, input.mintedTokenValues, input.probe.requestBody)
+      ? { ...res, satisfied: true, reason: 'wire_differential_token_mint_confirmed', evidence: { controlId: cRec.id, variantId: pRec.id } }
+      : res
+  }
+  if (pEx.status >= 300 && pEx.status < 400) {
+    const loc = Object.entries(pEx.respHeaders ?? {}).find(([k]) => k.toLowerCase() === 'location')?.[1]?.trim() ?? ''
+    let locHost = '', targetHost = ''
+    try { if (/^https?:\/\//i.test(loc) || loc.startsWith('//')) locHost = new URL(loc.startsWith('//') ? `https:${loc}` : loc).hostname.toLowerCase() } catch { /* ignore */ }
+    try { if (input.origin || pEx.origin) targetHost = new URL(input.origin ?? pEx.origin).hostname.toLowerCase() } catch { /* ignore */ }
+    if (locHost.length >= 8 && locHost !== targetHost && authRequestText(pEx, input.probe.requestText).includes(locHost) && !authRequestText(cEx, input.control.requestText).includes(locHost)) {
+      return evaluateUniversalPrimitive('oob_and_execution_witness', { kind: 'redirect_canary', trigger: pRec, witness: pRec, hostCanary: locHost, observedCanary: null, control: cRec, verifySignature })
+    }
+  }
+  if (cEx.status >= 200 && cEx.status < 300 && pEx.status >= 200 && pEx.status < 300 && hasMutation) {
+    if (!signer.verify(cRec) || !signer.verify(pRec)) return { primitive: 'wire_framing_and_cache_differential', required: true, satisfied: false, reason: 'invalid_host_signature' }
+    if (cRec.route !== pRec.route) return { primitive: 'wire_framing_and_cache_differential', required: true, satisfied: false, reason: 'control_and_variant_route_mismatch' }
+    if (!cRec.actorId || cRec.actorId !== pRec.actorId) return { primitive: 'wire_framing_and_cache_differential', required: true, satisfied: false, reason: 'control_and_variant_actor_mismatch' }
+    if (cWire === pWire) return { primitive: 'wire_framing_and_cache_differential', required: true, satisfied: false, reason: 'no_wire_differential_between_control_and_variant' }
+    if (!hasAuthPrivilegeEscalation(cRec.json, pRec.json)) return { primitive: 'wire_framing_and_cache_differential', required: true, satisfied: false, reason: 'no_privilege_escalation_in_200_response' }
+    return { primitive: 'wire_framing_and_cache_differential', subRule: 'signature_validity', required: true, satisfied: true, reason: 'wire_differential_privilege_escalation_confirmed', evidence: { controlId: cRec.id, variantId: pRec.id } }
+  }
+  return { primitive: hasMutation ? 'wire_framing_and_cache_differential' : 'access_differential', required: true, satisfied: false, reason: pEx.status >= 200 && pEx.status < 300 ? 'control_not_denied' : 'variant_rejected' }
+}
+
 /**
- * Cut 3e typed runner for `auth_protocol_proof`:
- * - OOB `jku_x5u_canary` verifies directly through `ProofReceipt` (`oob` rule, zero-jq).
- * - Token-minting & JWT/OAuth differentials enforce boundary gates, redaction of mutated tokens,
- *   and evaluate assertions cleanly without living inside `replay-verifier.ts`.
+ * Cut 3e typed runner for `auth_protocol_proof` (zero-jq, Tier-1 universal primitive gated).
  */
 export async function runAuthProtocolProofRecipe(
   spec: Extract<DeclarativeReplaySpec, { kind: 'auth_protocol_proof' }>,
   ctx: LegacySpecRunnerContext,
 ): Promise<ReplayVerificationResult> {
   const { exchanges, exchangeIds, recordExchange } = makeRunnerRecorder(ctx, 'auth')
-  const basePayload: Record<string, unknown> = {
-    kind: spec.kind,
-    origin: spec.origin,
-    replayedAt: new Date().toISOString(),
-  }
-  const vars: Record<string, string> = {}
-  const stepsOut: Record<string, unknown> = {}
-  const probeStepExchanges: Array<{ id: string; exchange: BrokerExchangeResult; exchangeId: string; request: BrokerHttpRequest }> = []
+  const basePayload: Record<string, unknown> = { kind: spec.kind, origin: spec.origin, replayedAt: new Date().toISOString() }
+  const vars: Record<string, string> = {}, stepsOut: Record<string, unknown> = {}
+  const probeStepExchanges: Array<{ id: string; exchange: BrokerExchangeResult; exchangeId: string; request: BrokerHttpRequest; authMutation?: AuthMutation }> = []
   const replayJarPrefix = randomUUID().slice(0, 8)
-  let firstControlStep: Record<string, unknown> | undefined
-  let firstProbeStep: Record<string, unknown> | undefined
+  let firstControlStep: Record<string, unknown> | undefined, firstProbeStep: Record<string, unknown> | undefined
+  let firstControlExchange: { exchange: BrokerExchangeResult; exchangeId: string; requestText?: string; requestBody?: string } | undefined
 
   const mintedTokens: Array<{ name: string; alg: string }> = []
   if (spec.tokenMints?.length) {
@@ -2048,9 +2170,7 @@ export async function runAuthProtocolProofRecipe(
         if (value === '{{now}}') return nowSeconds
         if (value === '{{now_plus_1h}}') return nowSeconds + 3600
         if (Array.isArray(value)) return value.map(resolveClaims)
-        if (value && typeof value === 'object') {
-          return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, resolveClaims(v)]))
-        }
+        if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, resolveClaims(v)]))
         return value
       }
       const headerJson = interpolateValue(resolveClaims(header), vars) as Record<string, unknown>
@@ -2061,15 +2181,11 @@ export async function runAuthProtocolProofRecipe(
   }
 
   const serializedSteps = JSON.stringify(spec.steps)
-  const needsCanary = spec.steps.some(s => s.request.authMutation?.kind === 'jku_x5u_canary') ||
-    /\{\{canary_(?:url|token|dns_host)\}\}/.test(serializedSteps)
+  const needsCanary = spec.steps.some(s => s.request.authMutation?.kind === 'jku_x5u_canary') || /\{\{canary_(?:url|token|dns_host)\}\}/.test(serializedSteps)
   let canarySession: EphemeralCanarySession | undefined
   let ctrlCanary: { url: string; token: string; dnsHost: string } | undefined
   let prbCanary: { url: string; token: string; dnsHost: string } | undefined
-
-  let forcedInconclusiveReason: string | null = null
-  let deterministicProofPassed = true
-  let proofFailureReason = ''
+  let forcedInconclusiveReason: string | null = null, deterministicProofPassed = true, proofFailureReason = ''
 
   try {
     if (needsCanary) {
@@ -2084,15 +2200,9 @@ export async function runAuthProtocolProofRecipe(
       const stepVars: Record<string, string> = { ...vars }
       if (ctrlCanary && prbCanary) {
         const activeCanary = step.role === 'control' ? ctrlCanary : prbCanary
-        stepVars.canary_url = activeCanary.url
-        stepVars.canary_token = activeCanary.token
-        stepVars.canary_dns_host = activeCanary.dnsHost
+        stepVars.canary_url = activeCanary.url; stepVars.canary_token = activeCanary.token; stepVars.canary_dns_host = activeCanary.dnsHost
       }
-      const brokerReq = stepToBrokerRequest(step, stepVars, {
-        replayJarPrefix,
-        runId: ctx.runId,
-        assignmentId: ctx.assignmentId,
-      })
+      const brokerReq = stepToBrokerRequest(step, stepVars, { replayJarPrefix, runId: ctx.runId, assignmentId: ctx.assignmentId })
       if (brokerReq.authMutation?.kind === 'jku_x5u_canary' && !brokerReq.authMutation.url && !brokerReq.authMutation.value && ctrlCanary && prbCanary) {
         brokerReq.authMutation = { ...brokerReq.authMutation, url: step.role === 'control' ? ctrlCanary.url : prbCanary.url }
       }
@@ -2101,10 +2211,10 @@ export async function runAuthProtocolProofRecipe(
       extractVariables(step, ex, vars)
       const stepEntry: Record<string, unknown> = { id: step.id, role: step.role, ...summarizeExchange(ex) }
       stepsOut[step.id] = stepEntry
-      if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
+      if (step.role === 'control' && !firstControlStep) { firstControlStep = stepEntry; firstControlExchange = { exchange: ex, exchangeId: exId, requestText: `${brokerReq.pathAndQuery}\n${brokerReq.body ?? ''}`, ...(brokerReq.body !== undefined ? { requestBody: brokerReq.body } : {}) } }
       if (step.role === 'probe') {
         if (!firstProbeStep) firstProbeStep = stepEntry
-        probeStepExchanges.push({ id: step.id, exchange: ex, exchangeId: exId, request: brokerReq })
+        probeStepExchanges.push({ id: step.id, exchange: ex, exchangeId: exId, request: brokerReq, authMutation: step.request.authMutation })
       }
     }
 
@@ -2114,12 +2224,6 @@ export async function runAuthProtocolProofRecipe(
         if (step.role !== 'control' && step.role !== 'probe') continue
         const status = (stepsOut[step.id] as { status?: number } | undefined)?.status
         if (typeof status === 'number' && isUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
-          if (step.role === 'probe') {
-            const statusAssertedInJq =
-              new RegExp(`status\\s*==\\s*${status}\\b|\\b${status}\\s*==\\s*[^;]*status`).test(spec.assertionsJq) ||
-              (status >= 500 && /status\s*>=\s*500\b/.test(spec.assertionsJq))
-            if (statusAssertedInJq) continue
-          }
           forcedInconclusiveReason = `Unexpected HTTP ${status} on ${step.role} step "${step.id}" (requireControlNonError); declare expectedStatus ${status} to test error behavior.`
           break
         }
@@ -2128,194 +2232,90 @@ export async function runAuthProtocolProofRecipe(
 
     let canaryProof: Record<string, unknown> | undefined
     let oobReceiptCheck: ReplayVerificationResult['receipt']
+    let oobWitness: { triggered: boolean; controlTriggered: boolean; token: string } | undefined
     if (canarySession && prbCanary && ctrlCanary) {
       const probeWait = await canarySession.waitForCallback(prbCanary.token, ctx.signal)
       const controlCheck = canarySession.check(ctrlCanary.token)
+      oobWitness = { triggered: probeWait.triggered, controlTriggered: controlCheck.triggered, token: prbCanary.token }
       deterministicProofPassed = probeWait.triggered && !controlCheck.triggered
-      if (!deterministicProofPassed) {
-        proofFailureReason = 'auth_protocol_proof OOB canary callback did not trigger exclusively on probe step.'
-      }
-      canaryProof = {
-        probeTriggered: probeWait.triggered,
-        probeStage: probeWait.stage,
-        probePromoted: probeWait.promoted,
-        controlTriggered: controlCheck.triggered,
-        probeDetail: probeWait.detail,
-        controlDetail: controlCheck.detail,
-      }
+      if (!deterministicProofPassed) proofFailureReason = 'auth_protocol_proof OOB canary callback did not trigger exclusively on probe step.'
+      canaryProof = { probeTriggered: probeWait.triggered, probeStage: probeWait.stage, probePromoted: probeWait.promoted, controlTriggered: controlCheck.triggered, probeDetail: probeWait.detail, controlDetail: controlCheck.detail }
       const primaryProbe = probeStepExchanges[0]
       if (primaryProbe) {
-        const carrierExtra = primaryProbe.request.authMutation?.kind === 'jku_x5u_canary'
-          ? (primaryProbe.request.authMutation.url ?? primaryProbe.request.authMutation.value ?? '')
-          : ''
+        const carrierExtra = primaryProbe.request.authMutation?.kind === 'jku_x5u_canary' ? (primaryProbe.request.authMutation.url ?? primaryProbe.request.authMutation.value ?? '') : ''
         oobReceiptCheck = evaluateRunnerOobReceipt({
-          origin: spec.origin,
-          stepId: primaryProbe.id,
-          exchange: primaryProbe.exchange,
-          exchangeId: primaryProbe.exchangeId,
-          request: primaryProbe.request,
-          oobEventId: 'auth-oob-canary',
-          callbackPrefix: 'auth',
-          token: prbCanary.token,
-          probeWait,
-          controlTriggered: controlCheck.triggered,
-          claimedDelta: 'Auth protocol token header triggered an out-of-band canary fetch on probe only.',
-          injectedAtMs,
-          carrierExtra,
+          origin: spec.origin, stepId: primaryProbe.id, exchange: primaryProbe.exchange, exchangeId: primaryProbe.exchangeId, request: primaryProbe.request,
+          oobEventId: 'auth-oob-canary', callbackPrefix: 'auth', token: prbCanary.token, probeWait, controlTriggered: controlCheck.triggered,
+          claimedDelta: 'Auth protocol token header triggered an out-of-band canary fetch on probe only.', injectedAtMs, carrierExtra,
         })
-        if (!oobReceiptCheck.verification.confirmed) {
-          deterministicProofPassed = false
-          proofFailureReason = oobReceiptCheck.verification.reason
-        }
+        if (!oobReceiptCheck.verification.confirmed) { deterministicProofPassed = false; proofFailureReason = oobReceiptCheck.verification.reason }
       }
     }
 
     let spaCatchall: Record<string, unknown> | undefined
     if (spec.spaCatchallControl) {
-      const catchall = await runRunnerSpaCatchall({
-        origin: spec.origin,
-        ctx,
-        recordExchange,
-        targets: probeStepExchanges,
-      })
+      const catchall = await runRunnerSpaCatchall({ origin: spec.origin, ctx, recordExchange, targets: probeStepExchanges })
       spaCatchall = catchall.summary
-      if (catchall.allProbesMatchedCatchall) {
-        forcedInconclusiveReason = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
-      }
+      if (catchall.allProbesMatchedCatchall) forcedInconclusiveReason = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
     }
 
     const authSteps = impactStepsFromStepsOut(spec, stepsOut)
-    // Boundary gate applies to HTTP auth/access bypass claims, never to OOB jku_x5u_canary fetches
-    // (whose proof is the host-observed out-of-band callback verified by ProofReceipt).
-    const authBoundaryClass = canaryProof
-      ? 'other' as const
-      : classifyBoundaryClaim({ cwe: spec.cwe, category: spec.category, title: spec.title, impact: spec.impact })
+    const authBoundaryClass = canaryProof ? 'other' as const : classifyBoundaryClaim({ cwe: spec.cwe, category: spec.category, title: spec.title, impact: spec.impact })
     const authBoundaryGate = authBoundaryClass === 'mfa'
       ? assessMfaBypass({ impactClass: 'other', steps: authSteps, targetOrigin: spec.origin })
       : authBoundaryClass === 'auth' || authBoundaryClass === 'access'
-        ? assessBoundary({
-            impactClass: 'other',
-            steps: authSteps,
-            boundaryClass: authBoundaryClass,
-            expectControlDenied: spec.expectControlDenied,
-            targetOrigin: spec.origin,
-          })
+        ? assessBoundary({ impactClass: 'other', steps: authSteps, boundaryClass: authBoundaryClass, expectControlDenied: spec.expectControlDenied, targetOrigin: spec.origin })
         : null
-    if (authBoundaryGate?.required && !authBoundaryGate.satisfied) {
+    if (authBoundaryGate?.required && !authBoundaryGate.satisfied) { deterministicProofPassed = false; proofFailureReason = authBoundaryGate.reason }
+
+    const primaryProbe = probeStepExchanges[probeStepExchanges.length - 1]
+    const primitive = authProtocolTier1Decision({
+      origin: spec.origin,
+      control: firstControlExchange,
+      probe: primaryProbe ? { exchange: primaryProbe.exchange, exchangeId: primaryProbe.exchangeId, authMutation: primaryProbe.authMutation, requestText: `${primaryProbe.request.pathAndQuery}\n${primaryProbe.request.body ?? ''}`, ...(primaryProbe.request.body !== undefined ? { requestBody: primaryProbe.request.body } : {}) } : undefined,
+      hasTokenMints: Boolean(spec.tokenMints?.length),
+      ...(mintedTokens.length > 0 ? { mintedTokenValues: mintedTokens.map(m => vars[m.name]).filter((v): v is string => typeof v === 'string' && v.length > 0) } : {}),
+      ...(oobWitness ? { oob: oobWitness } : {}),
+    })
+    if (!primitive.satisfied) {
       deterministicProofPassed = false
-      proofFailureReason = authBoundaryGate.reason
+      proofFailureReason = proofFailureReason || `tier1_primitive_rejected: ${primitive.primitive} ${primitive.reason}`
     }
 
-    const dynamicSecrets = runnerSecrets(ctx.grant, ctx.broker)
     const evidencePayload = redactJsonValue({
-      ...basePayload,
-      protocol: spec.protocol,
-      steps: stepsOut,
-      ...(firstControlStep ? { control: firstControlStep } : {}),
-      ...(firstProbeStep ? { probe: firstProbeStep } : {}),
-      extractedVars: vars,
-      ...(mintedTokens.length > 0 ? { mintedTokens } : {}),
-      ...(canaryProof ? { canaryProof } : {}),
-      ...(spaCatchall ? { spaCatchall } : {}),
-      ...(authBoundaryGate ? { boundaryGate: authBoundaryGate } : {}),
-    }, dynamicSecrets)
-    const serializedPayload = JSON.stringify(evidencePayload, null, 2)
-    const evidenceSha256 = createHash('sha256').update(serializedPayload).digest('hex')
-
-    // OOB canary path (e.g. jku_x5u_canary): zero-jq confirmation backed by ProofReceipt.
-    if (canaryProof) {
-      const controlStatus = (firstControlStep as { status?: number } | undefined)?.status ?? null
-      const controlPassed = forcedInconclusiveReason === null && controlStatus !== null && controlStatus >= 200 && controlStatus < 500
-      if (forcedInconclusiveReason) {
-        return {
-          verdict: 'inconclusive',
-          outcome: { confirmed: false, controlPassed: false, observed: 'oob_canary', expected: 'No untrusted header fetch.', reason: forcedInconclusiveReason },
-          exchangeIds, exchanges, evidencePayload, evidenceSha256,
-          ...(oobReceiptCheck ? { receipt: oobReceiptCheck } : {}),
-        }
-      }
-      if (deterministicProofPassed && controlPassed) {
-        return {
-          verdict: 'confirmed',
-          verificationTier: 'runtime_confirmed',
-          outcome: { confirmed: true, controlPassed: true, observed: 'jku_x5u_oob_confirmed', expected: 'Token header URL is never fetched.' },
-          exchangeIds, exchanges, evidencePayload, evidenceSha256,
-          ...(oobReceiptCheck ? { receipt: oobReceiptCheck } : {}),
-        }
-      }
-      return {
-        verdict: controlPassed ? 'dismissed' : 'inconclusive',
-        outcome: { confirmed: false, controlPassed, observed: 'jku_x5u_oob_not_triggered', expected: 'Token header URL is never fetched.', reason: proofFailureReason || 'OOB canary did not fire.' },
-        exchangeIds, exchanges, evidencePayload, evidenceSha256,
-        ...(oobReceiptCheck ? { receipt: oobReceiptCheck } : {}),
-      }
-    }
-
-    // Non-OOB auth_protocol_proof (JWT mutations, tokenMints, OAuth redirect differentials):
-    // evaluate spec assertions via worker jq so every caller differential shape stays exact.
-    const jqCommand = `jq '${singleQuoteEscape(spec.assertionsJq)}' /evidence/replay-results.json > /work/outcome.json`
-    const workerResult = await ctx.backend.run({
-      assignmentId: ctx.assignmentId,
-      files: [{ name: 'replay-results.json', content: serializedPayload }],
-      command: jqCommand,
-      outputs: ['outcome.json'],
-      timeoutMs: 30_000,
-    }, ctx.signal)
-    const rawOutcome = (workerResult.outputs['outcome.json'] || workerResult.stdout || '').trim()
-    if (workerResult.exitCode !== 0 || !rawOutcome) {
-      return inconclusiveResult(`Replay jq assertion failed (exit ${workerResult.exitCode}): ${workerResult.stderr.slice(0, 400)}`, exchanges, exchangeIds, evidencePayload)
-    }
-    let parsedJson: unknown
-    try { parsedJson = JSON.parse(rawOutcome) } catch {
-      return inconclusiveResult('Replay jq assertion did not emit valid JSON.', exchanges, exchangeIds, evidencePayload)
-    }
-    const coerceText = (v: unknown) => (typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v))).slice(0, 1200)
-    if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
-      const obj = { ...(parsedJson as Record<string, unknown>) }
-      if ('observed' in obj && obj.observed !== undefined) obj.observed = coerceText(obj.observed)
-      if ('expected' in obj && obj.expected !== undefined) obj.expected = coerceText(obj.expected)
-      if ('reason' in obj) {
-        if (obj.reason === undefined || obj.reason === null) delete obj.reason
-        else obj.reason = coerceText(obj.reason)
-      }
-      parsedJson = obj
-    }
-    const validated = replayAssertionOutcomeSchema.safeParse(parsedJson)
-    if (!validated.success) {
-      return inconclusiveResult(`Replay assertion output violated schema: ${validated.error.issues[0]?.message ?? 'invalid shape'}`, exchanges, exchangeIds, evidencePayload)
-    }
-    const outcome = validated.data
+      ...basePayload, protocol: spec.protocol, steps: stepsOut,
+      ...(firstControlStep ? { control: firstControlStep } : {}), ...(firstProbeStep ? { probe: firstProbeStep } : {}),
+      extractedVars: vars, ...(mintedTokens.length > 0 ? { mintedTokens } : {}), ...(canaryProof ? { canaryProof } : {}),
+      ...(spaCatchall ? { spaCatchall } : {}), ...(authBoundaryGate ? { boundaryGate: authBoundaryGate } : {}),
+      tier1Primitive: { primitive: primitive.primitive, subRule: primitive.subRule, satisfied: primitive.satisfied, reason: primitive.reason },
+    }, runnerSecrets(ctx.grant, ctx.broker))
+    const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload, null, 2)).digest('hex')
+    const receiptExtra = oobReceiptCheck ? { receipt: oobReceiptCheck } : {}
+    const controlStatus = (firstControlStep as { status?: number } | undefined)?.status ?? null
+    const controlPassed = forcedInconclusiveReason === null && controlStatus !== null && controlStatus >= 200 && controlStatus < 500
+    const expected = canaryProof ? 'Token header URL is never fetched.' : 'Invalid, forged, or unauthorized protocol token is rejected.'
     if (forcedInconclusiveReason) {
-      return {
-        verdict: 'inconclusive',
-        outcome: { ...outcome, confirmed: false, controlPassed: false, reason: forcedInconclusiveReason },
-        exchangeIds, exchanges, evidencePayload, evidenceSha256,
-      }
+      return runnerResult('inconclusive', { confirmed: false, controlPassed: false, observed: canaryProof ? 'oob_canary' : `status=${primaryProbe?.exchange.status ?? 'none'}`, expected, reason: forcedInconclusiveReason }, exchanges, exchangeIds, evidencePayload, evidenceSha256, receiptExtra)
     }
-    if (!deterministicProofPassed) {
-      return {
-        verdict: outcome.controlPassed ? 'dismissed' : 'inconclusive',
-        outcome: { ...outcome, confirmed: false, reason: proofFailureReason || 'Auth protocol boundary proof did not pass.' },
-        exchangeIds, exchanges, evidencePayload, evidenceSha256,
-      }
+    if (deterministicProofPassed && controlPassed) {
+      const observed = canaryProof ? 'jku_x5u_oob_confirmed' : `auth_protocol_tier1_confirmed (${primitive.primitive}:${primitive.subRule ?? 'ok'}, probeStatus=${primaryProbe?.exchange.status ?? 'none'})`
+      return runnerResult('confirmed', { confirmed: true, controlPassed: true, observed, expected }, exchanges, exchangeIds, evidencePayload, evidenceSha256, receiptExtra)
     }
-    const verdict = outcome.controlPassed && outcome.confirmed
-      ? 'confirmed'
-      : outcome.controlPassed ? 'dismissed' : 'inconclusive'
-    return {
-      verdict,
-      ...(verdict === 'confirmed' ? { verificationTier: 'runtime_confirmed' as const } : {}),
-      outcome,
-      exchangeIds,
-      exchanges,
-      evidencePayload,
-      evidenceSha256,
-    }
+    const observed = canaryProof ? 'jku_x5u_oob_not_triggered' : `auth_protocol_rejected (${primitive.reason}, probeStatus=${primaryProbe?.exchange.status ?? 'none'})`
+    return runnerResult(controlPassed ? 'dismissed' : 'inconclusive', { confirmed: false, controlPassed, observed, expected, reason: proofFailureReason || 'Auth protocol Tier-1 proof did not pass.' }, exchanges, exchangeIds, evidencePayload, evidenceSha256, receiptExtra)
   } catch (err) {
     return runnerHandleError(err, ctx, exchanges, exchangeIds, basePayload)
   } finally {
     await canarySession?.close()
   }
+}
+
+/** Direct zero-jq Tier-1 runner dispatch for non-recipe floor spec kinds (`rce_proof`, `cache_differential`, `auth_protocol_proof`). */
+export async function runTypedFloorSpec(spec: DeclarativeReplaySpec, ctx: LegacySpecRunnerContext): Promise<ReplayVerificationResult | null> {
+  if (spec.kind === 'rce_proof') return runRceProofRecipe(spec, ctx)
+  if (spec.kind === 'cache_differential') return runCacheDifferentialRecipe(spec, ctx)
+  if (spec.kind === 'auth_protocol_proof') return runAuthProtocolProofRecipe(spec, ctx)
+  return null
 }
 
 // ---------------------------------------------------------------------------------------------

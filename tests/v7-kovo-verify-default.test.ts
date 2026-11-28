@@ -390,7 +390,7 @@ async function startBoundaryFixture(): Promise<{ origin: string; grant: Grant; c
   })
   const personas = new Map<string, ResolvedPersona>([
     ['user_a', persona('user_a', 'member (beta)', 'tok-user-a')],
-    ['user_b', persona('user_b', 'viewer (beta)', 'tok-user-b')],
+    ['user_b', persona('user_b', 'member (beta)', 'tok-user-b')],
   ])
   const grant = makeLabGrant(origin, { tier: 2, personas })
   return {
