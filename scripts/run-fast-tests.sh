@@ -148,6 +148,7 @@ EXCLUDE_SPECS=(
   "playwright-e2e|tests/ui-polish-foundation.test.ts|launches real Playwright Chromium Foundation/Settings Bucket A geometry/motion assertions (~55s)"
   "playwright-e2e|tests/ui-polish-projects.test.ts|launches real Playwright Chromium Projects/Modals Bucket A geometry/motion assertions (~25s)"
   "playwright-e2e|tests/ui-polish-run-workbench.test.ts|launches real Playwright Chromium Run Workbench Bucket A geometry/motion assertions (~80s)"
+  "playwright-e2e|tests/ui-wave2a-palette-rail-micro.test.ts|launches real Playwright Chromium Desktop Wave 2A Palette/Rail/Micro-interactions assertions (~45s)"
   "playwright-e2e|tests/v7-realism1-spa.test.ts|launches real Playwright Chromium ScopedBrowser (>60s)"
 
   # batch-boundary-slow: Batch-boundary / regression-floor tier (run by scripts/regression-floor.sh)
