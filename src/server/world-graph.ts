@@ -3,9 +3,12 @@
  *
  * Projects bounded, already-observed run state (discovered endpoints, per-principal broker exchange
  * status outcomes, observed API dependencies, host-verified CapabilityLedger causal edges, untainted
- * worker facts/leads, optional in-memory program-graph controller routes) into a compact, prioritized
- * snapshot, and serializes it under a deterministic UTF-8 byte budget for the single-turn planner.
+ * worker facts/leads, optional in-memory program-graph controller routes, bounded open chain
+ * hypotheses) into a compact, prioritized snapshot, and serializes it under a deterministic UTF-8
+ * byte budget for the single-turn planner.
  */
+import { isTerminalStepStatus } from '../step-status.ts'
+import { DEAD_END_STRIKE_LIMIT } from './frontier-scheduler.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
 import type { Run, Store } from './store.ts'
 
@@ -20,6 +23,13 @@ const FACT_CAP = 16
 const CODE_ROUTE_CAP = 12
 const SAMPLE_TEMPLATE_CAP = 3
 const FACT_SUMMARY_MAX = 120
+/** Multi-hop audit facts keep their `Hop 1 -> Hop 2 -> ...` skeleton within this bound. */
+const FACT_MULTIHOP_SUMMARY_MAX = 240
+const OPEN_CHAIN_CAP = 4
+const OPEN_CHAIN_SUSPECT_SAMPLE_LIMIT = 500
+const MAX_PARSED_HOPS = 12
+const HOP_MARKER_RE = /\bhop\s*(\d{1,2})\b/gi
+const HOP_ROUTE_RE = /(?:^|[\s(,])(?:(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+)?(\/[A-Za-z0-9_\-.~:{}[\]/]*)/i
 const DEFAULT_BYTE_BUDGET = 4096
 const MUTATING_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const LEAD_SUBKINDS: ReadonlySet<string> = new Set(['det_lead', 'code_audit_suspect', 'lead', 'invariant_hypothesis'])
@@ -36,19 +46,30 @@ export interface WorldGraphEndpointGroup {
 
 export interface WorldGraphCausalEdge {
   id: string; source: 'api_dependency' | 'capability_ledger'; fromOrigin: string; from: string; toOrigin: string; to: string
+  /** Capability-ledger edges: the endpoint the verified hop landed on (where a chain may stall). */
+  endpoint?: string
   resourceKey?: string; crossOrigin: boolean; hostVerified: boolean
+}
+
+/** Bounded open chain hypothesis: declared hops exceed max host-verified hop depth. */
+export interface WorldGraphOpenChain {
+  /** Audit suspect fact id (cite it in `dependsOnFactIds` when proposing the next hop). */
+  id: string; origin: string; declaredHops: number; maxVerifiedHop: number
+  stalledEndpoint?: string; nextHop?: string; attempts: number
 }
 
 export interface WorldGraphFact { id: string; origin: string; kind: string; summary: string; route?: string; lead: boolean; confirmed: boolean }
 export interface WorldGraphCodeRoute { method: string; path: string; file: string; guards: string[]; sinks: string[] }
 
 export interface WorldGraphTruncation {
-  omittedGroups: number; omittedEdges: number; omittedFacts: number; omittedCodeRoutes: number; byteBudget: number; serializedBytes?: number
+  omittedGroups: number; omittedEdges: number; omittedFacts: number; omittedCodeRoutes: number; omittedOpenChains: number
+  byteBudget: number; serializedBytes?: number
 }
 
 export interface WorldGraphSnapshot {
   version: 1; runId: string; principals: string[]
   groups: WorldGraphEndpointGroup[]; edges: WorldGraphCausalEdge[]; facts: WorldGraphFact[]; codeRoutes: WorldGraphCodeRoute[]
+  openChains: WorldGraphOpenChain[]
   stats: { endpoints: number; exchangesSampled: number; apiDependencies: number; ledgerEdges: number; factsSeen: number; degraded?: string[] }
   truncation: WorldGraphTruncation
 }
@@ -60,8 +81,9 @@ export interface WorldGraphApiDependencyInput {
   producerOrigin: string; producerMethod: string; producerPath: string
   consumerOrigin: string; consumerMethod: string; consumerPath: string
 }
-export interface WorldGraphLedgerEdgeInput { edgeId: string; fromOrigin: string; from: string; toOrigin: string; to: string }
+export interface WorldGraphLedgerEdgeInput { edgeId: string; fromOrigin: string; from: string; toOrigin: string; to: string; endpoint?: string }
 export interface WorldGraphFactInput { id: string; origin: string; kind: string; summary: string; data?: Record<string, unknown> | null }
+export interface OpenChainStepInput { status: string; dependsOnFactIds: readonly string[] }
 export interface WorldGraphConfirmedRef { origin?: string | null; method?: string | null; path: string }
 /** Structural subset of the coordinator program graph (in-memory only; never walks the filesystem). */
 export interface WorldGraphProgramGraphInput {
@@ -80,6 +102,10 @@ export interface BuildWorldGraphInput extends Omit<CollectWorldGraphOptions, 'on
   runId: string; endpoints: readonly WorldGraphEndpointInput[]; exchanges: readonly WorldGraphExchangeInput[]
   apiDependencies?: readonly WorldGraphApiDependencyInput[]; ledgerEdges?: readonly WorldGraphLedgerEdgeInput[]
   facts?: readonly WorldGraphFactInput[]; degraded?: readonly string[]
+  /** Audit suspects for open-chain derivation (defaults to `code_audit_suspect` entries in `facts`). */
+  chainSuspects?: readonly WorldGraphFactInput[]
+  /** Chain steps used to count attempts per open chain hypothesis. */
+  chainSteps?: readonly OpenChainStepInput[]
 }
 
 /** Group key prefix: `/api/v1/<seg>`, `/api/<seg>`, or `/<seg>` (never a path parameter). */
@@ -118,6 +144,90 @@ function isConfirmedTemplate(origin: string, template: string, refs: readonly Wo
 function cleanText(text: string, max: number): string {
   const flat = text.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()
   return flat.length <= max ? flat : `${flat.slice(0, Math.max(0, max - 1)).trimEnd()}…`
+}
+
+export interface DeclaredChainHop { hop: number; method?: string; endpoint?: string; label: string }
+
+/**
+ * Parse the audit's generic `Hop 1 (METHOD /path, file:line, sink) -> Hop 2 (...)` / `Hop N`
+ * trajectory format into ordered hops (first occurrence of each hop number wins).
+ */
+export function parseDeclaredChainHops(text: string): DeclaredChainHop[] {
+  const flat = text.replace(/[\u0000-\u001f\u007f]+/g, ' ')
+  const markers = [...flat.matchAll(HOP_MARKER_RE)]
+  const hops = new Map<number, DeclaredChainHop>()
+  markers.forEach((marker, i) => {
+    const hop = Number(marker[1])
+    if (!Number.isInteger(hop) || hop < 1 || hop > MAX_PARSED_HOPS || hops.has(hop)) return
+    const segment = flat.slice((marker.index ?? 0) + marker[0].length, markers[i + 1]?.index ?? flat.length)
+      .replace(/^[\s:(]+/, '').replace(/[\s)>,;→-]+$/, '')
+    const route = HOP_ROUTE_RE.exec(segment)
+    const endpoint = route?.[2] && route[2].length > 1 ? normalizeRouteTemplate(route[2]) : undefined
+    hops.set(hop, {
+      hop, ...(route?.[1] ? { method: route[1].toUpperCase() } : {}), ...(endpoint ? { endpoint } : {}), label: cleanText(segment, 64),
+    })
+  })
+  return [...hops.values()].sort((a, b) => a.hop - b.hop)
+}
+
+const hopRoute = (hop: DeclaredChainHop): string => [hop.method, hop.endpoint].filter(Boolean).join(' ')
+
+/** Bounded multi-hop summary that keeps every hop's route (Hop 3+ never sliced away); null if < 2 hops. */
+function compactMultiHopSummary(lead: string, hopSource: string, max: number): string | null {
+  const hops = parseDeclaredChainHops(hopSource)
+  if (hops.length < 2) return null
+  const skeleton = hops.map(h => `Hop ${h.hop} ${hopRoute(h) || cleanText(h.label, 24)}`.trim()).join(' -> ')
+  const leadText = cleanText(lead.split(/\bhop\s*\d/i)[0] ?? '', Math.max(0, max - skeleton.length - 3))
+  return cleanText(leadText.length >= 16 ? `${leadText} | ${skeleton}` : skeleton, max)
+}
+
+function factHopSource(fact: Pick<WorldGraphFactInput, 'summary' | 'data'>): string {
+  const hypothesis = typeof fact.data?.hypothesis === 'string' ? fact.data.hypothesis : ''
+  return `${fact.summary} ${hypothesis}`
+}
+
+function factSummary(fact: WorldGraphFactInput): string {
+  return compactMultiHopSummary(fact.summary, factHopSource(fact), FACT_MULTIHOP_SUMMARY_MAX) ?? cleanText(fact.summary, FACT_SUMMARY_MAX)
+}
+
+export interface OpenChainHypothesis extends WorldGraphOpenChain { converted: boolean; active: boolean; exhausted: boolean }
+
+const isAuditSuspect = (fact: WorldGraphFactInput) => fact.kind === 'code_audit_suspect' || fact.data?.subkind === 'code_audit_suspect'
+
+/**
+ * Derive open chain hypotheses: audit suspects whose declared hop count exceeds the max hop whose
+ * endpoint matches a host-verified CapabilityLedger hop. A converted hypothesis is exhausted once
+ * `attemptLimit` dependent steps reached a terminal state with none still in flight.
+ */
+export function deriveOpenChainHypotheses(input: {
+  suspects: readonly WorldGraphFactInput[]; verifiedEndpoints: Iterable<string>
+  steps?: readonly OpenChainStepInput[]; attemptLimit?: number
+}): OpenChainHypothesis[] {
+  const verified = new Set([...input.verifiedEndpoints].map(e => normalizeRouteTemplate(e)))
+  const limit = Math.max(1, Math.floor(input.attemptLimit ?? DEAD_END_STRIKE_LIMIT))
+  const out: OpenChainHypothesis[] = []
+  const seen = new Set<string>()
+  for (const fact of input.suspects) {
+    if (seen.has(fact.id)) continue
+    seen.add(fact.id)
+    const hops = parseDeclaredChainHops(factHopSource(fact))
+    const declaredHops = hops.reduce((max, h) => Math.max(max, h.hop), 0)
+    const maxVerifiedHop = hops.reduce((max, h) => (h.endpoint && verified.has(h.endpoint) ? Math.max(max, h.hop) : max), 0)
+    if (declaredHops < 1 || maxVerifiedHop >= declaredHops) continue
+    const deps = (input.steps ?? []).filter(step => step.dependsOnFactIds.includes(fact.id))
+    const attempts = deps.filter(step => isTerminalStepStatus(step.status)).length
+    const active = deps.some(step => !isTerminalStepStatus(step.status))
+    const stalled = hops.find(h => h.hop > maxVerifiedHop)
+    const stalledEndpoint = stalled ? hopRoute(stalled) : ''
+    out.push({
+      id: fact.id, origin: fact.origin, declaredHops, maxVerifiedHop,
+      ...(stalledEndpoint ? { stalledEndpoint: cleanText(stalledEndpoint, 72) } : {}),
+      ...(stalled?.label ? { nextHop: cleanText(stalled.label, 64) } : {}),
+      attempts, converted: deps.length > 0, active, exhausted: !active && attempts >= limit,
+    })
+  }
+  return out.sort((a, b) => Number(a.exhausted) - Number(b.exhausted) || b.maxVerifiedHop - a.maxVerifiedHop ||
+    b.declaredHops - a.declaredHops || a.id.localeCompare(b.id))
 }
 
 interface GroupAccumulator { origin: string; prefix: string; methods: Set<string>; templates: string[]; endpointCount: number; matrix: WorldGraphAuthMatrix }
@@ -185,8 +295,9 @@ function buildEdges(input: BuildWorldGraphInput, inScope: (origin: string) => bo
   for (const edge of input.ledgerEdges ?? []) {
     push({
       id: edge.edgeId, source: 'capability_ledger', fromOrigin: edge.fromOrigin, from: cleanText(edge.from, 64),
-      toOrigin: edge.toOrigin, to: cleanText(edge.to, 64), crossOrigin: edge.fromOrigin !== edge.toOrigin,
-      hostVerified: true, tested: false,
+      toOrigin: edge.toOrigin, to: cleanText(edge.to, 64),
+      ...(edge.endpoint ? { endpoint: cleanText(normalizeRouteTemplate(edge.endpoint), 72) } : {}),
+      crossOrigin: edge.fromOrigin !== edge.toOrigin, hostVerified: true, tested: false,
     })
   }
   return edges
@@ -212,7 +323,7 @@ function buildFacts(input: BuildWorldGraphInput, inScope: (origin: string) => bo
     const confirmed = route ? isConfirmedTemplate(fact.origin, route, refs) : false
     const score = (lead ? 30 : 0) + (confirmed ? 0 : 20) + (['auth', 'object_ref', 'cors', 'policy_gap'].includes(fact.kind) ? 10 : 0)
     const out: WorldGraphFact = {
-      id: fact.id, origin: fact.origin, kind: subkind || fact.kind, summary: cleanText(fact.summary, FACT_SUMMARY_MAX),
+      id: fact.id, origin: fact.origin, kind: subkind || fact.kind, summary: factSummary(fact),
       ...(route ? { route } : {}), lead, confirmed,
     }
     return { out, score }
@@ -247,9 +358,14 @@ export function buildWorldGraphSnapshot(input: BuildWorldGraphInput): WorldGraph
   const facts = buildFacts(input, inScope)
   const codeRoutes = buildCodeRoutes(input.programGraph)
   const principals = [...new Set(groups.flatMap(g => Object.keys(g.authMatrix)))].sort()
+  const openChains = deriveOpenChainHypotheses({
+    suspects: (input.chainSuspects ?? (input.facts ?? []).filter(isAuditSuspect)).filter(f => inScope(f.origin)),
+    verifiedEndpoints: (input.ledgerEdges ?? []).flatMap(e => (e.endpoint ? [e.endpoint] : [])),
+    steps: input.chainSteps,
+  }).filter(c => !c.exhausted).map(({ converted: _c, active: _a, exhausted: _e, ...chain }) => chain)
   return {
     version: 1, runId: input.runId, principals, groups: groups.slice(0, GROUP_CAP), edges: edges.slice(0, EDGE_CAP),
-    facts: facts.slice(0, FACT_CAP), codeRoutes: codeRoutes.slice(0, CODE_ROUTE_CAP),
+    facts: facts.slice(0, FACT_CAP), codeRoutes: codeRoutes.slice(0, CODE_ROUTE_CAP), openChains: openChains.slice(0, OPEN_CHAIN_CAP),
     stats: {
       endpoints: input.endpoints.length, exchangesSampled: input.exchanges.length,
       apiDependencies: input.apiDependencies?.length ?? 0, ledgerEdges: input.ledgerEdges?.length ?? 0,
@@ -260,6 +376,7 @@ export function buildWorldGraphSnapshot(input: BuildWorldGraphInput): WorldGraph
       omittedEdges: Math.max(0, edges.length - EDGE_CAP),
       omittedFacts: Math.max(0, facts.length - FACT_CAP),
       omittedCodeRoutes: Math.max(0, codeRoutes.length - CODE_ROUTE_CAP),
+      omittedOpenChains: Math.max(0, openChains.length - OPEN_CHAIN_CAP),
       byteBudget: input.byteBudget ?? DEFAULT_BYTE_BUDGET,
     },
   }
@@ -276,9 +393,9 @@ function stringifyWithBytes(snap: WorldGraphSnapshot): { json: string; bytes: nu
   return { json, bytes: Buffer.byteLength(json, 'utf8') }
 }
 
-type PruneList = 'codeRoutes' | 'facts' | 'edges' | 'groups'
+type PruneList = 'codeRoutes' | 'facts' | 'edges' | 'groups' | 'openChains'
 const OMITTED_KEY: Record<PruneList, keyof Omit<WorldGraphTruncation, 'byteBudget' | 'serializedBytes'>> = {
-  codeRoutes: 'omittedCodeRoutes', facts: 'omittedFacts', edges: 'omittedEdges', groups: 'omittedGroups',
+  codeRoutes: 'omittedCodeRoutes', facts: 'omittedFacts', edges: 'omittedEdges', groups: 'omittedGroups', openChains: 'omittedOpenChains',
 }
 
 /**
@@ -289,6 +406,8 @@ const OMITTED_KEY: Record<PruneList, keyof Omit<WorldGraphTruncation, 'byteBudge
 export function serializeWorldGraph(snapshot: WorldGraphSnapshot, maxBytes = DEFAULT_BYTE_BUDGET): string {
   const snap: WorldGraphSnapshot = structuredClone(snapshot)
   snap.truncation.byteBudget = maxBytes
+  snap.openChains ??= []
+  snap.truncation.omittedOpenChains ??= 0
   delete snap.truncation.serializedBytes
   let current = stringifyWithBytes(snap)
   const fits = () => (current = stringifyWithBytes(snap)).bytes <= maxBytes
@@ -307,10 +426,15 @@ export function serializeWorldGraph(snapshot: WorldGraphSnapshot, maxBytes = DEF
     () => pruneTo('facts', 6),
     () => pruneTo('edges', 6),
     () => pruneTo('groups', 8),
-    () => { for (const f of snap.facts) f.summary = cleanText(f.summary, 48); return fits() },
+    () => pruneTo('openChains', 2),
+    () => {
+      for (const f of snap.facts) f.summary = compactMultiHopSummary('', f.summary, 96) ?? cleanText(f.summary, 48)
+      return fits()
+    },
     () => pruneTo('codeRoutes', 0),
     () => pruneTo('facts', 0),
     () => pruneTo('edges', 0),
+    () => pruneTo('openChains', 0),
     () => pruneTo('groups', 0),
     () => { snap.principals = snap.principals.slice(0, 4); delete snap.stats.degraded; return fits() },
   ]
@@ -360,16 +484,99 @@ export function collectWorldGraphFromStore(storage: Store, run: Pick<Run, 'id'>,
       const fromOrigin = edge.actorContext.serviceOrigin ?? ''
       const toOrigin = post?.serviceOrigin ?? fromOrigin
       if (!fromOrigin || !toOrigin) return []
+      const endpoint = ledgerEdgeEndpoint(edge.metadata, post?.metadata)
       return [{
         edgeId: edge.edgeId, fromOrigin, from: `${edge.actorContext.roleLabel ?? edge.actorContext.persona} ${edge.edgeBindingKind}`,
-        toOrigin, to: post ? `${post.kind} ${post.surface}` : (edge.terminalImpact ?? 'terminal'),
+        toOrigin, to: post ? `${post.kind} ${post.surface}` : (edge.terminalImpact ?? 'terminal'), ...(endpoint ? { endpoint } : {}),
       }]
     })
   })
   const facts = readStage('facts', [] as WorldGraphFactInput[], degraded, opts, () =>
     storage.listFacts(run.id, { includeTainted: false, limit: FACT_SAMPLE_LIMIT }))
+  const chainSuspects = readStage('code_audit_suspects', [] as WorldGraphFactInput[], degraded, opts, () =>
+    storage.listFacts(run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: FACT_SAMPLE_LIMIT }))
+  const chainSteps = readStage('chain_steps', [] as OpenChainStepInput[], degraded, opts, () => storage.listChainSteps(run.id))
   return buildWorldGraphSnapshot({
     runId: run.id, approvedOrigins: opts.approvedOrigins, endpoints, exchanges, apiDependencies, ledgerEdges, facts,
+    chainSuspects: [...chainSuspects, ...facts.filter(isAuditSuspect)], chainSteps,
     confirmedRefs: opts.confirmedRefs, programGraph: opts.programGraph, byteBudget: opts.byteBudget, degraded,
   })
+}
+
+/** Endpoint a host-verified ledger hop landed on (edge metadata first, then its postcondition capability). */
+function ledgerEdgeEndpoint(...sources: Array<Record<string, unknown> | null | undefined>): string | undefined {
+  for (const meta of sources) {
+    for (const key of ['endpoint', 'targetRoute', 'route', 'path']) {
+      const value = meta?.[key]
+      if (typeof value === 'string' && value.trim().startsWith('/')) return value.trim()
+    }
+  }
+  return undefined
+}
+
+/**
+ * Store-backed open chain hypotheses for the stop guard: every untainted audit suspect of the run
+ * (bounded page), matched against every host-verified CapabilityLedger hop endpoint.
+ */
+export function collectOpenChainHypotheses(storage: Store, run: Pick<Run, 'id' | 'goalRevision'>): OpenChainHypothesis[] {
+  const suspects = storage.listFacts(run.id, { includeTainted: false, kind: 'code_audit_suspect', limit: OPEN_CHAIN_SUSPECT_SAMPLE_LIMIT })
+  if (!suspects.length) return []
+  const ledger = storage.capabilityLedger(run.id)
+  const verifiedEndpoints = ledger.listCausalEdges().flatMap(edge => {
+    const post = edge.postconditionCapId ? ledger.getCapability(edge.postconditionCapId) : null
+    const endpoint = ledgerEdgeEndpoint(edge.metadata, post?.metadata)
+    return endpoint ? [endpoint] : []
+  })
+  return deriveOpenChainHypotheses({ suspects, verifiedEndpoints, steps: storage.listChainSteps(run.id, run.goalRevision) })
+}
+
+// ---------------------------------------------------------------------------
+// Recall Lever 1: Priority-Ordered Suspect Queue & Open-Chain Stop Hold
+// ---------------------------------------------------------------------------
+
+/** Wall-clock reserve below which open chain hypotheses no longer hold the run open. */
+export const OPEN_CHAIN_WALL_RESERVE_MS = 60_000
+/** Reserve share of `maxDurationMs` (the smaller of the two reserves applies). */
+export const OPEN_CHAIN_WALL_RESERVE_SHARE = 0.1
+
+export interface SuspectRankKey { priority: number; declaredHops: number; index: number }
+
+/** Deterministic suspect order: priority desc, declared chain hops desc, then record order (`index`). */
+export function rankSuspectsByPriority<T extends SuspectRankKey>(items: readonly T[]): T[] {
+  return [...items].sort((a, b) => b.priority - a.priority || b.declaredHops - a.declaredHops || a.index - b.index)
+}
+
+export interface OpenChainHoldInput {
+  /** Converted chain hypotheses whose declared hops exceed their max verified hop (not exhausted). */
+  openChainCount: number
+  /** Unconverted deferred/overflow audit suspects still awaiting dispatch. */
+  deferredSuspectCount: number
+  elapsedMs?: number; maxDurationMs?: number
+  budgetUsdSpent?: number; budgetUsdLimit?: number
+  requestsSpent?: number; requestBudget?: number
+}
+
+export type OpenChainHoldReason =
+  | 'open_chain_hypotheses' | 'deferred_suspects' | 'no_open_work'
+  | 'wall_reserve_exhausted' | 'budget_exhausted' | 'request_budget_exhausted'
+
+export interface OpenChainHoldDecision { hold: boolean; reason: OpenChainHoldReason }
+
+/**
+ * Should open chain hypotheses / deferred suspects keep the high-priority queue "non-empty"?
+ * Holds only while run budget, request budget, and a wall-clock reserve remain, so a run with
+ * unresolvable hypotheses still terminates cleanly at its bounds (no infinite planner loop).
+ */
+export function evaluateOpenChainHold(input: OpenChainHoldInput): OpenChainHoldDecision {
+  const openChains = Math.max(0, Math.floor(input.openChainCount || 0))
+  const deferred = Math.max(0, Math.floor(input.deferredSuspectCount || 0))
+  if (openChains + deferred === 0) return { hold: false, reason: 'no_open_work' }
+  if ((input.budgetUsdLimit ?? 0) > 0 && (input.budgetUsdSpent ?? 0) >= input.budgetUsdLimit!) return { hold: false, reason: 'budget_exhausted' }
+  if ((input.requestBudget ?? 0) > 0 && (input.requestsSpent ?? 0) >= input.requestBudget!) return { hold: false, reason: 'request_budget_exhausted' }
+  const maxMs = input.maxDurationMs ?? 0
+  if (maxMs > 0) {
+    const reserve = Math.min(OPEN_CHAIN_WALL_RESERVE_MS, Math.floor(maxMs * OPEN_CHAIN_WALL_RESERVE_SHARE))
+    if (maxMs - Math.max(0, input.elapsedMs ?? 0) <= reserve) return { hold: false, reason: 'wall_reserve_exhausted' }
+  }
+  return { hold: true, reason: deferred > 0 ? 'deferred_suspects' : 'open_chain_hypotheses' }
 }

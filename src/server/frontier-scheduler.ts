@@ -11,7 +11,8 @@
  *  3. Hop-Checkpoint Branching (`selectNextWaveAssignments`) emitting strictly bounded (<= 2 KB)
  *     pre-hydrated checkpoint briefs carrying opaque Layer-1 handles and the next-hop goal.
  *  4. Progress-Aware Termination (`evaluateWaveProgress`) replacing flat DRY_ROUND_LIMIT with
- *     frontier-progress accounting across tenant/role/service/surface reach and composite receipts.
+ *     frontier-progress accounting across tenant/role/service/surface reach, chain-depth advance
+ *     (a deeper verified hop on already-seen reach), and composite receipts.
  *  5. 2-Strike Dead-End Pruning & Negative-Edge Memoization keeping dead-end re-probe waste <= 5%.
  */
 
@@ -124,16 +125,25 @@ export interface WaveSelectionResult {
 export interface VerifiedHopReceiptEvent {
   hopReceiptId: string; branchKey: string; depth: number; hostVerified: boolean
   tenantScope: string; roleLabel?: string; serviceOrigin: string; surface: FrontierSurface; capabilityId?: string
+  /** Chain lineage this hop extends; defaults to the root of `branchKey` (`<root>>h<N>` children). */
+  lineageKey?: string
 }
 
 export interface FrontierReachState {
   tenants: Set<string>; roles: Set<string>; services: Set<string>; surfaces: Set<string>
   verifiedHopReceiptIds: Set<string>; confirmedCompositeReceiptIds: Set<string>
+  /** Run-wide max host-verified hop depth (chain-depth productivity). */
+  maxVerifiedHopDepth?: number
+  /** Max host-verified hop depth per chain lineage. */
+  lineageHopDepths?: Map<string, number>
 }
 
 export interface ReachDelta {
   newTenants: string[]; newRoles: string[]; newServices: string[]; newSurfaces: string[]
+  /** Productive hop receipts: reach expansion OR chain-depth advance. */
   newHopReceiptIds: string[]; newCompositeReceiptIds: string[]
+  /** Hop receipts that advanced verified chain depth (subset of `newHopReceiptIds`). */
+  newChainDepthHopReceiptIds?: string[]
 }
 
 export interface WaveProgressInput {
@@ -463,15 +473,43 @@ export function selectNextWaveAssignments(input: SelectWaveInput): WaveSelection
 // ---------------------------------------------------------------------------
 
 export function createEmptyReachState(): FrontierReachState {
-  return { tenants: new Set(), roles: new Set(), services: new Set(), surfaces: new Set(), verifiedHopReceiptIds: new Set(), confirmedCompositeReceiptIds: new Set() }
+  return {
+    tenants: new Set(), roles: new Set(), services: new Set(), surfaces: new Set(), verifiedHopReceiptIds: new Set(),
+    confirmedCompositeReceiptIds: new Set(), maxVerifiedHopDepth: 0, lineageHopDepths: new Map(),
+  }
+}
+
+/** Chain lineage of a frontier branch key: child branches are keyed `<root>>h<N>`. */
+export function chainLineageKey(branchKey: string): string {
+  return branchKey.trim().split('>h')[0] ?? ''
 }
 
 /**
- * Evaluate frontier progress: productive if yielding EITHER a confirmed CompositeProofReceipt
- * OR a host-verified new HopReceipt expanding tenant/role/service/surface reach.
+ * Record a host-verified hop depth; true when it advances verified chain depth. Depth-1 hops never
+ * advance a chain. A deeper hop advances when it beats the run-wide max OR its existing lineage's
+ * previous max, so single-app runs whose tenant/service/surface sets saturate early still count
+ * deeper verified hops along an existing chain as frontier progress.
+ */
+export function recordVerifiedHopDepth(reach: FrontierReachState, lineageKey: string, depth: number): boolean {
+  if (!Number.isFinite(depth) || depth < 1) return false
+  const hopDepth = Math.min(MAX_CHAIN_DEPTH, Math.floor(depth))
+  const lineages = reach.lineageHopDepths ??= new Map()
+  const prevGlobal = reach.maxVerifiedHopDepth ?? 0
+  const prevLineage = lineageKey ? lineages.get(lineageKey) : undefined
+  if (lineageKey && (prevLineage === undefined || hopDepth > prevLineage)) lineages.set(lineageKey, hopDepth)
+  if (hopDepth > prevGlobal) reach.maxVerifiedHopDepth = hopDepth
+  return hopDepth >= 2 && (hopDepth > prevGlobal || (prevLineage !== undefined && hopDepth > prevLineage))
+}
+
+/**
+ * Evaluate frontier progress: productive if yielding a confirmed CompositeProofReceipt, a
+ * host-verified new HopReceipt expanding tenant/role/service/surface reach, OR a host-verified hop
+ * advancing max verified chain depth on already-seen reach. Flat waves stay unproductive.
  */
 export function evaluateWaveProgress(input: WaveProgressInput): WaveProgressDecision {
-  const delta: ReachDelta = { newTenants: [], newRoles: [], newServices: [], newSurfaces: [], newHopReceiptIds: [], newCompositeReceiptIds: [] }
+  const delta: ReachDelta = {
+    newTenants: [], newRoles: [], newServices: [], newSurfaces: [], newHopReceiptIds: [], newCompositeReceiptIds: [], newChainDepthHopReceiptIds: [],
+  }
   for (const rawId of input.confirmedCompositeReceipts ?? []) {
     const id = rawId.trim()
     if (!id || input.reach.confirmedCompositeReceiptIds.has(id)) continue
@@ -492,7 +530,9 @@ export function evaluateWaveProgress(input: WaveProgressInput): WaveProgressDeci
     if (service && !input.reach.services.has(service)) { input.reach.services.add(service); delta.newServices.push(service); expanded = true }
     if (service && !input.reach.surfaces.has(surfaceKey)) { input.reach.surfaces.add(surfaceKey); delta.newSurfaces.push(surfaceKey); expanded = true }
     input.reach.verifiedHopReceiptIds.add(hopId)
-    if (expanded) delta.newHopReceiptIds.push(hopId)
+    const deeper = recordVerifiedHopDepth(input.reach, hop.lineageKey?.trim() || chainLineageKey(hop.branchKey), hop.depth)
+    if (deeper) delta.newChainDepthHopReceiptIds!.push(hopId)
+    if (expanded || deeper) delta.newHopReceiptIds.push(hopId)
   }
 
   const productive = delta.newCompositeReceiptIds.length > 0 || delta.newHopReceiptIds.length > 0
@@ -516,7 +556,7 @@ export function evaluateWaveProgress(input: WaveProgressInput): WaveProgressDeci
     return out('stop', 'frontier_exhausted', `Frontier exhausted after wave ${input.waveNo} (${input.coverageSettledCount ?? 0} coverage settlement(s)).`)
   }
   if (!productive && nextStreak >= limit) return out('stop', 'frontier_stagnated', `Frontier stagnated for ${nextStreak} consecutive unproductive wave(s).`)
-  if (productive) return out('continue', 'frontier_progress', `Wave ${input.waveNo} advanced frontier (${delta.newCompositeReceiptIds.length} composite, ${delta.newHopReceiptIds.length} hop reach expansion(s)).`, 0)
+  if (productive) return out('continue', 'frontier_progress', `Wave ${input.waveNo} advanced frontier (${delta.newCompositeReceiptIds.length} composite, ${delta.newHopReceiptIds.length} productive hop(s), ${delta.newChainDepthHopReceiptIds!.length} chain-depth advance(s); max verified depth ${input.reach.maxVerifiedHopDepth ?? 0}).`, 0)
   if (input.completedAssignments <= 0) return out('continue', 'awaiting_completions', `Wave ${input.waveNo} awaiting completed assignments (streak ${nextStreak}).`)
   return out('continue', 'frontier_active', `Wave ${input.waveNo} unproductive (${nextStreak}/${limit}); frontier remains active.`)
 }

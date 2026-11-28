@@ -141,8 +141,8 @@ function laneKey(run: Run): string {
 test('resolveSourceAuditWallClockMs scales proportionally across 4m, 10m, 30m, and unset runs', () => {
   // 10m (600s) -> 90s
   assert.equal(resolveSourceAuditWallClockMs(600_000), 90_000)
-  // 30m (1800s) -> capped at 90s (never 300s+)
-  assert.equal(resolveSourceAuditWallClockMs(1_800_000), 90_000)
+  // 30m (1800s) -> modest long-run scale-up: 90s + 10% of the 15m past the short-run threshold = 180s (never 300s+)
+  assert.equal(resolveSourceAuditWallClockMs(1_800_000), 180_000)
   // 4m (240s) -> floored at 45s (240s * 0.15 = 36s -> 45s)
   assert.equal(resolveSourceAuditWallClockMs(240_000), 45_000)
   // 8m (480s) -> 72s

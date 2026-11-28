@@ -226,7 +226,7 @@ import {
   singleStepWallClockMs,
   requeueInterruptedAssignments,
   CODE_AUDIT_WAVE1_MAX_STEPS,
-  convertCodeAuditSuspectsToChainSteps,
+  convertCodeAuditSuspectsToChainSteps, openChainHoldForRun, promoteDeferredCodeAuditSuspects, queueDeferredCodeAuditSuspects,
   type FrontierWaveController,
   type DeterministicSweepMode,
   type PhaseRequestBudgets,
@@ -372,6 +372,7 @@ export class Execution {
   private readonly plannerBackoffCapMs: number
   private readonly plannerMaxConsecutiveErrors: number
   private readonly dryStreakObserved = this.runState.mapView('dryStreakObserved')
+  private readonly deferredAuditSuspects = this.runState.mapView('deferredAuditSuspects')
   /** Phase-0 ranked probe plans (probe breadth hint; the endpoint store stays lossless). */
   private readonly probePlans = new ProbePlanRegistry()
   private readonly programGraphLeadsSeeded = this.runState.prefixedSetView('programGraphLeadsSeeded', '\0')
@@ -2393,9 +2394,9 @@ export class Execution {
       const suspects = settled.suspects
       const hostTiers = computeHostTiers([...approvedOrigins], threatModel)
       const stepsCreated = convertCodeAuditSuspectsToChainSteps(this.storage, latestRun, suspects, hostTiers, {
-        maxSteps: CODE_AUDIT_WAVE1_MAX_STEPS,
-        promoteMultiHop: true,
+        maxSteps: CODE_AUDIT_WAVE1_MAX_STEPS, promoteMultiHop: true,
       })
+      this.deferredAuditSuspects.set(run.id, queueDeferredCodeAuditSuspects(this.storage, latestRun, suspects, hostTiers, claimed.id)) // Lever 1 overflow queue
 
       const outcomeText = sessionResult.completion
         ? `[${sessionResult.completion.status}] ${sessionResult.completion.summary} (${suspects.length} suspects → ${stepsCreated.length} targeted chain steps)`
@@ -2842,20 +2843,19 @@ export class Execution {
     return guard
   }
 
-  /**
-   * True when no ready/pending high-priority step remains. High priority means the `det_lead`
-   * upgrade lane or a chain-primitive dispatch; ordinary class scans do not keep a drained planner
-   * alive on their own.
+  /** True when no ready/pending high-priority step (`det_lead` upgrade / chain-primitive dispatch) remains
+   * and no open chain hypothesis or deferred audit suspect holds the queue within run bounds (Lever 1).
    */
   private highPriorityQueueEmpty(run: Pick<Run, 'id' | 'goalRevision'>): boolean {
     try {
       const fullRun = this.storage.run(run.id)
       const unavailableOrigins = this.reconPlanner.unavailableOriginsForRun(fullRun)
       const steps = this.storage.listChainSteps(run.id, run.goalRevision)
-      return !dispatchableReadySteps(steps, undefined, unavailableOrigins).some(step =>
+      if (dispatchableReadySteps(steps, undefined, unavailableOrigins).some(step =>
         (isDetLeadDispatchStep(step) ||
           step.skills.some(skill => skill.startsWith('chain:') || skill === 'chain-primitives') ||
-          step.priority >= 88))
+          step.priority >= 88))) return false
+      return !openChainHoldForRun(this.storage, fullRun, { maxDurationMs: this.maxDurationMs, carried: this.deterministicOnly ? null : this.deferredAuditSuspects.get(run.id) ?? [] }).hold
     } catch {
       return true
     }
@@ -3100,11 +3100,11 @@ export class Execution {
     // Wave-1 invariant chains: promote high-signal cross-surface / cross-service / entity-lifecycle
     // hypotheses into ready `chain` lane steps BEFORE Phase B's first dispatch tick.
     try {
-      this.reconPlanner.ensureWave1InvariantChainSteps(
-        this.storage.run(run.id),
-        this.approvedOriginsSet(run),
-      )
+      this.reconPlanner.ensureWave1InvariantChainSteps(this.storage.run(run.id), this.approvedOriginsSet(run))
     } catch { /* invariant chain promotion is additive */ }
+    // Lever 1: promote priority-ordered deferred audit suspects into chain steps as worker slots open.
+    settleOrReport(run.id, 'code_audit.deferred_promotion', () => promoteDeferredCodeAuditSuspects(this.storage, this.storage.run(run.id), { carried: this.deferredAuditSuspects.get(run.id),
+      activeAssignments: [...this.active.values()].filter(j => j.assignment.runId === run.id && j.assignment.phase === 'investigation').length }), (id, k, m, d) => this.safeEvent(id, k, m, d))
 
     // R4-H-12: Route BOTH origin quarantine and circuit-open through ONE terminal-transition
     // primitive so quarantined/circuit-open steps transition to `blocked` (and restore cleanly
