@@ -5,7 +5,9 @@ import { Link } from '@tanstack/react-router'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { KovoMark } from '../brand/KovoMark.tsx'
 import { DevicesIcon, DevicesSessionModal } from '../settings/DevicesSessionModal.tsx'
+import { middleTruncate, projectDisambiguators } from '../shell/AppShell.tsx'
 import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
+import { HintTooltip, TooltipProvider, useMouseHoverHighlight } from '../ui/tooltip.tsx'
 import { useRun } from './data.tsx'
 import { useDecisions } from './decisions.tsx'
 import { KbdGroup } from './display.tsx'
@@ -97,8 +99,11 @@ export function writeTelemetryOpenPreference(open: boolean, storage?: Pick<Stora
   }
 }
 
-const railItemBase =
-  'group/ri relative flex h-[30px] w-full cursor-pointer select-none items-center gap-2.5 rounded-[7px] border-0 bg-transparent px-2.5 py-1 text-left font-sans text-[13px] font-normal leading-[18px] text-fg-muted shadow-none transition-[background-color,color] duration-[var(--d1)] hover:bg-hover hover:text-fg'
+/** Row metrics without a hover fill: view navs get the mouse-only sliding highlight instead. */
+const railItemShape =
+  'group/ri relative flex h-[30px] w-full cursor-pointer select-none items-center gap-2.5 rounded-[7px] border-0 bg-transparent px-2.5 py-1 text-left font-sans text-[13px] font-normal leading-[18px] text-fg-muted shadow-none transition-[background-color,color] duration-[var(--d1)] hover:text-fg'
+
+const railItemBase = cn(railItemShape, 'hover:bg-hover')
 
 const railItemOn =
   'bg-accent-soft font-medium text-fg hover:bg-accent-soft hover:text-fg before:absolute before:bottom-[6px] before:left-0 before:top-[6px] before:w-[2.5px] before:rounded-r-[2px] before:bg-accent before:content-[""]'
@@ -130,6 +135,35 @@ export function QueueRailBadge({
   >
     {activeDecideCount}
   </span>
+}
+
+/** Namesake projects among the rail's runs get a short-id suffix (run rows carry no hosts). */
+export function railProjectDisambiguators(runs: readonly { projectId: string; projectName: string }[]): Map<string, string> {
+  const seen = new Map<string, { id: string; name: string }>()
+  for (const r of runs) if (!seen.has(r.projectId)) seen.set(r.projectId, { id: r.projectId, name: r.projectName })
+  return projectDisambiguators([...seen.values()])
+}
+
+function RailProjectHeader({ projectId, projectName, disambiguator }: {
+  projectId: string
+  projectName: string
+  disambiguator?: string
+}) {
+  return <Link
+    to="/projects/$projectId"
+    params={{ projectId }}
+    search={{ tab: 'runs' }}
+    className="flex min-w-0 items-baseline gap-1.5 px-2.5 pb-0.5 pt-1 text-[11.5px] font-medium text-fg-subtle hover:text-fg-muted"
+    title={[projectName, disambiguator].filter(Boolean).join(' — ')}
+    data-slot="rail-project-header"
+  >
+    <span className="min-w-0 truncate">{projectName}</span>
+    {disambiguator && (
+      <span className="flex-none font-mono text-[10.5px] font-normal text-fg-faint" data-slot="rail-project-disambiguator">
+        {middleTruncate(disambiguator, 18)}
+      </span>
+    )}
+  </Link>
 }
 
 export function Rail() {
@@ -176,14 +210,15 @@ export function Rail() {
     report: model.report ? 'v' + model.report.version : '',
   }
 
+  // Switching views stays instant (keyboard, 100+/day); only mouse hover glides.
   const renderViewBtn = (v: (typeof VIEWS)[number]) => {
     const active = v.id === nav.view
-    return <button
-      key={v.id}
+    return <HintTooltip key={v.id} label={v.label} shortcut={`G then ${v.key.toUpperCase()}`} side="right">
+    <button
       type="button"
-      className={cn(railItemBase, active && railItemOn)}
+      className={cn(railItemShape, active && railItemOn)}
       aria-current={active ? 'page' : undefined}
-      title={`${v.label} (G then ${v.key.toUpperCase()})`}
+      data-hover-item=""
       onClick={() => nav.setView(v.id)}
     >
       <Icon name={v.icon} className={cn('transition-colors duration-[var(--d1)]', active ? 'text-accent' : 'text-fg-subtle group-hover/ri:text-fg-muted')} />
@@ -196,6 +231,7 @@ export function Rail() {
           />
         : (cnt[v.id] ? <span className="num text-[12px] text-fg-subtle">{cnt[v.id]}</span> : null)}
     </button>
+    </HintTooltip>
   }
 
   const {
@@ -204,6 +240,9 @@ export function Rail() {
     otherProjects,
     otherProjectsRunCount,
   } = useMemo(() => partitionRailRuns(runs, detail.run.projectId), [runs, detail.run.projectId])
+  const projectNames = useMemo(() => railProjectDisambiguators(runs), [runs])
+  const investigationHover = useMouseHoverHighlight()
+  const telemetryHover = useMouseHoverHighlight()
 
   const renderRunRow = (r: (typeof runs)[number]) => {
     const active = r.id === detail.run.id
@@ -233,7 +272,7 @@ export function Rail() {
   }
 
   const isDark = theme === 'dark'
-  return <>
+  return <TooltipProvider>
     <aside className="flex min-h-0 flex-col border-r border-line bg-rail" aria-label="Run navigation">
       <div className="flex h-12 flex-none items-center gap-[9px] pl-4 pr-3.5 text-[13px] font-normal tracking-[-0.003em] text-fg">
         <KovoMark />
@@ -253,7 +292,8 @@ export function Rail() {
         <div className={cn(sectionHeadingClass, 'pt-1.5')}>
           <span>Investigation</span>
         </div>
-        <nav className="flex flex-col gap-px" aria-label="Investigation views">
+        <nav className="flex flex-col gap-px" aria-label="Investigation views" {...investigationHover.listProps}>
+          {investigationHover.highlight}
           {investigationViews.map(renderViewBtn)}
         </nav>
 
@@ -283,15 +323,11 @@ export function Rail() {
             <DisclosureContent className="pt-0.5">
               {otherProjects.map(group => (
                 <div key={group.projectId} className="mt-1 first:mt-0">
-                  <Link
-                    to="/projects/$projectId"
-                    params={{ projectId: group.projectId }}
-                    search={{ tab: 'runs' }}
-                    className="block truncate px-2.5 pb-0.5 pt-1 text-[11.5px] font-medium text-fg-subtle hover:text-fg-muted"
-                    title={group.projectName}
-                  >
-                    {group.projectName}
-                  </Link>
+                  <RailProjectHeader
+                    projectId={group.projectId}
+                    projectName={group.projectName}
+                    disambiguator={projectNames.get(group.projectId)}
+                  />
                   <div className="flex flex-col gap-px">
                     {group.runs.map(renderRunRow)}
                   </div>
@@ -326,7 +362,8 @@ export function Rail() {
           />
         </button>
         {telemetryOpen && (
-          <nav id="rail-telemetry-nav" className="flex flex-col gap-px" aria-label="Telemetry views">
+          <nav id="rail-telemetry-nav" className="flex flex-col gap-px" aria-label="Telemetry views" {...telemetryHover.listProps}>
+            {telemetryHover.highlight}
             {telemetryViews.map(renderViewBtn)}
           </nav>
         )}
@@ -367,18 +404,22 @@ export function Rail() {
         </button>
       </div>
       <div className="flex flex-none items-center gap-1 border-t border-line px-2.5 py-2">
-        <button type="button" className={runIconBtn()} onClick={toggle} title="Toggle theme (⇧T)">
-          <Icon name={isDark ? 'sun' : 'moon'} />
-          <span className="text-[12px]">{isDark ? 'Light' : 'Dark'}</span>
-        </button>
+        <HintTooltip label="Toggle theme" shortcut="⇧T">
+          <button type="button" className={runIconBtn()} onClick={toggle}>
+            <Icon name={isDark ? 'sun' : 'moon'} />
+            <span className="text-[12px]">{isDark ? 'Light' : 'Dark'}</span>
+          </button>
+        </HintTooltip>
         <span className="flex-1" />
-        <button type="button" className={runIconBtn()} onClick={() => pal.openHelp()} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
-          <Icon name="keyboard" />
-        </button>
+        <HintTooltip label="Keyboard shortcuts" shortcut="?">
+          <button type="button" className={runIconBtn()} onClick={() => pal.openHelp()} aria-label="Keyboard shortcuts">
+            <Icon name="keyboard" />
+          </button>
+        </HintTooltip>
       </div>
     </aside>
     <DevicesSessionModal open={devicesOpen} onClose={() => setDevicesOpen(false)} />
-  </>
+  </TooltipProvider>
 }
 
 /**

@@ -55,7 +55,8 @@ h1, h2, h3, h4, p { margin: 0; }
 h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; line-height: 26px; }
 h2 { font-size: 15px; font-weight: 600; line-height: 22px; letter-spacing: -0.012em; }
 h3 { font-size: 13.5px; font-weight: 600; line-height: 20px; }
-a { color: inherit; text-decoration: none; }
+/* Zero specificity so Tailwind `text-*` / `underline` utilities on <Link> win without `!`. */
+:where(a) { color: inherit; text-decoration: none; }
 button, input, textarea, select { font: inherit; color: inherit; }
 button, [role=checkbox] { cursor: pointer; }
 
@@ -256,6 +257,38 @@ button:where([data-slot=dropdown-menu-trigger][data-popup-open]) {
 @media (pointer: coarse) {
   input:where(:not([type=checkbox]):not([type=radio]):not([type=range])), textarea, select { font-size: 16px !important; }
   [data-slot=checkbox]::after { inset: -15px; } /* 15px box + 2×15px = 45px */
+}
+
+/* [U20] Warm-up tooltips (src/components/ui/tooltip.tsx): a warm sibling
+   (`data-instant`) and every exit render in a single frame, so a sweep never
+   trails a fading label. Reduced motion keeps the opacity fade, never the scale. */
+[data-slot=tooltip-content]:where([data-instant], [data-ending-style]) { transition-duration: 0s; }
+@media (prefers-reduced-motion: reduce) {
+  [data-slot=tooltip-content] { scale: none !important; }
+}
+
+/* [U20] Mouse-only sliding hover highlight (useMouseHoverHighlight). Hidden
+   unless the device truly hovers with a fine pointer; it fades in where it
+   appears and only glides (composited transform) between rows. Reduced motion
+   drops `transform` from every transition list, so the glide snaps. */
+[data-hover-list] { position: relative; isolation: isolate; }
+[data-slot=hover-highlight] {
+  display: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: -1;
+  border-radius: 7px;
+  background: var(--hover);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--d1) var(--ease);
+}
+@media (hover: hover) and (pointer: fine) {
+  [data-slot=hover-highlight] { display: block; }
+  [data-slot=hover-highlight][data-visible] { opacity: 1; }
+  [data-slot=hover-highlight][data-glide] { transition: opacity var(--d1) var(--ease), transform 110ms var(--ease); }
 }
 
 /* Theme switches flip every surface in one frame instead of rippling through
