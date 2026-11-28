@@ -15,12 +15,112 @@ import type { FindingRow, RunEvent, RunModel } from '../model.ts'
 import { DUR, EASE_CSS, ease, reducedMotion, T } from '../motion.tsx'
 import { useTheme } from '../theme.ts'
 import { cn, runIconBtn } from '../tw.ts'
-import { allNodes, bounds, edgePath, hotEdges, isLive, LOD_K, nodeLineage, onCameraRequest, replaySpans, WF } from './workflow-layout.ts'
+import { allNodes, bounds, edgePath, hotEdges, isLive, nodeLineage, onCameraRequest, replaySpans, WF } from './workflow-layout.ts'
 import type { WfEdge, WfHead, WfLayout, WfNode } from './workflow-layout.ts'
 
 interface Cam { x: number; y: number; k: number }
 /** Camera per run, kept across view switches. */
 const camStore = new Map<string, Cam>()
+/** User-toggled phase collapse overrides per run (phase → collapsed), kept across view switches. */
+const phaseOverrideStore = new Map<string, Map<string, boolean>>()
+
+/** Below this zoom the cards switch to semantic-zoom compact cards (glyph + large title). */
+export const SEMANTIC_LOD_K = 0.80
+/** The initial and follow-live cameras never frame work below this zoom. */
+export const LEGIBILITY_FLOOR_K = 0.85
+/** Width of a collapsed completed-phase summary lane, and the gap after it. */
+export const COLLAPSED_PHASE_W = 196
+export const COLLAPSED_PHASE_GAP = 48
+/** The minimap appears only when the scaled graph exceeds this multiple of the viewport. */
+export const MINIMAP_OVERFLOW_RATIO = 2
+
+/** A finished worker phase that is neither live nor the run's current phase. */
+export function isCompletedPhaseHead(head: WfHead, runPhase: string): boolean {
+  return head.phase !== 'report' && !head.live && head.phase !== runPhase && head.n > 0 && head.done >= head.n
+}
+
+/**
+ * Phases folded to summary lanes by default: every completed phase while work is still active;
+ * on a finished run, every completed phase but the last so the final work column stays open.
+ */
+export function defaultCollapsedPhases(heads: readonly WfHead[], runPhase: string): Set<string> {
+  const done = heads.filter(h => isCompletedPhaseHead(h, runPhase))
+  const active = heads.some(h => h.phase !== 'report' && !isCompletedPhaseHead(h, runPhase) && (h.live || h.phase === runPhase || (h.n > 0 && h.done < h.n)))
+  if (active) return new Set(done.map(h => h.phase))
+  if (done.length < 2) return new Set()
+  return new Set(done.slice(0, -1).map(h => h.phase))
+}
+
+export interface CollapsedHead { head: WfHead; x: number; w: number; workerCount: number; findingsCount?: number }
+
+/**
+ * Re-pack the phase columns with collapsed phases folded into narrow summary lanes (their nodes and
+ * edges hidden). Visible cards are lifted together when the rows above them belonged to folded phases.
+ */
+export function projectWorkflowLayout(L: WfLayout, collapsedPhases: ReadonlySet<string>): { layout: WfLayout; collapsedHeads: CollapsedHead[] } {
+  if (!collapsedPhases.size) return { layout: L, collapsedHeads: [] }
+  const heads: WfHead[] = []
+  const collapsedHeads: CollapsedHead[] = []
+  const dxByPhase = new Map<string, number>()
+  let x = 0
+  for (const h of L.heads) {
+    if (h.phase !== 'report' && collapsedPhases.has(h.phase)) {
+      heads.push({ ...h, x, w: COLLAPSED_PHASE_W })
+      collapsedHeads.push({ head: h, x, w: COLLAPSED_PHASE_W, workerCount: h.n + h.earlier })
+      x += COLLAPSED_PHASE_W + COLLAPSED_PHASE_GAP
+      continue
+    }
+    dxByPhase.set(h.phase, x - h.x)
+    heads.push(x === h.x ? h : { ...h, x })
+    x += h.w + WF.PG
+  }
+  const kept = L.nodes.filter(n => dxByPhase.has(n.phase))
+  const dy = Math.max(0, Math.min(...kept.map(n => n.y), L.report?.y ?? Infinity) - WF.HH)
+  const shift = (n: WfNode): WfNode => {
+    const dx = dxByPhase.get(n.phase) ?? 0
+    return dx || dy ? { ...n, x: n.x + dx, y: n.y - dy } : n
+  }
+  const nodes = kept.map(shift)
+  const report = L.report ? shift(L.report) : null
+  const byId = new Map<string, WfNode>(nodes.map(n => [n.id, n]))
+  if (report) byId.set(report.id, report)
+  const edges = L.edges.filter(e => byId.has(e.from) && byId.has(e.to))
+  const inc = new Map<string, string[]>()
+  const out = new Map<string, string[]>()
+  for (const e of edges) {
+    inc.set(e.to, [...(inc.get(e.to) ?? []), e.from])
+    out.set(e.from, [...(out.get(e.from) ?? []), e.to])
+  }
+  const W = Math.max(WF.NW, ...heads.map(h => h.x + h.w))
+  const H = Math.max(WF.HH + WF.NH, ...nodes.map(n => n.y + WF.NH), report ? report.y + WF.NH : 0)
+  return { layout: { ...L, nodes, byId, edges, inc, out, heads, W, H, report }, collapsedHeads }
+}
+
+/** Semantic zoom tier for a camera zoom. */
+export function semanticZoomTier(k: number): 'compact' | 'full' {
+  return k < SEMANTIC_LOD_K ? 'compact' : 'full'
+}
+
+/** The minimap only earns its corner when the scaled graph is far larger than the viewport. */
+export function shouldShowMinimap(contentW: number, contentH: number, viewportW: number, viewportH: number, k: number): boolean {
+  return viewportW > 0 && viewportH > 0 && (contentW * k > viewportW * MINIMAP_OVERFLOW_RATIO || contentH * k > viewportH * MINIMAP_OVERFLOW_RATIO)
+}
+
+const liveRank = (status: string) => status === 'running' ? 2 : status === 'paused' || status === 'waiting_approval' ? 1 : 0
+
+/** Where the follow-live camera looks: the newest running (else paused) worker or stack, else the live phase. */
+export function selectFollowLiveTarget(L: WfLayout): { node: WfNode | null; head: WfHead | null } {
+  let node: WfNode | null = null, rank = 0, at = -Infinity
+  for (const n of L.nodes) {
+    const ms = n.kind === 'worker' ? [n.a!] : n.kind === 'stack' ? n.members ?? [] : []
+    for (const a of ms) {
+      const r = liveRank(a.status)
+      if (r && (r > rank || (r === rank && a.createdAt > at))) { node = n; rank = r; at = a.createdAt }
+    }
+  }
+  const head = (node ? L.heads.find(h => h.phase === node.phase) : undefined) ?? L.heads.find(h => h.live) ?? null
+  return { node, head }
+}
 
 export interface GraphProps {
   L: WfLayout
@@ -137,10 +237,12 @@ function tickBgClass(status: string): string {
   }
 }
 
-const NODE_BASE = 'group/node absolute flex h-[var(--nh)] w-[var(--nw)] cursor-pointer select-none flex-col gap-[3px] rounded-[9px] px-[11px] pb-2 pt-[9px] transition-[opacity,box-shadow,scale] duration-[var(--d2)] ease-kovo group-data-[lod]/wf:justify-center group-data-[lod]/wf:px-3.5 group-data-[lod]/wf:py-2.5 data-[rp=hidden]:pointer-events-none data-[rp=hidden]:scale-[.94] data-[rp=hidden]:opacity-0!'
+const NODE_BASE = 'group/node absolute flex h-[var(--nh)] w-[var(--nw)] cursor-pointer select-none flex-col gap-[3px] rounded-[9px] px-[11px] pb-2 pt-[9px] transition-[opacity,box-shadow,scale] duration-[var(--d2)] ease-kovo group-data-[lod]/wf:flex-row group-data-[lod]/wf:items-center group-data-[lod]/wf:gap-3 group-data-[lod]/wf:px-3.5 group-data-[lod]/wf:py-2.5 data-[rp=hidden]:pointer-events-none data-[rp=hidden]:scale-[.94] data-[rp=hidden]:opacity-0!'
 const NODE_STACK_LAYERS = "before:content-[''] before:absolute before:inset-x-1.5 before:-bottom-[5px] before:-z-[1] before:h-2 before:rounded-b-[9px] before:bg-panel before:shadow-surface after:content-[''] after:absolute after:inset-x-3 after:-bottom-2.5 after:-z-[2] after:h-2 after:rounded-b-[9px] after:bg-panel after:opacity-70 after:shadow-surface"
 const NODE_TOP = 'flex h-4 min-w-0 items-center gap-1.5 whitespace-nowrap text-[11.5px] tabular-nums group-data-[lod]/wf:hidden'
-const NODE_TITLE = 'line-clamp-2 min-h-[34px] text-[12.5px] font-medium leading-[17px] group-data-[lod]/wf:min-h-0 group-data-[lod]/wf:text-[21px] group-data-[lod]/wf:leading-[27px]'
+const NODE_TITLE = 'line-clamp-2 min-h-[34px] text-[12.5px] font-medium leading-[17px] group-data-[lod]/wf:min-h-0 group-data-[lod]/wf:min-w-0 group-data-[lod]/wf:flex-1 group-data-[lod]/wf:text-[18px] group-data-[lod]/wf:font-semibold group-data-[lod]/wf:leading-[22px]'
+/** Status glyph shown beside the title only in the semantic-zoom compact tier. */
+const NODE_LOD_GLYPH = 'hidden size-5 flex-none items-center justify-center [&>*]:scale-[1.45] group-data-[lod]/wf:inline-flex'
 const NODE_BOT = 'mt-auto flex items-center gap-2 whitespace-nowrap text-[11px] tabular-nums group-data-[lod]/wf:hidden'
 const NODE_BADGE_BASE = 'inline-flex h-[17px] items-center gap-1 rounded-[9px] px-1.5 text-[11px] font-medium shadow-[inset_0_0_0_1px_var(--line-2)]'
 const NODE_BADGE = `${NODE_BADGE_BASE} bg-sunk text-fg-muted`
@@ -182,6 +284,7 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
         <span className="flex-none">Report</span>
         <span className="ml-auto min-w-0 truncate text-[11px]">{fmtDate(n.createdAt)}</span>
       </div>
+      <span className={NODE_LOD_GLYPH}><Icon name="report" /></span>
       <div className={cn(NODE_TITLE, 'text-panel')}>{reportSub}</div>
       <div className={cn(NODE_BOT, REPORT_MUTE)}>
         <span>Open the report</span><span className="flex-1" /><Icon name="arrowR" />
@@ -233,6 +336,7 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
           </button>
         )}
       </div>
+      <span className={NODE_LOD_GLYPH}>{n.kind === 'stack' ? <Lv status={i.status} /> : <Icon name="queue" />}</span>
       <div className={cn(NODE_TITLE, n.kind === 'queue' ? 'text-fg-muted' : i.status === 'failed' ? 'text-danger' : 'text-fg')}>
         {n.kind === 'stack' ? n.g!.title : 'Queued chain steps'}
       </div>
@@ -270,6 +374,7 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
         ? <span className="ml-auto min-w-0 truncate font-sans text-[11px] text-warn">{i.hist}</span>
         : <span className="ml-auto min-w-0 truncate font-mono text-[11px]">{i.host}</span>}
     </div>
+    <span className={NODE_LOD_GLYPH}><Lv status={a.status} pulse={flags.sel} /></span>
     <div className={cn(NODE_TITLE, a.status === 'failed' ? 'text-danger' : flags.hist ? 'text-fg-muted' : 'text-fg')}>
       {a.title}
     </div>
@@ -314,30 +419,51 @@ const Edge = memo(function Edge({ d, e, hot }: { d: string; e: WfEdge; hot: bool
   />
 })
 
-/** Initial-fit insets: phase-nav pill (top) and the minimap footprint (right / bottom). */
+/** Initial-fit insets: phase bar (top) and the minimap footprint (right / bottom) when it shows. */
 const CAM_INSET = { top: 44, right: 224, bottom: 148 }
 
 /**
- * Initial camera (A-136): show the whole graph when it fits at a legible zoom (≥ 0.9);
- * otherwise frame the live phase (or the largest column) at 0.9–1×, inside the rect
- * left free by the phase-nav pill and the minimap.
+ * Initial camera (A-136): show the whole graph when it fits at a legible zoom (≥ 0.85);
+ * otherwise frame the live phase (or the largest open column, with the collapsed lanes just
+ * before it when they fit) at 0.85–1×. The minimap inset applies only when the minimap shows.
  */
-function initialCamera(Lc: WfLayout, W: number, H: number): Cam {
+function initialCamera(Lc: WfLayout, W: number, H: number, collapsed: ReadonlySet<string> = new Set()): Cam {
   const b = bounds(Lc)
   const top = CAM_INSET.top
-  const availW = Math.max(160, W - CAM_INSET.right)
-  const availH = Math.max(120, H - top - CAM_INSET.bottom)
-  const kAll = Math.min(availW / b.w, availH / b.h)
-  if (kAll >= 0.9) {
-    const k = Math.min(1, kAll)
-    return { k, x: (availW - b.w * k) / 2 - b.x * k, y: top - b.y * k }
+  const frame = (right: number, bottom: number): Cam => {
+    const availW = Math.max(160, W - right)
+    const availH = Math.max(120, H - top - bottom)
+    const kAll = Math.min(availW / b.w, availH / b.h)
+    if (kAll >= LEGIBILITY_FLOOR_K) {
+      const k = Math.min(1, kAll)
+      return { k, x: (availW - b.w * k) / 2 - b.x * k, y: top - b.y * k }
+    }
+    let head: WfHead | undefined = Lc.heads.find(h => h.live && !collapsed.has(h.phase))
+    if (!head) for (const h of Lc.heads) if (!collapsed.has(h.phase) && (!head || h.n > head.n)) head = h
+    const fitK = Math.min(availW / ((head?.w ?? b.w) + WF.PAD * 2), availH / b.h)
+    let k = clamp(fitK, LEGIBILITY_FLOOR_K, 1)
+    let fx = head ? head.x - WF.PAD : b.x
+    if (head) {
+      // pull the folded lanes just before the live column into frame while the zoom stays legible
+      let j = Lc.heads.indexOf(head)
+      while (j > 0 && collapsed.has(Lc.heads[j - 1].phase)) {
+        const kk = Math.min(k, availW / (head.x + head.w - Lc.heads[j - 1].x + WF.PAD * 2))
+        if (kk < LEGIBILITY_FLOOR_K) break
+        k = kk
+        j--
+      }
+      // a folded lane left out of frame must not peek in as a sliver at the left edge
+      fx = Lc.heads[j].x - (j > 0 && collapsed.has(Lc.heads[j - 1].phase) ? 24 : WF.PAD)
+    }
+    return { k, x: -fx * k + 16, y: Math.max(top - b.y * k, top + (availH - b.h * k) / 2 - b.y * k) }
   }
-  let head: WfHead | undefined = Lc.heads.find(h => h.live)
-  if (!head) for (const h of Lc.heads) if (!head || h.n > head.n) head = h
-  const fitK = Math.min(availW / ((head?.w ?? b.w) + WF.PAD * 2), availH / b.h)
-  const k = clamp(fitK, 0.9, 1)
-  const fx = head ? head.x - WF.PAD : b.x
-  return { k, x: -fx * k + 16, y: Math.max(top - b.y * k, top + (availH - b.h * k) / 2 - b.y * k) }
+  const bare = frame(16, 56)
+  return shouldShowMinimap(b.w, b.h, W, H, bare.k) ? frame(CAM_INSET.right, CAM_INSET.bottom) : bare
+}
+
+/** Width (px) of the floating inspector overlay covering the right of the canvas (0 when docked). */
+function paneInset(el: Element | null): number {
+  return el ? parseFloat(getComputedStyle(el).getPropertyValue('--pane-inset')) || 0 : 0
 }
 
 /** Session flag: the graph entrance plays once per session (A-137). */
@@ -349,10 +475,55 @@ function markGraphSeen() {
   try { sessionStorage.setItem(GRAPH_SEEN_KEY, '1') } catch { /* storage disabled: entrance simply replays */ }
 }
 
-export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand, onReport, replay, onReplayClose, skipEntrance }: GraphProps) {
+const NO_OVERRIDES: ReadonlyMap<string, boolean> = new Map()
+
+export function WorkflowGraph({ L: fullL, selId, focusSet, nomatch, onSelect, onExpand, onReport, replay, onReplayClose, skipEntrance }: GraphProps) {
   const { model, events, detail } = useRun()
   const runId = detail.run.id
+  const runPhase = detail.run.phase
   const { theme } = useTheme()
+
+  // ---- collapsed completed phases: defaults + per-run user overrides; the selection's phase always opens
+  const [ov, setOv] = useState(() => ({ runId, map: phaseOverrideStore.get(runId) ?? NO_OVERRIDES }))
+  const overrides = ov.runId === runId ? ov.map : phaseOverrideStore.get(runId) ?? NO_OVERRIDES
+  const setPhaseCollapsed = useCallback((phase: string, on: boolean) => {
+    const next = new Map(phaseOverrideStore.get(runId) ?? NO_OVERRIDES)
+    next.set(phase, on)
+    phaseOverrideStore.set(runId, next)
+    setOv({ runId, map: next })
+  }, [runId])
+  const baseCollapsed = useMemo(() => {
+    const s = defaultCollapsedPhases(fullL.heads, runPhase)
+    for (const h of fullL.heads) {
+      const on = overrides.get(h.phase)
+      if (on === false) s.delete(h.phase)
+      else if (on && isCompletedPhaseHead(h, runPhase)) s.add(h.phase)
+    }
+    return s
+  }, [fullL.heads, runPhase, overrides])
+  const selPhase = selId ? fullL.byId.get(selId)?.phase : undefined
+  const collapsed = useMemo(() => {
+    if (!selPhase || !baseCollapsed.has(selPhase)) return baseCollapsed
+    const s = new Set(baseCollapsed)
+    s.delete(selPhase)
+    return s
+  }, [baseCollapsed, selPhase])
+  const collapsedRef = useRef(collapsed)
+  collapsedRef.current = collapsed
+  const baseCollapsedRef = useRef(baseCollapsed)
+  baseCollapsedRef.current = baseCollapsed
+  // Selecting into a folded phase opens it for good (it stays open after the selection moves on).
+  useEffect(() => {
+    if (selPhase && baseCollapsedRef.current.has(selPhase)) setPhaseCollapsed(selPhase, false)
+  }, [selId, selPhase, setPhaseCollapsed])
+  const projected = useMemo(() => projectWorkflowLayout(fullL, collapsed), [fullL, collapsed])
+  const L = projected.layout
+  const collapsedLanes = useMemo(() => new Map(projected.collapsedHeads.map(c => {
+    const seen = new Set<string>()
+    for (const a of model.detail.assignments) if (a.phase === c.head.phase) for (const f of model.workerFindings.get(a.id) ?? []) seen.add(f.id)
+    return [c.head.phase, { ...c, findingsCount: seen.size }] as const
+  })), [projected, model])
+
   const vpRef = useRef<HTMLDivElement>(null)
   const cvRef = useRef<HTMLDivElement>(null)
   const miniRef = useRef<HTMLCanvasElement>(null)
@@ -360,7 +531,10 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   const tipRef = useRef<HTMLDivElement>(null)
   const cam = useRef<Cam | null>(camStore.get(runId) ?? null)
   const camAnim = useRef<() => void>(() => {})
-  const [lod, setLod] = useState(false)
+  const [zoomTier, setZoomTier] = useState<'compact' | 'full'>('full')
+  const [showMinimap, setShowMinimap] = useState(false)
+  const showMiniRef = useRef(showMinimap)
+  showMiniRef.current = showMinimap
   const [phaseCur, setPhaseCur] = useState(0)
   const [hover, setHover] = useState<string | null>(null)
   const hoverRef = useRef<string | null>(null)
@@ -369,6 +543,25 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   Lref.current = L
   const selRef = useRef(selId)
   selRef.current = selId
+
+  // ---- follow-live camera: on by default while work is live; any manual camera move disengages it
+  const liveTarget = useMemo(() => selectFollowLiveTarget(L), [L])
+  const hasLiveTarget = liveTarget.node !== null || L.heads.some(h => h.live)
+  const [followLive, setFollowLiveState] = useState(() => hasLiveTarget && !selId)
+  const followRef = useRef(followLive)
+  const setFollow = useCallback((on: boolean) => {
+    if (followRef.current === on) return
+    followRef.current = on
+    setFollowLiveState(on)
+  }, [])
+  const followRun = useRef(runId)
+  useEffect(() => {
+    if (followRun.current === runId) return
+    followRun.current = runId
+    setFollow(hasLiveTarget)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId, setFollow])
+  const restoredCam = useRef(cam.current !== null)
 
   const info = useMemo(() => nodeInfo(model, L, events), [model, L, events])
 
@@ -480,7 +673,9 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     vp.style.setProperty('--bx', c.x + 'px')
     vp.style.setProperty('--by', c.y + 'px')
     if (zlRef.current) zlRef.current.textContent = Math.round(c.k * 100) + '%'
-    setLod(c.k < LOD_K)
+    setZoomTier(semanticZoomTier(c.k))
+    const b = bounds(Lref.current)
+    setShowMinimap(shouldShowMinimap(b.w, b.h, vp.clientWidth, vp.clientHeight, c.k))
     const cx = (vp.clientWidth * 0.4 - c.x) / c.k
     let cur = 0
     Lref.current.heads.forEach((h, i) => { if (h.x <= cx) cur = i })
@@ -523,22 +718,50 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   const fit = useCallback(() => {
     const vp = vpRef.current
     if (!vp) return
+    setFollow(false)
     const b = bounds(Lref.current)
-    const W = vp.clientWidth, H = vp.clientHeight - 100
+    const W = vp.clientWidth - paneInset(vp), H = vp.clientHeight - 100
     const k = clamp(Math.min(W / b.w, H / b.h), 0.12, 1)
     camTo({ k, x: (W - b.w * k) / 2 - b.x * k, y: 44 + (H - b.h * k) / 2 - b.y * k })
-  }, [camTo])
+  }, [camTo, setFollow])
 
-  const initialCam = useCallback((): Cam => initialCamera(Lref.current, vpRef.current!.clientWidth, vpRef.current!.clientHeight), [])
+  const initialCam = useCallback((): Cam => {
+    const vp = vpRef.current!
+    return initialCamera(Lref.current, vp.clientWidth - paneInset(vp), vp.clientHeight, collapsedRef.current)
+  }, [])
+
+  /** Frame the live worker (or the live / largest open phase) at a legible zoom. */
+  const panToLive = useCallback((dur: number = 240) => {
+    const vp = vpRef.current, c = cam.current
+    if (!vp || !c) return
+    const Lc = Lref.current
+    const { node, head: liveHead } = selectFollowLiveTarget(Lc)
+    let head = liveHead
+    if (!head) for (const h of Lc.heads) if (h.phase !== 'report' && !collapsedRef.current.has(h.phase) && (!head || h.n >= head.n)) head = h
+    const k = Math.min(1.6, Math.max(c.k, LEGIBILITY_FLOOR_K))
+    const W = vp.clientWidth - paneInset(vp), H = vp.clientHeight
+    const b = bounds(Lc)
+    const top = CAM_INSET.top
+    const cx = node ? node.x + WF.NW / 2 : head ? head.x + head.w / 2 : b.x + b.w / 2
+    const cy = node ? node.y + WF.NH / 2 : b.y + b.h / 2
+    const x = b.w * k <= W - 32
+      ? (W - b.w * k) / 2 - b.x * k
+      : clamp(W * 0.5 - cx * k, W - 16 - (b.x + b.w) * k, 16 - b.x * k)
+    const y = b.h * k <= H - top - 56
+      ? top - b.y * k
+      : clamp(H * 0.45 - cy * k, H - 56 - (b.y + b.h) * k, top - b.y * k)
+    if (Math.abs(x - c.x) < 1 && Math.abs(y - c.y) < 1 && Math.abs(k - c.k) < 0.001) return
+    camTo({ k, x, y }, dur)
+  }, [camTo])
 
   const reveal = useCallback((id: string, center: boolean) => {
     const Lc = Lref.current, n = Lc.byId.get(id), vp = vpRef.current, c = cam.current
     if (!n || !vp || !c) return
-    const W = vp.clientWidth, H = vp.clientHeight
+    const W = vp.clientWidth - paneInset(vp), H = vp.clientHeight
     let k = c.k
     if (k < 0.62 && center) k = 0.8
     const sx = n.x * k + c.x, sy = n.y * k + c.y, sw = WF.NW * k, sh = WF.NH * k
-    const inView = sx > 40 && sy > 50 && sx + sw < W - 220 && sy + sh < H - 60
+    const inView = sx > 40 && sy > 50 && sx + sw < W - (showMiniRef.current ? 220 : 20) && sy + sh < H - 60
     if (inView && k === c.k && !center) return
     const b = bounds(Lc)
     const fitsV = b.h * k <= H - 60
@@ -555,12 +778,45 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     if (!cam.current) cam.current = initialCam()
     applyCam()
     const vp = vpRef.current!
-    const ro = new ResizeObserver(() => drawMini())
+    const ro = new ResizeObserver(() => applyCam())
     ro.observe(vp)
     return () => { ro.disconnect(); camAnim.current() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-  useEffect(() => { drawMini() }, [drawMini, focus, selId, theme, L])
+  useEffect(() => { applyCam() }, [applyCam, focus, selId, theme, L])
+  useEffect(() => { if (showMinimap) drawMini() }, [showMinimap, drawMini])
+
+  // follow-live: keep the newest live worker framed as workers arrive (the first frame is the initial camera)
+  const followKey = liveTarget.node ? liveTarget.node.id : liveTarget.head?.phase ?? ''
+  const followMounted = useRef(false)
+  useEffect(() => {
+    const first = !followMounted.current
+    followMounted.current = true
+    if (first && !restoredCam.current) return
+    if (followRef.current && !rp.current.on) panToLive()
+  }, [followKey, L.W, panToLive])
+
+  // phase nav into a folded phase: expand it, then land on its cards once the layout re-packs
+  const pendingJump = useRef<string | null>(null)
+  const jumpToPhase = (phase: string) => {
+    setFollow(false)
+    rp.current.follow = false
+    if (collapsedRef.current.has(phase)) { pendingJump.current = phase; setPhaseCollapsed(phase, false); return }
+    const h = Lref.current.heads.find(x => x.phase === phase), c = cam.current
+    if (h && c) camTo({ k: c.k, x: 24 - h.x * c.k, y: c.y }, 240)
+  }
+  useEffect(() => {
+    const phase = pendingJump.current
+    if (!phase || collapsed.has(phase)) return
+    pendingJump.current = null
+    const h = L.heads.find(x => x.phase === phase), c = cam.current
+    if (h && c) camTo({ k: c.k, x: 24 - h.x * c.k, y: c.y }, 240)
+  }, [L, collapsed, camTo])
+  const toggleFollow = () => {
+    if (followRef.current) { setFollow(false); return }
+    setFollow(true)
+    panToLive()
+  }
 
   // the camera eases to the selection (first mount: centre it)
   const firstReveal = useRef(true)
@@ -744,6 +1000,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     if (!replay) return
     const { t0 } = rspanRef.current
     rp.current = { on: true, t: t0, playing: true, speed: 2, follow: true, shown: new Set() }
+    setFollow(false)
     setRpUi({ playing: true, speed: 2 })
     applyReplayRef.current(true)
     // camera: whole height, start at the left edge
@@ -762,7 +1019,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
       clearReplay()
       drawMini()
     }
-  }, [replay, loop, camTo, clearReplay, drawMini])
+  }, [replay, loop, camTo, clearReplay, drawMini, setFollow])
 
   const togglePlay = useCallback(() => {
     const r = rp.current
@@ -831,7 +1088,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
         hideTip()
         if (hoverRef.current) setHover(null)
       }
-      if (d.moved) { c.x = d.cx + dx; c.y = d.cy + dy; rp.current.follow = false; applyCam() }
+      if (d.moved) { c.x = d.cx + dx; c.y = d.cy + dy; rp.current.follow = false; setFollow(false); applyCam() }
       return
     }
     const t = e.target as Element
@@ -849,7 +1106,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     if (!d || d.moved) return
     if (d.expand) { onExpand(d.expand, true); return }
     if (d.node === 'report') { onReport(); return }
-    if (d.node) { onSelect(d.node === selRef.current ? null : d.node); return }
+    if (d.node) { setFollow(false); onSelect(d.node === selRef.current ? null : d.node); return }
     if (selRef.current) onSelect(null)
   }
 
@@ -863,6 +1120,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
       hideTip()
       camAnim.current()
       rp.current.follow = false
+      setFollow(false)
       const c = cam.current
       if (!c) return
       const r = vp.getBoundingClientRect()
@@ -877,7 +1135,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     }
     vp.addEventListener('wheel', onWheel, { passive: false })
     return () => vp.removeEventListener('wheel', onWheel)
-  }, [applyCam, zoomAt])
+  }, [applyCam, zoomAt, setFollow])
 
   // minimap: click or drag to move
   const miniDown = useRef(false)
@@ -887,8 +1145,9 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     const r = e.currentTarget.getBoundingClientRect()
     const { s, ox, oy } = miniGeo.current
     const wx = (e.clientX - r.left - ox) / s, wy = (e.clientY - r.top - oy) / s
-    const t = { k: c.k, x: vp.clientWidth / 2 - wx * c.k, y: vp.clientHeight / 2 - wy * c.k }
+    const t = { k: c.k, x: (vp.clientWidth - paneInset(vp)) / 2 - wx * c.k, y: vp.clientHeight / 2 - wy * c.k }
     rp.current.follow = false
+    setFollow(false)
     if (animate) camTo(t, 240)
     else { camAnim.current(); Object.assign(c, t); applyCam() }
   }
@@ -926,7 +1185,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
     { key: 'k', run: () => step(-1) },
     { key: ['+', '='], run: () => centerZoom(1.2) },
     { key: ['-', '_'], run: () => centerZoom(1 / 1.2) },
-    { key: '0', run: fit },
+    { key: ['0', '!'], run: fit },
     { key: ['Enter', 'o'], run: () => { if (selId) reveal(selId, true); else if (readingOrder[0]) onSelect(readingOrder[0].id) } },
     { key: ' ', run: () => { if (!replay) return false; togglePlay() } },
   ])
@@ -941,7 +1200,9 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   return <div
     className="group/wf @container/wf relative flex min-h-0 flex-1 flex-col [contain:paint]"
     data-focus={focus ? '' : undefined}
-    data-lod={lod ? '' : undefined}
+    data-lod={zoomTier === 'compact' ? '' : undefined}
+    data-zoom-tier={zoomTier}
+    data-follow-live={followLive ? '' : undefined}
     data-replaying={replay ? '' : undefined}
   >
     <div
@@ -970,15 +1231,62 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
           {L.edges.map(e => <Edge key={e.key} e={e} d={edgePath(L, e)} hot={!!focus?.edges.has(e.key)} />)}
         </svg>
         {L.heads.map(h => {
+          const label = h.phase === 'report' ? 'Report' : PHASE_LABEL[h.phase] ?? h.phase
+          const lane = collapsedLanes.get(h.phase)
+          if (lane) {
+            const count = lane.workerCount
+            const meta = [plural(h.n, 'worker') + ' complete', h.earlier ? h.earlier + ' earlier' : '', lane.findingsCount ? plural(lane.findingsCount, 'finding') : ''].filter(Boolean).join(' · ')
+            return <div key={h.phase} className="absolute px-0.5" style={{ left: h.x, top: 0, width: h.w, height: Math.max(L.H, WF.HH + WF.NH) }} data-wf-collapsed-phase={h.phase}>
+              <span className="flex items-baseline gap-2 whitespace-nowrap text-[13px] font-semibold text-fg">
+                {label}<span className="text-[12px] font-normal text-fg-subtle tabular-nums">Done</span>
+              </span>
+              <span className="mt-1.5 block h-[3px] overflow-hidden rounded-[2px] bg-line-2"><i className="block h-full w-full bg-fg-subtle" /></span>
+              <span className="pointer-events-none absolute inset-x-0.5 bottom-0 rounded-[9px] border border-dashed border-line-2" style={{ top: WF.HH }} aria-hidden="true" />
+              <button
+                type="button"
+                data-wf-float=""
+                data-wf-phase-toggle={h.phase}
+                aria-expanded="false"
+                aria-label={`Expand ${label}: ${plural(count, 'worker')}, all complete`}
+                title="Expand this completed phase"
+                className="absolute inset-x-0.5 flex h-auto min-h-[var(--nh)] cursor-pointer flex-col items-start gap-1 whitespace-normal rounded-[9px] border-0 bg-panel px-3 py-2.5 text-left font-sans shadow-surface transition-[box-shadow] duration-[var(--d1)] ease-kovo hover:bg-panel hover:shadow-[0_0_0_1px_var(--line-strong),0_4px_12px_-4px_rgba(0,0,0,.14)]"
+                style={{ top: WF.HH }}
+                onClick={() => { setFollow(false); setPhaseCollapsed(h.phase, false) }}
+              >
+                <span className="flex w-full min-w-0 items-center gap-1.5 text-[13px] font-medium leading-[18px] text-fg group-data-[lod]/wf:text-[17px] group-data-[lod]/wf:leading-[22px]">
+                  <span className="inline-flex flex-none text-ok"><Icon name="check" /></span>
+                  <span className="min-w-0 truncate">{label} · <span className="tabular-nums">{count}</span></span>
+                </span>
+                <span className="text-[11.5px] leading-4 text-fg-subtle group-data-[lod]/wf:hidden">{meta}</span>
+                <span className="mt-auto inline-flex items-center gap-1 text-[11.5px] font-medium leading-4 text-accent group-data-[lod]/wf:hidden">Expand<Icon name="chevR" size={11} /></span>
+              </button>
+            </div>
+          }
           const isCur = h.live && h.phase === detail.run.phase
+          const foldable = isCompletedPhaseHead(h, runPhase)
           return <div key={h.phase} className="absolute flex flex-col gap-1.5 px-0.5" style={{ left: h.x, top: 0, width: h.w }}>
             <span className="flex items-baseline gap-2 whitespace-nowrap text-[13px] font-semibold text-fg">
-              {h.phase === 'report' ? 'Report' : PHASE_LABEL[h.phase] ?? h.phase}
+              {label}
               <span className="text-[12px] font-normal text-fg-subtle tabular-nums">
                 {h.phase === 'report' ? 'v' + (model.report?.version ?? '') : h.n ? h.done + ' of ' + h.n + ' complete' : 'No workers'}
                 {h.earlier ? ' · ' + h.earlier + ' earlier' : ''}
               </span>
               {isCur && <span className="ml-0.5 text-[11px] font-medium text-accent">Current</span>}
+              {foldable && <button
+                type="button"
+                data-wf-float=""
+                data-wf-phase-toggle={h.phase}
+                aria-expanded="true"
+                aria-label={`Collapse ${label}`}
+                title="Fold this completed phase into a summary lane"
+                className="ml-auto inline-flex h-5 flex-none cursor-pointer items-center gap-1 self-center rounded-[5px] border-0 bg-transparent px-1.5 font-sans text-[11px] font-normal text-fg-subtle shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg"
+                onClick={() => {
+                  if (selPhase === h.phase) onSelect(null)
+                  setPhaseCollapsed(h.phase, true)
+                }}
+              >
+                <Icon name="minus" size={11} />Collapse
+              </button>}
             </span>
             <span className="h-[3px] overflow-hidden rounded-[2px] bg-line-2">
               <i
@@ -1014,31 +1322,48 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
       {!L.nodes.length && <div className="pointer-events-none absolute inset-0 flex items-center justify-center"><span className="text-[12.5px] text-fg-subtle">No workers match.</span></div>}
     </div>
 
-    <div
-      data-wf-float=""
-      className="absolute left-3 top-2.5 z-[3] flex h-7 max-w-[calc(100%-24px)] items-center gap-0 overflow-hidden rounded-lg bg-raise px-[3px] shadow-popover"
-      role="navigation"
-      aria-label="Phases"
-    >
-      {L.heads.map((h, i) => <span key={h.phase} className="contents">
-        {i > 0 && <span className="flex text-fg-faint"><Icon name="chevR" /></span>}
-        <button
-          type="button"
-          className={cn(
-            'inline-flex h-[22px] cursor-pointer items-center gap-[5px] whitespace-nowrap rounded-[5px] border-0 px-[7px] font-sans text-[12px] font-normal shadow-none transition-[background-color,color] duration-[var(--d1)]',
-            i === phaseCur
-              ? 'bg-press text-fg hover:bg-press'
-              : 'bg-transparent text-fg-subtle hover:bg-hover hover:text-fg',
-          )}
-          onClick={() => {
-            const c = cam.current
-            if (c) { rp.current.follow = false; camTo({ k: c.k, x: 24 - h.x * c.k, y: c.y }) }
-          }}
-        >
-          {h.phase === 'report' ? 'Report' : PHASE_LABEL[h.phase] ?? h.phase}
-          {h.phase !== 'report' && <span className={cn('text-[11px] tabular-nums', i === phaseCur ? 'text-fg-subtle' : 'text-fg-faint')}>{h.n + h.earlier}</span>}
-        </button>
-      </span>)}
+    <div className="pointer-events-none absolute left-3 right-[calc(var(--pane-inset,0px)+12px)] top-2.5 z-[3] flex items-center justify-between gap-2" data-wf-topbar="">
+      <div
+        data-wf-float=""
+        className="pointer-events-auto flex h-7 min-w-0 items-center gap-0 overflow-x-auto overflow-y-hidden rounded-lg bg-raise px-[3px] shadow-popover [scrollbar-width:none]"
+        role="navigation"
+        aria-label="Phases"
+      >
+        {L.heads.map((h, i) => <span key={h.phase} className="contents">
+          {i > 0 && <span className="flex flex-none text-fg-faint"><Icon name="chevR" /></span>}
+          <button
+            type="button"
+            className={cn(
+              'inline-flex h-[22px] flex-none cursor-pointer items-center gap-[5px] whitespace-nowrap rounded-[5px] border-0 px-[7px] font-sans text-[12px] font-normal shadow-none transition-[background-color,color] duration-[var(--d1)]',
+              i === phaseCur
+                ? 'bg-press text-fg hover:bg-press'
+                : 'bg-transparent text-fg-subtle hover:bg-hover hover:text-fg',
+            )}
+            data-wf-phase-nav={h.phase}
+            data-wf-phase-collapsed={collapsed.has(h.phase) ? '' : undefined}
+            onClick={() => jumpToPhase(h.phase)}
+          >
+            {h.phase === 'report' ? 'Report' : PHASE_LABEL[h.phase] ?? h.phase}
+            {h.phase !== 'report' && <span className={cn('text-[11px] tabular-nums', i === phaseCur ? 'text-fg-subtle' : 'text-fg-faint')}>{h.n + h.earlier}</span>}
+          </button>
+        </span>)}
+      </div>
+      <button
+        type="button"
+        data-wf-float=""
+        data-testid="wf-follow-live"
+        aria-pressed={followLive}
+        title={followLive ? 'Following the newest live worker · pan or zoom to stop' : 'Follow the newest live worker'}
+        className={cn(
+          'pointer-events-auto inline-flex h-7 flex-none cursor-pointer items-center gap-2 whitespace-nowrap rounded-lg border-0 px-2.5 font-sans text-[12px] font-medium transition-[background-color,color,box-shadow] duration-[var(--d1)] ease-kovo',
+          followLive
+            ? 'bg-accent-soft text-accent shadow-[inset_0_0_0_1px_var(--accent-line),var(--shadow-pop)] hover:bg-accent-soft'
+            : 'bg-raise text-fg-muted shadow-popover hover:bg-raise hover:text-fg',
+        )}
+        onClick={toggleFollow}
+      >
+        {followLive ? <><LiveDot />Following live</> : <><Icon name="follow" />Follow live</>}
+      </button>
     </div>
 
     <div data-wf-float="" className="absolute bottom-3 left-3 z-[3] flex items-end gap-1.5 group-data-[replaying]/wf:hidden">
@@ -1046,7 +1371,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
         <button type="button" className={zBtn} title="Zoom out (−)" aria-label="Zoom out" onClick={() => centerZoom(1 / 1.2)}><Icon name="minus" /></button>
         <span className="min-w-11 text-center text-[12px] text-fg-muted tabular-nums" ref={zlRef}>100%</span>
         <button type="button" className={zBtn} title="Zoom in (+)" aria-label="Zoom in" onClick={() => centerZoom(1.2)}><Icon name="plus" /></button>
-        <button type="button" className={zBtn} title="Fit graph (0)" aria-label="Fit graph" onClick={fit}><Icon name="fit" /></button>
+        <button type="button" className={zBtn} title="Fit graph (0 / ⇧1)" aria-label="Fit graph" onClick={fit}><Icon name="fit" /></button>
       </div>
       <div className="flex h-[30px] items-center gap-3 whitespace-nowrap rounded-lg bg-raise px-2.5 text-[11.5px] text-fg-subtle shadow-popover @max-[560px]/wf:hidden">
         {([['Handoff', undefined], ['Causal · facts', '4 3']] as const).map(([lbl, dash]) => (
@@ -1056,20 +1381,24 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
       </div>
     </div>
 
-    <div
+    {showMinimap && <div
       data-wf-float=""
-      className="absolute bottom-3 right-3 z-[3] h-[124px] w-[200px] cursor-pointer overflow-hidden rounded-lg bg-raise shadow-popover @max-[720px]/wf:h-24 @max-[720px]/wf:w-[150px]"
+      data-testid="wf-minimap"
+      className="absolute bottom-3 right-[calc(var(--pane-inset,0px)+12px)] z-[3] h-[124px] w-[200px] cursor-pointer overflow-hidden rounded-lg bg-raise shadow-popover @max-[720px]/wf:h-24 @max-[720px]/wf:w-[150px]"
       title="Minimap: click or drag to move"
       onPointerDown={e => { miniDown.current = true; e.currentTarget.setPointerCapture(e.pointerId); miniGo(e, true) }}
       onPointerMove={e => { if (miniDown.current) miniGo(e, false) }}
       onPointerUp={() => { miniDown.current = false }}
     >
       <canvas ref={miniRef} className="block size-full" />
-    </div>
+    </div>}
 
     {replay && <div
       data-wf-float=""
-      className="absolute bottom-3 left-3 right-[224px] z-[4] flex h-12 items-center gap-2.5 rounded-card bg-raise pl-1.5 pr-2.5 shadow-popover @max-[720px]/wf:right-[174px]"
+      className={cn(
+        'absolute bottom-3 left-3 z-[4] flex h-12 items-center gap-2.5 rounded-card bg-raise pl-1.5 pr-2.5 shadow-popover',
+        showMinimap ? 'right-[calc(var(--pane-inset,0px)+224px)] @max-[720px]/wf:right-[calc(var(--pane-inset,0px)+174px)]' : 'right-[calc(var(--pane-inset,0px)+12px)]',
+      )}
       role="group"
       aria-label="Replay"
     >
