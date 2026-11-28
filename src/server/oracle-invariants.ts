@@ -595,17 +595,25 @@ export function stepReadsState(step: Pick<ImpactStep, 'method' | 'requestJson'>)
   return isReadMethod(step.method) || isReadOnlyGraphqlRequest(step)
 }
 
-function isSuccess(status: number | null): boolean {
-  return status !== null && status >= 200 && status < 300
+function isSuccess(status: number | null): boolean { return status !== null && status >= 200 && status < 300 }
+
+/** B3: the ONE denied-control status predicate shared by the authorization oracle and the proof-receipt anon-control guard. */
+export function isDeniedControlStatus(status: number | null): boolean { return status === 401 || status === 403 || status === 404 }
+const isDenied = isDeniedControlStatus
+
+/** B1: a derived (capability) credential with no server-bound tenant is an UNKNOWN principal — it supports no peer-denial or cross-tenant inference. */
+export function isUnknownDerivedPrincipal(actor: Pick<ActorIdentity, 'handle' | 'tenant' | 'tenants'>): boolean { return Boolean(actor.handle?.startsWith('cap:')) && actorTenants(actor).size === 0 }
+
+/**
+ * B3: a denied control is tenant-compatible with a probe (a peer denial, not tenant isolation) only when neither side is an
+ * unknown derived principal and both are untenanted or share a tenant — a cross-tenant 401/403/404 is isolation, never peer denial.
+ */
+export function deniedControlTenantCompatible(control: Pick<ImpactStep, 'status' | 'actor'>, probe: Pick<ImpactStep, 'actor'>): boolean {
+  if (!isDeniedControlStatus(control.status) || isUnknownDerivedPrincipal(control.actor) || isUnknownDerivedPrincipal(probe.actor)) return false
+  return actorTenants(control.actor).size === 0 || actorTenants(probe.actor).size === 0 || actorsShareTenant(control.actor, probe.actor)
 }
 
-function isDenied(status: number | null): boolean {
-  return status === 401 || status === 403 || status === 404
-}
-
-function sameRoute(a: ImpactStep, b: ImpactStep): boolean {
-  return (a.route ?? '') !== '' && a.route === b.route
-}
+function sameRoute(a: ImpactStep, b: ImpactStep): boolean { return (a.route ?? '') !== '' && a.route === b.route }
 
 /** Same resource tree: equal route family, or a collection readback above the mutated item. */
 function relatedRoute(a: ImpactStep, b: ImpactStep): boolean {
@@ -1023,9 +1031,7 @@ interface PersistenceProof {
   controlDelta: StateDelta | null
 }
 
-function isDeleteStep(step: Pick<ImpactStep, 'method' | 'requestJson'>): boolean {
-  return isMutatingMethod(step.method) && (step.method ?? '').toUpperCase() === 'DELETE' && !isReadOnlyGraphqlRequest(step)
-}
+function isDeleteStep(step: Pick<ImpactStep, 'method' | 'requestJson'>): boolean { return isMutatingMethod(step.method) && (step.method ?? '').toUpperCase() === 'DELETE' && !isReadOnlyGraphqlRequest(step) }
 
 function findPersistence(steps: readonly ImpactStep[], probe: ImpactStep): PersistenceProof {
   const reads = steps.filter(step => isReadMethod(step.method) && step.json !== undefined && step.json !== null)
@@ -1270,9 +1276,7 @@ const GRAPHQL_INLINE_OBJECT_ARG_RE = /\(\s*[^)]*\b(?:[a-z0-9_]*_?id|tenant|org|o
 const GRAPHQL_VAR_OBJECT_ARG_RE = /\(\s*[^)]*\b(?:[a-z0-9_]*_?id|tenant|org|organization|account|user|owner|customer|email|slug|key|number|token|code|handle)\s*:\s*\$([A-Za-z_][A-Za-z0-9_]*)/gi
 const TENANT_SCOPE_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:tenant|org|organization|workspace)(?:_?id)?$/i
 
-function hasNonEmptyScalar(val: unknown): boolean {
-  return (typeof val === 'string' && val.trim().length > 0) || (typeof val === 'number' && Number.isFinite(val))
-}
+function hasNonEmptyScalar(val: unknown): boolean { return (typeof val === 'string' && val.trim().length > 0) || (typeof val === 'number' && Number.isFinite(val)) }
 
 /**
  * True when a request targets a specific object (concrete ID segment in the path, an explicit
@@ -1382,9 +1386,7 @@ export function hasForeignTenantOrOwnerDisclosure(
   return false
 }
 
-function sameTenant(a: ActorIdentity, b: ActorIdentity): boolean {
-  return actorsShareTenant(a, b)
-}
+function sameTenant(a: ActorIdentity, b: ActorIdentity): boolean { return actorsShareTenant(a, b) }
 
 /**
  * A 404 returned on a different request path (a nonexistent/bogus-ID selectivity control) only
@@ -1392,10 +1394,13 @@ function sameTenant(a: ActorIdentity, b: ActorIdentity): boolean {
  * target object.
  */
 function isBogusIdSelectivity404(control: ImpactStep, success: ImpactStep): boolean {
-  return control.status === 404 &&
-    control.pathAndQuery !== undefined &&
-    success.pathAndQuery !== undefined &&
-    control.pathAndQuery !== success.pathAndQuery
+  return control.status === 404 && control.pathAndQuery !== undefined && success.pathAndQuery !== undefined && control.pathAndQuery !== success.pathAndQuery
+}
+
+/** B4: a control on a different concrete object path refuses only an unproven (possibly fabricated) entity unless the host observed that entity succeed. */
+function isUnprovenEntityControl(control: ImpactStep, target: ImpactStep, steps: readonly ImpactStep[]): boolean {
+  const pathOf = (st: ImpactStep): string => (st.pathAndQuery ?? st.route ?? '').split('?')[0] ?? '', cp = pathOf(control), tp = pathOf(target)
+  return Boolean(cp && tp && cp !== tp && !steps.some(st => st !== control && isSuccess(st.status) && pathOf(st) === cp))
 }
 
 /**
@@ -1459,7 +1464,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     const unauthenticated = control.actor.handle === null && controlTenants.size === 0
     const targetTenants = targetProbe ? actorTenants(targetProbe.actor) : probeTenants
     const targetAuthenticated = targetProbe !== undefined && (targetProbe.actor.handle !== null || targetTenants.size > 0)
-    if (unauthenticated && targetAuthenticated) return false
+    if ((unauthenticated && targetAuthenticated) || isUnknownDerivedPrincipal(control.actor) || (targetProbe !== undefined && isUnknownDerivedPrincipal(targetProbe.actor))) return false
     const cRank = roleRank(control.actor.role), tRank = targetProbe ? roleRank(targetProbe.actor.role) : null
     if (cRank !== null && tRank !== null && cRank < tRank) return false
     if (controlTenants.size === 0 || targetTenants.size === 0) return true
@@ -2132,12 +2137,8 @@ export interface RepeatedTransitionControlResult {
 }
 
 function sameRequestBody(a: ImpactStep, b: ImpactStep): boolean {
-  const aJson = a.requestJson === undefined ? null : safeJson(a.requestJson)
-  const bJson = b.requestJson === undefined ? null : safeJson(b.requestJson)
-  if (aJson !== bJson) return false
-  const aRaw = a.requestBody === undefined ? null : a.requestBody
-  const bRaw = b.requestBody === undefined ? null : b.requestBody
-  return aRaw === bRaw
+  if ((a.requestJson === undefined ? null : safeJson(a.requestJson)) !== (b.requestJson === undefined ? null : safeJson(b.requestJson))) return false
+  return (a.requestBody === undefined ? null : a.requestBody) === (b.requestBody === undefined ? null : b.requestBody)
 }
 
 function sameMutatingRequest(a: ImpactStep, b: ImpactStep): boolean {
@@ -2397,7 +2398,7 @@ export function verifyRepeatedTransitionControl(input: {
     if (!stepMutatesState(control)) return false
     if ((control.method ?? '').toUpperCase() !== (first.method ?? '').toUpperCase()) return false
     if (!relatedRoute(control, first) && !sameRoute(control, first)) return false
-    if (isBogusIdSelectivity404(control, first)) return false
+    if (isBogusIdSelectivity404(control, first) || isUnprovenEntityControl(control, first, steps)) return false
     const status = control.status
     if (status === null) return false
     const isRefusalStatus = REFUSAL_CONTROL_STATUSES.has(status) || (status === 400 && sameRequestBody(control, first))
@@ -3146,7 +3147,7 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
   // R2-C-7 / C-6: reject anonymous controls, drop missing-tenant fallback, require equal-or-higher
   // peer role rank, and require the same request body.
   const peerDenial = (control: ImpactStep): boolean => {
-    if (!control.actor.handle) return false
+    if (!control.actor.handle || isUnknownDerivedPrincipal(control.actor) || isUnknownDerivedPrincipal(mutatingProbe.actor)) return false
     const controlTenants = actorTenants(control.actor)
     if (controlTenants.size > 0 || probeTenants.size > 0) {
       if (controlTenants.size === 0 || probeTenants.size === 0) return false
@@ -3164,7 +3165,7 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     peerDenial(control) &&
     isDenied(control.status) &&
     sameRoute(control, mutatingProbe) &&
-    !isBogusIdSelectivity404(control, mutatingProbe) &&
+    !isBogusIdSelectivity404(control, mutatingProbe) && !isUnprovenEntityControl(control, mutatingProbe, steps) &&
     steps.indexOf(control) < steps.indexOf(mutatingProbe))
   // Cross-tenant control read must bind to an object ID on the same object route (never a parent
   // collection prefix) and be corroborated by a victim readback.
@@ -3625,8 +3626,7 @@ export function assessStatusOnlyDivergence(steps: readonly ImpactStep[]): Status
 }
 
 function sameInjectionRoute(a: ImpactStep, b: ImpactStep): boolean {
-  const left = routeFamily(a.route ?? a.pathAndQuery ?? '')
-  const right = routeFamily(b.route ?? b.pathAndQuery ?? '')
+  const left = routeFamily(a.route ?? a.pathAndQuery ?? ''), right = routeFamily(b.route ?? b.pathAndQuery ?? '')
   return left !== '' && left === right
 }
 

@@ -1,0 +1,122 @@
+{
+  "id": "tier2-judge-cannot-override-terminal-unproven-fp",
+  "side": "fp",
+  "archetype": "tier2-judge-terminal-unproven",
+  "description": "A5: a configured Tier-2 policy judge with a verified same-principal 403->2xx refusal-control flip and a confirming skeptic must never flip a decided Tier-1 terminal_impact_unproven rejection whose terminal is a 202 job handle; no Verify Fix predicate is compiled.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/policy-judge.ts"
+    ],
+    "classes": [
+      "bola"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Org-scoped export job created by tenant member",
+    "impact": "Creates a queued export job handle on the member's own organization.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Export handle adjudicated by Tier-2 judge"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": false,
+    "composite": true,
+    "floorInjectionRecipe": false,
+    "agentScriptReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_member",
+      "arm": "control",
+      "role": "control",
+      "method": "POST",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}",
+      "requestJson": {
+        "format": "csv"
+      }
+    },
+    {
+      "id": "prb_create",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": "member_a",
+      "status": 202,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"jobId\":\"job_41\",\"status\":\"queued\"}",
+      "requestJson": {
+        "format": "csv"
+      }
+    }
+  ],
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_create",
+      "controlExchangeIds": [
+        "ctl_member"
+      ]
+    }
+  ],
+  "composite": {
+    "chainId": "tier2-export-handle",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "none",
+    "claimedDelta": "Member obtained an org export job handle adjudicated by Tier-2.",
+    "singleHop": true,
+    "terminalExchangeId": "prb_create",
+    "preChainControlIds": [
+      "ctl_member"
+    ],
+    "postChainReadbackIds": [],
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "expectedFailedStage": "terminal_impact",
+    "tier2Judge": {
+      "skepticVerdict": "confirmed",
+      "refusalControl": {
+        "kind": "boundary_flip_403_200",
+        "controlExchangeIds": [
+          "ctl_member"
+        ],
+        "probeExchangeId": "prb_create"
+      }
+    }
+  }
+}

@@ -1,0 +1,163 @@
+{
+  "id": "single-hop-handle-with-sibling-readback-fp",
+  "side": "fp",
+  "archetype": "single-hop-handle-sibling-readback",
+  "description": "A2/A3/C1: no composite at all. A tenant-b member creates a 202 export job handle on the tenant-a org; the tenant-a readback only shows the job still queued (intermediate), and the only non-stub later read is an unrelated own-tenant sibling read. The stub test runs on the receipt's TARGET probe \u2014 a sibling read is never a verified post-mutation readback \u2014 and the unified terminal gate runs on single-hop receipts.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Org-scoped export job created by tenant member",
+    "impact": "Creates a queued export job handle on the member's own organization.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Export handle plus own-tenant listing readback"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true,
+    "agentScriptReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "agentScriptExpectedReason": "terminal_impact_unproven",
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "claimedDelta": "Tenant-b member created a tenant-a export job handle; readbacks show only a queued job and an own-tenant sibling read.",
+    "targetMethod": "POST",
+    "targetPathAndQuery": "/v1/orgs/tenant-a/exports"
+  },
+  "personas": [
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    },
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "before",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"exports\":[]}"
+    },
+    {
+      "id": "prb_create",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": "member_b",
+      "status": 202,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"jobId\":\"job_77\",\"status\":\"queued\"}",
+      "requestJson": {
+        "format": "csv"
+      }
+    },
+    {
+      "id": "after",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/exports",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"exports\":[{\"id\":\"job_77\",\"tenantId\":\"tenant-a\",\"status\":\"queued\"}]}"
+    },
+    {
+      "id": "sibling",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/me",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"profile\":{\"id\":\"u_b1\",\"tenantId\":\"tenant-b\",\"displayName\":\"Member B\"}}"
+    }
+  ],
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_create",
+      "beforeExchangeId": "before",
+      "afterExchangeId": "after",
+      "controlExchangeIds": [
+        "sibling"
+      ]
+    }
+  ],
+  "composite": {
+    "chainId": "single-hop-handle-sibling",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "none",
+    "claimedDelta": "Tenant-b member created a tenant-a export job handle (queued).",
+    "singleHop": true,
+    "terminalExchangeId": "prb_create",
+    "preChainControlIds": [
+      "before"
+    ],
+    "postChainReadbackIds": [
+      "after",
+      "sibling"
+    ],
+    "attackerPersonas": [
+      "member_b"
+    ],
+    "expectedFailedStage": "terminal_impact"
+  }
+}

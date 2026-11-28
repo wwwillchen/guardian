@@ -34,29 +34,26 @@ import { buildPersonaHeader, buildPersonaSecretNeedles } from './persona-vault.t
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import {
-  EgressSanitizer, checkSealRateLimit, extractRequestEntityIds, normalizeDerivedSecretKind,
-  resolveSealJsonPath, toPublicCapabilityMeta, validateCapabilitySealValue,
+  EgressSanitizer, checkSealRateLimit, extractRequestEntityIds, normalizeDerivedSecretKind, resolveSealJsonPath, toPublicCapabilityMeta, validateCapabilitySealValue,
 } from './egress-sanitizer.ts'
 import { defaultRequestAdmissionEngine, type RequestAdmissionEngine } from './request-admission.ts'
 import {
   DerivedCapabilityVault, SEAL_FIELD_NOT_FOUND_ERROR, SEAL_REGEX_RETIRED_ERROR, awaitAsyncConvergence,
-  computeNonSecretLiteralHmac, consumeRunCompositeVerifyBudget, consumeRunSealBudget, formatDerivedHandle,
-  isDerivedCapabilityHandle, resolveVerifyRpcScratchRoot,
+  computeNonSecretLiteralHmac, consumeRunCompositeVerifyBudget, consumeRunSealBudget, formatDerivedHandle, isDerivedCapabilityHandle, resolveVerifyRpcScratchRoot,
 } from './derived-custody.ts'
 import { resolveRunSafetyBudgets, type RunSafetyBudgets } from './run-safety-budgets.ts'
 import type {
-  AsyncPollProfile, CapabilityConsumptionAttestation, CapabilitySourceProvenance,
-  HostHmacAlg, HostHmacEncoding, HostJwtAlg, InjectCapabilityTarget,
+  AsyncPollProfile, CapabilityConsumptionAttestation, CapabilitySourceProvenance, HostHmacAlg, HostHmacEncoding, HostJwtAlg, InjectCapabilityTarget,
 } from './derived-custody.ts'
-import { resolveTranscriptReplayMode, signHostRecord, verifyHostRecordSignature } from './composite-receipt.ts'
-import type {
-  CompositeReceiptVerification, CompositeVerifyOptions, HostAsyncPollRecord, HostBrowserTrace,
-  HostCryptoAttestation, HostOobEvent, HostSignableRecord, HostSignedTranscript, HostTranscriptEntry,
+import {
+  resolveTranscriptReplayMode, signHostRecord, verifyHostRecordSignature, type CompositeReceiptVerification, type CompositeVerifyOptions, type HostAsyncPollRecord, type HostBrowserTrace,
+  type HostCryptoAttestation, type HostOobEvent, type HostSignableRecord, type HostSignedTranscript, type HostTranscriptEntry,
 } from './composite-receipt.ts'
 import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
-import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
+import { defaultTerminalOracleRegistry, evaluateSingleHopProductionEnvelope, type TerminalOracleResult } from './terminal-oracle-registry.ts'
 import { isReadMethod, resolvePersonaIdentity, routeFamily } from './oracle-invariants.ts'
 import { extractSealMetadataHeaders } from './own-org-terminal-guard.ts'
+import { serverBoundGrantTenant } from './v8-oracle-families.ts'
 import type { ImpactStep, RoleName } from './oracle-invariants.ts'
 import {
   buildHostAuthPlacement, compileAsyncMatchPredicate, computeWorkerVisibleBodyDigest,
@@ -998,10 +995,10 @@ export class VerifyRpcServer {
       }
       for (const [k, v] of Object.entries(authHeaders)) setHeaderCI(mergedBundleHeaders, k, v)
       const ephemeralHandle = primaryAuthHandle ?? attestations[0]!.consumedCapabilityId
-      const srcProv = this.capabilityVault.getSourceProvenance(ephemeralHandle)
-      const capRoleLabel = srcProv?.sourceActorRoleLabel ?? null
-      const capId = resolvePersonaIdentity({ roleLabel: capRoleLabel, tenantRef: srcProv?.sourceActorTenant ?? null, privilege: srcProv?.sourceActorRole ?? null })
-      const capRole = capId.role, capTenant = capId.tenant
+      const srcProv = this.capabilityVault.getSourceProvenance(ephemeralHandle), capRoleLabel = srcProv?.sourceActorRoleLabel ?? null
+      const capId = resolvePersonaIdentity({ roleLabel: capRoleLabel, tenantRef: null, privilege: srcProv?.sourceActorRole ?? null })
+      const srcRec = srcProv?.sourceExchangeId ? this.transcript.get(srcProv.sourceExchangeId) : undefined
+      const capRole = capId.role, capTenant = srcRec ? serverBoundGrantTenant(this.rawBodies.get(srcRec.exchangeId) ?? this.transcript.body(srcRec.exchangeId), srcRec.response?.status ?? null, srcRec.request?.method) : null // B1: server-bound minted principal, else unknown — never the minter's tenant
       authCapabilityActor = { handle: ephemeralHandle, roleLabel: capRoleLabel, role: capRole, tenant: capTenant }
       const ephemeralPersona: ResolvedPersona = {
         id: ephemeralHandle, handle: ephemeralHandle, roleLabel: capRoleLabel ?? 'derived', tenantRef: capTenant, privilege: capRole, originAllowlist: [nextOrigin],
@@ -2108,7 +2105,7 @@ export class VerifyRpcServer {
       const idn = resolvePersonaIdentity({ roleLabel: signedLabel, tenantRef: typedTenant ?? null, privilege: typedPriv ?? null, handle })
       const hIdn = !capActor && handle && ((idn.role === null && typedPriv === undefined) || (idn.tenant === null && typedTenant === undefined)) ? resolvePersonaIdentity({ roleLabel: handle, handle }) : null
       const role = idn.role ?? (!capActor && typedPriv === undefined ? hIdn?.role ?? null : null)
-      const tenant = idn.tenant ?? (!capActor && typedTenant === undefined ? hIdn?.tenant ?? null : null)
+      const tenant = capActor ? (capActor.tenant ?? null) : (idn.tenant ?? (typedTenant === undefined ? hIdn?.tenant ?? null : null)) // B1: capability tenant is server-bound only
       const rawRole = record.request?.sessionRole
       const arm: ImpactStep['arm'] = rawRole === 'control' || rawRole === 'setup' || rawRole === 'cleanup' || rawRole === 'probe'
         ? rawRole
@@ -2189,16 +2186,17 @@ export class VerifyRpcServer {
   /** Build a read-only kernel-plane HostFactLog from this session's host-signed transcript. */
   buildHostFactLog(): HostFactLog { return HostFactLog.fromTranscript(this.buildHostSignedTranscript()) }
 
+  /** A2: evaluate a host-built single-hop agent-script receipt through the production 1-node composite envelope (this session's private signing key + host persona policy); `factLog` must carry entries signed by this session. */
+  evaluateSingleHopReceipt(factLog: HostFactLog, built: Parameters<typeof evaluateSingleHopProductionEnvelope>[1]): TerminalOracleResult {
+    const personaRoleLabels = hostPersonaRoleLabels(this.options.grant)
+    return evaluateSingleHopProductionEnvelope(factLog, built, { signingKey: this.compositeSigningKey, compositeOptions: { ...(personaRoleLabels ? { personaRoleLabels } : {}), ...this.options.compositeVerifyOptions } })
+  }
+
   /** Host-side verification of a CompositeProofReceipt against this session's signed transcript & capability vault. */
   verifyComposite(rawReceipt: unknown, options?: Omit<CompositeVerifyOptions, 'signingKey'>): CompositeReceiptVerification {
-    const factLog = HostFactLog.fromTranscript(this.buildHostSignedTranscript())
-    const personaRoleLabels = this.options.grant?.personas?.size
-      ? Object.fromEntries([...this.options.grant.personas.entries()].filter(([, p]) => Boolean(p.roleLabel)).map(([h, p]) => [h, p.roleLabel]))
-      : undefined
-    const res = defaultTerminalOracleRegistry.evaluate(
-      factLog, { kind: 'composite', receipt: rawReceipt },
-      { compositeOptions: { ...(personaRoleLabels ? { personaRoleLabels } : {}), ...this.options.compositeVerifyOptions, ...options }, signingKey: this.compositeSigningKey, strictHostDerivation: true },
-    )
+    const factLog = HostFactLog.fromTranscript(this.buildHostSignedTranscript()), personaRoleLabels = hostPersonaRoleLabels(this.options.grant)
+    const res = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'composite', receipt: rawReceipt },
+      { compositeOptions: { ...(personaRoleLabels ? { personaRoleLabels } : {}), ...this.options.compositeVerifyOptions, ...options }, signingKey: this.compositeSigningKey, strictHostDerivation: true })
     return res.composite!
   }
 
@@ -2270,6 +2268,8 @@ export class VerifyRpcServer {
     }
   }
 }
+
+function hostPersonaRoleLabels(grant: Pick<Grant, 'personas'> | undefined): Record<string, string> | undefined { return grant?.personas?.size ? Object.fromEntries([...grant.personas.entries()].filter(([, p]) => Boolean(p.roleLabel)).map(([h, p]) => [h, p.roleLabel])) : undefined }
 
 export interface LocalAttemptFactoryOptions extends LocalAttemptFactoryBaseOptions {
   createRpcOptions: (nonce: string, attempt: 1 | 2) => Omit<VerifyRpcSessionOptions, 'nonce'>

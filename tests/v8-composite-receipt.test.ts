@@ -965,7 +965,10 @@ test('combined 5-hop signed DAG exercising all 4 edge bindings + custom terminal
     signingKey: SIGNING_KEY,
     verifyTerminalImpact: () => ({ confirmed: true, reason: 'custom v8 oracle confirmed', family: 'cross_surface_pivot' }),
   })
-  assert.equal(ok.confirmed, true, ok.reason)
+  // R3-05 A5: a custom terminal oracle is ADDITIVE — all 4 causal edges verify, but a confirming custom oracle can
+  // never confirm a terminal hop that carries zero host-recorded terminal evidence.
+  assert.equal(ok.confirmed, false, ok.reason)
+  assert.equal(ok.failedStage, 'terminal_impact')
   assert.equal(ok.verifiedEdges.length, 4)
 
   // Custom terminal oracle rejection fails closed.

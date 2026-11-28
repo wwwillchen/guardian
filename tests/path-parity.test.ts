@@ -40,9 +40,12 @@ import {
 } from '../src/server/floor-recipe-engine.ts'
 import { cut3FloorRecipe, runCut3Recipe, type FloorRecipeExecution } from '../src/server/floor-recipes.ts'
 import { HostFactLog } from '../src/server/host-fact-log.ts'
+import { buildCompositeVerifyOptionsFromGrant } from '../src/server/agent-script-proof.ts'
+import { serverBoundGrantTenant } from '../src/server/v8-oracle-families.ts'
 import { classifyBoundaryClaim, classifyImpactDescriptor, type BoundaryClass, type ImpactClass, type ImpactStep, type InjectionFamily, type RoleName } from '../src/server/oracle-invariants.ts'
 import {
   HostMintedOracle,
+  buildAgentScriptReceipt,
   buildProofReceipt,
   isPureJobOrHandleStubChain,
   proofReceiptMode,
@@ -61,6 +64,7 @@ import {
   REGISTERED_V8_ORACLE_FAMILIES,
   SINGLE_HOP_ORACLE_RULES,
   defaultTerminalOracleRegistry,
+  evaluateSingleHopProductionEnvelope,
   type SingleHopOracleRule,
 } from '../src/server/terminal-oracle-registry.ts'
 import type { V8OracleFamily } from '../src/server/v8-oracle-families.ts'
@@ -101,6 +105,10 @@ interface ParityExchange {
   actorRoleLabel?: string
   emittedCapabilities?: string[]
   consumedCapabilities?: string[]
+  /** Derived (capability-sealed) credential handle (`cap:hop_<id>:<slot>`) this exchange authenticated with. */
+  actorCapability?: string
+  /** Persona that MINTED `actorCapability` (its role label is inherited by the capability actor, as in production). */
+  actorCapabilitySourcePersona?: string
   originOverride?: string
   oobToken?: string
   oobHit?: boolean
@@ -142,8 +150,19 @@ interface ParityCase {
     floorInjectionRecipe: boolean
     proofReceipt?: boolean
     retest?: boolean
+    /** `buildAgentScriptReceipt` -> production single-hop envelope (`evaluateSingleHopProductionEnvelope`). */
+    agentScriptReceipt?: boolean
   }
   expected: { confirmed: boolean }
+  /** Substring the agentScriptReceipt rejection reason must contain (pins the specific soundness gate). */
+  agentScriptExpectedReason?: string
+  /** Host-recorded REJECTED CompositeProofReceipt written to the TranscriptStore (the worker omits its claim). */
+  compositeRejected?: {
+    chainId: string
+    terminalVulnClass: string
+    failedStage: string
+    rejectedBy: string
+  }
   retest?: {
     scenario: 'drifted_session' | 'unbuildable_receipt' | 'composite_stage_rejected' | 'clean_fix'
     expectedVerdict: 'fixed' | 'inconclusive' | 'reproduced'
@@ -221,6 +240,11 @@ interface ParityCase {
     v8OracleInput?: {
       family: V8OracleFamily
       rawInput: Record<string, unknown>
+    }
+    /** Host-configured Tier-2 policy judge (deterministic skeptic verdict + refusal control) run via the registry. */
+    tier2Judge?: {
+      skepticVerdict: 'confirmed' | 'rejected' | 'needs_review'
+      refusalControl: { kind: 'serial_4xx' | 'clean_session_403' | 'boundary_flip_403_200'; controlExchangeIds: string[]; probeExchangeId: string }
     }
   }
 }
@@ -579,6 +603,7 @@ function populateTranscriptStore(
   c: ParityCase,
   origin: string,
   templateVars: Readonly<Record<string, string>> = {},
+  opts: { typedPersonaTenant?: boolean } = {},
 ): { store: TranscriptStore; idMap: Map<string, string> } {
   const store = new TranscriptStore(Buffer.alloc(32, 7))
   const personaByHandle = new Map(c.personas.map(p => [p.handle, p]))
@@ -588,6 +613,13 @@ function populateTranscriptStore(
   for (const ex of c.exchanges) {
     ts = ex.startedAtOffsetMs !== undefined ? baseTs + ex.startedAtOffsetMs : ts + 100
     const persona = ex.persona ? personaByHandle.get(ex.persona) : undefined
+    // Production attribution (verify-rpc B1): a capability actor inherits its minter's role label, but its tenant
+    // is ONLY the server-bound tenant the host observed in the minting session-grant response (else unknown).
+    const capMinter = ex.actorCapability ? personaByHandle.get(ex.actorCapabilitySourcePersona ?? '') : undefined
+    const capMintEx = ex.actorCapability ? c.exchanges.find(m => m.emittedCapabilities?.includes(ex.actorCapability!)) : undefined
+    const capIdentity = ex.actorCapability
+      ? { personaHandle: ex.actorCapability, actorRoleLabel: capMinter?.roleLabel ?? null, actorTenant: capMintEx ? serverBoundGrantTenant(capMintEx.body, capMintEx.status, capMintEx.method) : null }
+      : null
     const reqHeaders: Record<string, string> = substituteHeaders(ex.requestHeaders ?? {}, templateVars)
     if (persona) reqHeaders[persona.headerName.toLowerCase()] = persona.headerValue
     const pathAndQuery = substituteTemplate(ex.pathAndQuery, templateVars)
@@ -611,9 +643,10 @@ function populateTranscriptStore(
         headers: reqHeaders,
         bodyBytes: Buffer.byteLength(reqBody, 'utf8'),
         bodySha256: sha256(reqBody),
-        personaHandle: persona?.handle ?? null,
+        personaHandle: capIdentity?.personaHandle ?? persona?.handle ?? null,
         sessionRole: ex.arm,
-        actorRoleLabel: ex.actorRoleLabel !== undefined ? (ex.actorRoleLabel || null) : (persona?.roleLabel ?? null),
+        actorRoleLabel: capIdentity ? capIdentity.actorRoleLabel : ex.actorRoleLabel !== undefined ? (ex.actorRoleLabel || null) : (persona?.roleLabel ?? null),
+        ...(capIdentity ? { actorTenant: capIdentity.actorTenant } : opts.typedPersonaTenant && persona ? { actorTenant: persona.tenant } : {}),
         nonce: 'parity-nonce',
       },
       response: {
@@ -629,7 +662,69 @@ function populateTranscriptStore(
     })
     idMap.set(ex.id, rec.exchangeId)
   }
+  if (c.compositeRejected) {
+    const storeIds = c.exchanges.map(e => idMap.get(e.id)!)
+    store.recordCompositeVerification({
+      chainId: c.compositeRejected.chainId,
+      terminalVulnClass: c.compositeRejected.terminalVulnClass,
+      replayMode: 'fresh_clean_replay',
+      hopCount: 1,
+      confirmed: false,
+      verifiedEdgeCount: 0,
+      reason: `CompositeProofReceipt rejected at ${c.compositeRejected.failedStage}`,
+      failedStage: c.compositeRejected.failedStage,
+      rejectedBy: c.compositeRejected.rejectedBy,
+      missingEvidence: [c.compositeRejected.rejectedBy],
+      exchangeIds: storeIds,
+      terminalExchangeId: storeIds[storeIds.length - 1] ?? null,
+    })
+  }
   return { store, idMap }
+}
+
+/**
+ * Production agent-script single-hop path: the host-recorded transcript is signed with the session key (with
+ * host capability emission/consumption provenance), the verify oracle (`evaluateClaims`) must pass on the
+ * script's claims, and the host-built receipt must confirm through the production single-hop envelope with the
+ * grant's persona policy.
+ */
+function evaluateAgentScriptReceiptPath(c: ParityCase, origin: string): { built: boolean; oraclePassed: boolean; confirmed: boolean; reason: string } {
+  // Production verify-rpc records the host-resolved TYPED persona tenant (never a label-derived one).
+  const { store, idMap } = populateTranscriptStore(c, origin, {}, { typedPersonaTenant: true })
+  const byStoreId = new Map(c.exchanges.map(ex => [idMap.get(ex.id)!, ex]))
+  const projected = HostFactLog.fromTranscriptStore(store).toHostSignedTranscript()
+  const entries: HostTranscriptEntry[] = (projected.entries ?? []).map(entry => {
+    const ex = byStoreId.get(entry.exchangeId)
+    const { hostSignature: _unsigned, ...rest } = entry
+    const base: HostTranscriptEntry = {
+      ...rest,
+      ...(ex?.emittedCapabilities?.length ? { emittedCapabilities: ex.emittedCapabilities } : {}),
+      ...(ex?.consumedCapabilities?.length || ex?.actorCapability ? { consumedCapabilities: ex.consumedCapabilities ?? [ex.actorCapability!] } : {}),
+      cleanSession: true,
+    }
+    return { ...base, hostSignature: signHostRecord(base, SIGNING_KEY) }
+  })
+  const factLog = HostFactLog.fromTranscriptStore(store, { hostTranscript: { ...projected, entries } })
+  const claims = remapClaimIds(c.claims ?? [], idMap)
+  const oracle = evaluateClaims(store, claims, {
+    factLog,
+    allowedExchangeIds: new Set(store.list().map(r => r.exchangeId)),
+    claimedImpact: c.canonicalLabel.claimedImpact,
+    claimedBoundary: c.canonicalLabel.claimedBoundary,
+    cwe: c.canonicalLabel.cwe ?? null,
+    category: c.canonicalLabel.category ?? null,
+    title: c.canonicalLabel.title ?? null,
+    description: c.canonicalLabel.impact ?? null,
+  })
+  const built = buildAgentScriptReceipt({ claims: claims as unknown as Record<string, unknown>[], exchanges: [], factLog, origin, title: c.canonicalLabel.title ?? c.id })
+  if (!built) return { built: false, oraclePassed: oracle.passed, confirmed: false, reason: 'receipt_unbuildable' }
+  const grant = buildGrant(origin, c.personas)
+  const personaRoleLabels = Object.fromEntries(c.personas.map(p => [p.handle, p.roleLabel]))
+  const res = evaluateSingleHopProductionEnvelope(built.factLog, built, {
+    signingKey: SIGNING_KEY,
+    compositeOptions: { personaRoleLabels, ...buildCompositeVerifyOptionsFromGrant(grant) },
+  })
+  return { built: true, oraclePassed: oracle.passed, confirmed: oracle.passed && res.confirmed, reason: oracle.passed ? res.reason : oracle.failures.join('; ') }
 }
 
 function remapClaimIds(claims: readonly VerifyClaim[], idMap: ReadonlyMap<string, string>): VerifyClaim[] {
@@ -939,6 +1034,7 @@ test('parity corpus: covers both TP and FP sides including anon-control authz an
       c.paths.composite,
       c.paths.floorInjectionRecipe,
       Boolean(c.paths.proofReceipt),
+      Boolean(c.paths.agentScriptReceipt),
     ].filter(Boolean).length
     assert.ok(
       activeCount >= 2,
@@ -1354,6 +1450,20 @@ test('path parity [verifyCompositeReceipt]: multi-hop TP confirms and stub/R3 FP
       )
     }
 
+    // A5: a host-configured Tier-2 judge (confirming skeptic + verified refusal control) never flips a decided
+    // Tier-1 terminal_impact_unproven rejection, and no Verify Fix predicate is compiled from it.
+    if (c.composite?.tier2Judge) {
+      const judge = c.composite.tier2Judge
+      const regRes = defaultTerminalOracleRegistry.evaluate(HostFactLog.fromTranscript(transcript), { kind: 'composite', receipt }, {
+        signingKey: SIGNING_KEY,
+        ...(options.attackerPersonas ? { attackerPersonas: options.attackerPersonas } : {}),
+        policyJudge: { refusalControl: judge.refusalControl, llmCall: () => ({ verdict: judge.skepticVerdict }) },
+      })
+      assert.equal(regRes.confirmed, c.expected.confirmed, `Tier-2 registry mismatch on ${c.id}: ${regRes.reason}`)
+      assert.equal(regRes.compiledPredicate, undefined, `${c.id}: no Verify Fix predicate may compile from a rejected verdict`)
+      if (!c.expected.confirmed) assert.equal(regRes.composite?.rejectedBy, 'terminal_impact_unproven', `${c.id}: Tier-1 rejection must stay terminal_impact_unproven`)
+    }
+
     // Assert BOTH TP and FP verdicts across ALL 6 label permutations in evaluateClaims(composite_receipt)!
     const factLog = HostFactLog.fromTranscriptStore(store)
     for (const perm of PERMUTATIONS) {
@@ -1374,6 +1484,87 @@ test('path parity [verifyCompositeReceipt]: multi-hop TP confirms and stub/R3 FP
         `composite ${c.side.toUpperCase()} ${c.id} evaluateClaims mismatch under "${perm}" (expected=${wantPassed}, failures: ${ev.failures.join('; ')})`,
       )
     }
+  }
+})
+
+// ============================================================================
+// 5a. Entry point 6: agent-script single-hop receipt via the production envelope (R3-05 Classes A/B/C)
+// ============================================================================
+
+/** TP cases whose structured claims build an agent-script receipt: recall through the production envelope is pinned. */
+const AGENT_SCRIPT_TP_RECALL_CASES: readonly string[] = [
+  'bfla-vertical-tp',
+  'cross-tenant-bola-tp',
+  'persisted-mutation-tp',
+  'r3-11-cross-tenant-read-tp',
+  'race-conserved-balance-tp',
+  'sqli-fingerprint-tp',
+]
+
+test('path parity [agentScriptReceipt]: single-hop script receipts run the production envelope; rejected composites, stub handles, derived credentials and fabricated refusals never confirm', () => {
+  const origin = 'http://127.0.0.1:4500'
+  const corpus = loadCorpus()
+  const fpCases = corpus.filter(c => c.paths.agentScriptReceipt)
+  assert.ok(fpCases.length >= 6, `expected >= 6 agentScriptReceipt corpus cases, got ${fpCases.length}`)
+  for (const c of fpCases) {
+    const res = evaluateAgentScriptReceiptPath(c, origin)
+    assert.equal(res.confirmed, c.expected.confirmed, `agentScriptReceipt mismatch for ${c.id}: expected ${c.expected.confirmed}, got ${res.confirmed} (${res.reason})`)
+    if (c.agentScriptExpectedReason) {
+      assert.ok(res.reason.includes(c.agentScriptExpectedReason), `agentScriptReceipt ${c.id} must reject via "${c.agentScriptExpectedReason}" (got: ${res.reason})`)
+    }
+  }
+  const byId = new Map(corpus.map(c => [c.id, c]))
+  for (const id of AGENT_SCRIPT_TP_RECALL_CASES) {
+    const c = byId.get(id)
+    assert.ok(c && c.side === 'tp', `missing TP recall case ${id}`)
+    const res = evaluateAgentScriptReceiptPath(c, origin)
+    assert.equal(res.built, true, `TP ${id} must build an agent-script receipt`)
+    assert.equal(res.confirmed, true, `TP ${id} must stay confirmed through the production single-hop envelope (${res.reason})`)
+  }
+})
+
+test('agentScriptReceipt [B2]: a capability-authenticated single-hop authorization probe fails closed as derived_credential_requires_composite', () => {
+  const c = loadCorpus().find(x => x.id === 'derived-capability-entitled-collection-read-fp')!
+  const { store, idMap } = populateTranscriptStore(c, 'http://127.0.0.1:4501', {}, { typedPersonaTenant: true })
+  const factLog = HostFactLog.fromTranscriptStore(store)
+  const probeId = idMap.get('prb_cap')!
+  const probe = factLog.getExchange(probeId)!
+  assert.equal(probe.actor, 'cap:hop_1:session')
+  // B1: the derived credential's principal is the server-bound tenant from the minting session grant — never the minter's.
+  assert.equal(probe.actorTenant, 'tenant-a')
+  const receipt = buildProofReceipt({
+    vulnClass: 'bola',
+    target: { origin: 'http://127.0.0.1:4501', method: 'GET', pathAndQuery: '/v1/orgs/tenant-a/invites' },
+    exchangeIds: [idMap.get('ctl_b')!, probeId],
+    oobEventIds: [],
+    browserTraceIds: [],
+    claimedDelta: 'Derived credential listed organization invites.',
+  })
+  const res = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'single_hop', receipt }, { strictHostDerivation: true })
+  assert.equal(res.confirmed, false)
+  assert.ok(res.reason.includes('derived_credential_requires_composite'), res.reason)
+  assert.equal(res.singleHop?.evidence?.rejectedBy, 'derived_credential_requires_composite')
+})
+
+test('agentScriptReceipt [B1/B3]: with composite-DAG credential provenance (B2 lifted) a derived credential still never inherits its minter tenant or turns tenant isolation into a peer denial', () => {
+  for (const id of ['derived-capability-entitled-collection-read-fp', 'derived-capability-same-path-404-peer-fp']) {
+    const c = loadCorpus().find(x => x.id === id)!
+    const origin = 'http://127.0.0.1:4502'
+    const { store, idMap } = populateTranscriptStore(c, origin, {}, { typedPersonaTenant: true })
+    const factLog = HostFactLog.fromTranscriptStore(store)
+    const probe = c.exchanges.find(e => e.arm === 'probe')!
+    const control = c.exchanges.find(e => e.arm === 'control')!
+    const receipt = buildProofReceipt({
+      vulnClass: c.canonicalLabel.vulnClass ?? 'bola',
+      target: { origin, method: probe.method, pathAndQuery: probe.pathAndQuery },
+      exchangeIds: [idMap.get(control.id)!, idMap.get(probe.id)!],
+      oobEventIds: [],
+      browserTraceIds: [],
+      claimedDelta: `${id}: derived credential read guarded by a peer control.`,
+    })
+    const res = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'single_hop', receipt }, { strictHostDerivation: true, derivedCredentialProvenance: 'composite_dag' })
+    assert.equal(res.confirmed, false, `${id} must not confirm even with composite-DAG provenance (${res.reason})`)
+    assert.ok(!res.reason.includes('derived_credential_requires_composite'), `${id}: rejection must come from principal attribution / denied-control parity, not B2`)
   }
 })
 
@@ -2001,3 +2192,4 @@ test('R2-04 retest parity [floor + declarative + agent-script]: drifted session,
     assert.equal(agentHealth.healthy, rt.expectedVerdict === 'fixed')
   }
 })
+

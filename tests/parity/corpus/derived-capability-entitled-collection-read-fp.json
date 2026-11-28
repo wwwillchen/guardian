@@ -1,0 +1,130 @@
+{
+  "id": "derived-capability-entitled-collection-read-fp",
+  "side": "fp",
+  "archetype": "derived-capability-entitled-collection-read",
+  "description": "B1/B2: a tenant-b member redeems an invite and the host-observed session grant binds the minted credential to tenant-a. Listing tenant-a invites with that credential is in policy for the minted principal; the tenant-b 403 control is tenant isolation, not a peer denial, and a capability-authenticated single-hop boundary probe needs a composite DAG proving the minting hop.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/verify-rpc.ts",
+      "src/server/v8-oracle-families.ts"
+    ],
+    "classes": [
+      "bfla",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-285",
+    "category": "broken-access-control",
+    "title": "Invite listing read with a derived session credential",
+    "impact": "Reads an organization invite listing with a minted session.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bfla"
+  },
+  "freeTextLabel": {
+    "title": "Derived session credential lists organization invites"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "agentScriptReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "agentScriptExpectedReason": "derived_credential_requires_composite",
+  "personas": [
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    },
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "redeem",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/invites/redeem",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"session\":{\"token\":\"parity-derived-session-4f1a\",\"tenantId\":\"tenant-a\",\"role\":\"member\"}}",
+      "requestJson": {
+        "code": "inv-code-1"
+      },
+      "emittedCapabilities": [
+        "cap:hop_1:session"
+      ]
+    },
+    {
+      "id": "ctl_b",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/invites",
+      "persona": "member_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb_cap",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/orgs/tenant-a/invites",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"invites\":[{\"id\":\"inv_1\",\"tenantId\":\"tenant-a\",\"role\":\"viewer\",\"status\":\"pending\"},{\"id\":\"inv_2\",\"tenantId\":\"tenant-a\",\"role\":\"member\",\"status\":\"pending\"}]}",
+      "actorCapability": "cap:hop_1:session",
+      "actorCapabilitySourcePersona": "member_b",
+      "requestHeaders": {
+        "authorization": "Bearer parity-derived-session-4f1a"
+      }
+    }
+  ],
+  "claims": [
+    {
+      "kind": "boundary",
+      "boundaryClass": "access",
+      "controlExchangeId": "ctl_b",
+      "probeExchangeId": "prb_cap"
+    }
+  ]
+}

@@ -11,7 +11,7 @@ import {
   ACTIVE_MARKUP_RE, assessBoundary, assessImpactEvidence, assessMarkupImpact, assessMfaBypass,
   assessReadDisclosure, assessStatusOnlyDivergence, classifyImpactDescriptor, flattenJson,
   hasForeignTenantOrOwnerDisclosure, injectionFamilyFromTyped, isMutatingMethod, isReadMethod,
-  matchStrippedInjectionFingerprint, resolvePersonaIdentity,
+  matchStrippedInjectionFingerprint, resolvePersonaIdentity, routeFamily,
 } from './oracle-invariants.ts'
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity, RoleName } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
@@ -165,21 +165,11 @@ export class TranscriptStore {
     this.secret = secret ?? randomBytes(32)
   }
 
-  get size(): number {
-    return this.records.size
-  }
+  get size(): number { return this.records.size }
 
-  private sign(record: Omit<VerifyTranscriptRecord, 'signature'>): string {
-    return createHmac('sha256', this.secret)
-      .update(JSON.stringify(record))
-      .digest('hex')
-  }
+  private sign(record: Omit<VerifyTranscriptRecord, 'signature'>): string { return createHmac('sha256', this.secret).update(JSON.stringify(record)).digest('hex') }
 
-  private signComposite(record: Omit<TranscriptCompositeVerification, 'signature'>): string {
-    return createHmac('sha256', this.secret)
-      .update(`composite:${JSON.stringify(record)}`)
-      .digest('hex')
-  }
+  private signComposite(record: Omit<TranscriptCompositeVerification, 'signature'>): string { return createHmac('sha256', this.secret).update(`composite:${JSON.stringify(record)}`).digest('hex') }
 
   recordCompositeVerification(
     input: Omit<TranscriptCompositeVerification, 'verificationId' | 'seq' | 'signature'>,
@@ -196,15 +186,12 @@ export class TranscriptStore {
     return record
   }
 
-  getCompositeVerification(verificationId: string): TranscriptCompositeVerification | undefined {
-    return this.compositeVerifications.get(verificationId)
-  }
+  getCompositeVerification(verificationId: string): TranscriptCompositeVerification | undefined { return this.compositeVerifications.get(verificationId) }
+  /** Every host-recorded composite verification for this session (host-written by `composite.verify`). */
+  listCompositeVerifications(): readonly TranscriptCompositeVerification[] { return [...this.compositeVerifications.values()] }
 
-  latestCompositeVerification(): TranscriptCompositeVerification | undefined {
-    let latest: TranscriptCompositeVerification | undefined
-    for (const rec of this.compositeVerifications.values()) latest = rec
-    return latest
-  }
+  /** Most recent host-recorded composite verification (insertion order). */
+  latestCompositeVerification(): TranscriptCompositeVerification | undefined { return this.listCompositeVerifications().at(-1) }
 
   record(input: {
     op: VerifyExchangeOp; raceTransport?: 'h2-single-packet' | 'http1-fallback'
@@ -298,14 +285,8 @@ export class TranscriptStore {
   /** HMAC over every signed record; stable for a fixed transcript, changes on tamper/append. */
   digest(): string {
     const h = createHmac('sha256', this.secret)
-    for (const record of this.list()) {
-      h.update(record.signature)
-      h.update('\0')
-    }
-    for (const comp of this.compositeVerifications.values()) {
-      h.update(comp.signature)
-      h.update('\0')
-    }
+    for (const record of this.list()) h.update(record.signature).update('\0')
+    for (const comp of this.compositeVerifications.values()) h.update(comp.signature).update('\0')
     return h.digest('hex')
   }
 
@@ -861,22 +842,14 @@ function mad(values: number[]): number {
 }
 
 function erf(x: number): number {
-  const sign = x < 0 ? -1 : 1
-  const ax = Math.abs(x)
-  const a1 = 0.254829592
-  const a2 = -0.284496736
-  const a3 = 1.421413741
-  const a4 = -1.453152027
-  const a5 = 1.061405429
-  const p = 0.3275911
+  const sign = x < 0 ? -1 : 1, ax = Math.abs(x)
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911
   const t = 1 / (1 + p * ax)
   const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax)
   return sign * y
 }
 
-function normalCdf(z: number): number {
-  return 0.5 * (1 + erf(z / Math.SQRT2))
-}
+function normalCdf(z: number): number { return 0.5 * (1 + erf(z / Math.SQRT2)) }
 
 export interface MannWhitneyResult {
   u: number
@@ -1058,6 +1031,7 @@ function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClai
   const control = toTranscriptStep(store, claim.controlExchangeId, 'control', stepOpts)
   const probe = toTranscriptStep(store, claim.probeExchangeId, 'probe', stepOpts)
   if (!control || !probe) return { claim, passed: false, detail: 'Boundary claim references an unreadable exchange.' }
+  const derivedErr = derivedCredentialClaimError(store, probe); if (derivedErr) return { claim, passed: false, detail: derivedErr, observed: { rejectedBy: 'derived_credential_requires_composite' } }
   const assessment = assessBoundary({
     boundaryClass: claim.boundaryClass,
     impactClass: claim.boundaryClass === 'access' ? 'authorization' : 'other',
@@ -1149,7 +1123,8 @@ function evaluateImpactClaim(
   if ((claim.impactClass === 'injection' || claim.impactClass === 'markup') && steps.some(stepHasRedactedRequestPlane)) {
     return { claim, passed: false, detail: `Kernel request plane contains a vault-scrubbed/redacted placeholder ([redacted...]); anti-reflection for ${claim.impactClass} fails closed.`, observed: { rejectedBy: 'redacted_request_plane' } }
   }
-  const probeRecord = store.get(claim.probeExchangeId)
+  const probeRecord = store.get(claim.probeExchangeId), derivedProbe = steps.find(st => st.arm === 'probe'), derivedImpactErr = DERIVED_BOUNDARY_IMPACTS.has(claim.impactClass) && derivedProbe ? derivedCredentialClaimError(store, derivedProbe) : null
+  if (derivedImpactErr) return { claim, passed: false, detail: derivedImpactErr, observed: { rejectedBy: 'derived_credential_requires_composite' } }
   const assessment = assessImpactEvidence({
     impactClass: claim.impactClass,
     steps,
@@ -1709,6 +1684,28 @@ function claimHasStrippedFingerprint(store: TranscriptStore, check: VerifyClaimC
   })
 }
 
+const DERIVED_BOUNDARY_IMPACTS: ReadonlySet<string> = new Set(['authorization', 'bfla', 'disclosure', 'business_logic', 'mass_assignment'])
+/** B2: a claim whose probe authenticated with a derived (capability) credential needs a host-CONFIRMED composite proving the minting hop. */
+function derivedCredentialClaimError(store: TranscriptStore, probe: ImpactStep): string | null {
+  return probe.actor.handle?.startsWith('cap:') && !store.listCompositeVerifications().some(rec => rec.confirmed) ? `derived_credential_requires_composite: probe authenticated with derived capability credential "${probe.actor.handle}"; the boundary crossing belongs to the minting hop, which only a host-verified multi-hop CompositeProofReceipt can attribute.` : null
+}
+
+/** C1/C2: a later read clears an intermediate stub only on the stub probe's own resource tree — an unrelated sibling read never does. */
+function readsStubResourceTree(r: VerifyTranscriptRecord, stubs: readonly VerifyTranscriptRecord[]): boolean {
+  const fam = (rec: VerifyTranscriptRecord): string => routeFamily(rec.request?.pathAndQuery ?? ''), rf = fam(r)
+  return rf !== '' && stubs.some(st => { const sf = fam(st); return sf !== '' && (sf === rf || rf.startsWith(`${sf}/`) || sf.startsWith(`${rf}/`)) })
+}
+
+/** C2: a passing impact/boundary claim bypasses the stub gate only when its OWN probe is not an intermediate stub or it cites a verified non-stub post-mutation readback. */
+function claimProbeIsUnverifiedStub(store: TranscriptStore, c: VerifyClaimCheck): boolean {
+  if (c.claim.kind !== 'impact' && c.claim.kind !== 'boundary') return false
+  const probeRec = store.get(c.claim.probeExchangeId)
+  if (!probeRec || !detectIntermediateStub(probeRec, store.body(probeRec.exchangeId)).isStub) return false
+  const afterRec = c.claim.kind === 'impact' && c.claim.afterExchangeId ? store.get(c.claim.afterExchangeId) : undefined, afterStatus = recordStatus(afterRec)
+  const beforeBody = c.claim.kind === 'impact' && c.claim.beforeExchangeId ? store.body(c.claim.beforeExchangeId) : undefined
+  return !(afterRec && afterRec.seq > probeRec.seq && afterStatus !== null && afterStatus >= 200 && afterStatus < 300 && !detectIntermediateStub(afterRec, store.body(afterRec.exchangeId)).isStub && !afterReadbackIsIntermediateOnly(beforeBody, afterRec, store.body(afterRec.exchangeId)).isStub)
+}
+
 const STATUS_INDEPENDENT_KINDS = new Set<VerifyClaim['kind']>(['structural_diff', 'timing', 'oob', 'race', 'impact', 'boundary', 'mfa', 'dom_sentinel', 'composite_receipt', 'host_evaluated_expression'])
 const hasStatusIndependentEvidence = (check: VerifyClaimCheck): boolean => check.passed && STATUS_INDEPENDENT_KINDS.has(check.claim.kind)
 
@@ -1756,7 +1753,10 @@ export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyCl
   }
   const boundaryClaimPassed = checks.some(c => c.passed && c.claim.kind === 'boundary' && (c.observed as { arm?: unknown } | undefined)?.arm === 'control_denied')
   const compositePassed = checks.some(c => c.passed && c.claim.kind === 'composite_receipt')
-  const compositeFailed = checks.some(c => !c.passed && c.claim.kind === 'composite_receipt')
+  // A1: composite failure is decided from HOST-recorded composite verifications, never from whether the worker returned its claim.
+  const hostComposites = store.listCompositeVerifications(), claimedCompositeFailed = checks.some(c => !c.passed && c.claim.kind === 'composite_receipt')
+  const compositeFailed = claimedCompositeFailed || (hostComposites.some(rec => !rec.confirmed) && !hostComposites.some(rec => rec.confirmed))
+  if (compositeFailed && !claimedCompositeFailed) failures.push('composite_receipt: a host-recorded CompositeProofReceipt rejection is final for this attempt; other claims cannot fall back to a single-hop confirmation after the host rejected the chain.')
   const impactBacked = compositePassed || checks.some(c => c.passed && c.claim.kind === 'impact' &&
     (c.claim.impactClass === effectiveClaimed || ((effectiveClaimed === 'bfla' || effectiveClaimed === 'disclosure') && c.claim.impactClass === 'authorization')))
   if (effectiveClaimed && !impactBacked && !compositeFailed) {
@@ -1802,7 +1802,7 @@ export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyCl
     .filter(id => !context.allowedExchangeIds || context.allowedExchangeIds.has(id))
     .map(id => store.get(id))
     .filter((rec): rec is VerifyTranscriptRecord => Boolean(rec?.request && rec.response && (rec.op === 'http' || rec.op === 'http2' || rec.op === 'race')))
-  if (!hasTerminalOracle && !hasEvaluatedOrFp) {
+  if (!checks.some(c => c.passed && STATUS_INDEPENDENT_KINDS.has(c.claim.kind) && c.claim.kind !== 'structural_diff' && !claimProbeIsUnverifiedStub(store, c)) && !hasEvaluatedOrFp) {
     const ok2xx = citedRecords.filter(r => { const s = recordStatus(r); return s !== null && s >= 200 && s < 300 })
     const probe2xx = ok2xx.filter(r => r.request?.sessionRole === 'probe')
     const mut2xx = ok2xx.filter(r => isMutatingMethod(r.request?.method))
@@ -1812,7 +1812,7 @@ export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyCl
       const beforeBody = [...ok2xx].reverse().find(r => r.seq < minProbeSeq && !isMutatingMethod(r.request?.method))
       const probeActors = new Set(primary2xx.map(r => r.request?.personaHandle ?? null))
       const hasNonStubAfter = ok2xx.some(r =>
-        r.seq > minProbeSeq && !primary2xx.includes(r) && !detectIntermediateStub(r, store.body(r.exchangeId)).isStub &&
+        r.seq > minProbeSeq && !primary2xx.includes(r) && !detectIntermediateStub(r, store.body(r.exchangeId)).isStub && readsStubResourceTree(r, primary2xx) &&
         !(probeActors.has(r.request?.personaHandle ?? null) && afterReadbackIsIntermediateOnly(beforeBody ? store.body(beforeBody.exchangeId) : undefined, r, store.body(r.exchangeId)).isStub))
       if (!hasNonStubAfter) failures.push(STANDALONE_TERMINAL_IMPACT_HINT)
     }
@@ -1830,7 +1830,7 @@ export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyCl
   const rejectedBy = failedCheck
     ? (typeof failedCheck.observed?.rejectedBy === 'string' ? failedCheck.observed.rejectedBy : failedCheck.claim.kind)
     : failures.length > 0
-      ? (failures.some(f => f.startsWith('terminal_impact_unproven:')) ? 'terminal_impact_unproven'
+      ? (failures.some(f => f.startsWith('composite_receipt:')) ? 'composite_receipt' : failures.some(f => f.startsWith('terminal_impact_unproven:')) ? 'terminal_impact_unproven'
           : failures.some(f => f.startsWith('boundary:')) ? 'boundary_gate'
             : failures.some(f => f.startsWith('impact:')) ? 'impact_gate' : 'oracle')
       : null

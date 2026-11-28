@@ -27,7 +27,7 @@ import { HostFactLog } from './host-fact-log.ts'
 import { resolvePersonaIdentity } from './oracle-invariants.ts'
 import { buildAgentScriptReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptVerification, ScriptProofExchange } from './proof-receipt.ts'
-import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
+import type { TerminalOracleResult } from './terminal-oracle-registry.ts'
 import {
   TranscriptStore,
   VerifyRpcServer,
@@ -400,6 +400,8 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     factLog: HostFactLog
     hostTranscript: HostSignedTranscript | null
     composites: V8CompositeProofBundle[]
+    /** A2: host-keyed production single-hop envelope evaluator bound to this attempt's RPC session. */
+    evaluateSingleHop: (built: NonNullable<ReturnType<typeof buildAgentScriptReceipt>>) => TerminalOracleResult
     title: string | null
     severity: string | null
     description: string | null
@@ -510,6 +512,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
           factLog,
           hostTranscript,
           composites: [...server.getVerifiedComposites()],
+          evaluateSingleHop: built => server.evaluateSingleHopReceipt(built.factLog, built),
           title: typeof resObj.title === 'string' && resObj.title.trim() ? resObj.title.trim() : null,
           severity: typeof resObj.severity === 'string' && resObj.severity.trim() ? resObj.severity.trim() : null,
           description: typeof resObj.description === 'string' && resObj.description.trim() ? resObj.description.trim() : null,
@@ -600,7 +603,10 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
   const rejectedComposite = a2?.composites.find(c => !c.verification.confirmed)
     ?? a1?.composites.find(c => !c.verification.confirmed)
     ?? null
-  if (!verdict.confirmed && rejectedComposite) {
+  // A1: a host-recorded composite rejection is FINAL for the attempt — whether or not the script chose to
+  // return its `composite_receipt` claim — unless a composite actually confirmed. The script can never fall
+  // back to a single-hop receipt built from its other claims after the host rejected its chain.
+  if (rejectedComposite && !confirmedComp1) {
     const capture = a2 ?? a1
     const exchanges = capture ? factLogToScriptExchanges(capture.factLog, workerSanitizer) : []
     return {
@@ -642,8 +648,10 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       const builtFallbackReceipt = !hasCompositeFailure && !drifted && hasCaptureWithClaims
         ? buildAgentScriptReceipt({ claims: latestCapture!.claims, exchanges, factLog: latestCapture!.factLog, origin: fallbackOrigin, title: params.title?.trim() || verdict.claimTitle || 'Agent script proof' })
         : null
+      // A2: failure classification uses the SAME production single-hop envelope as confirmation (host
+      // signing key + grant persona policy), so the reported failure code matches the gate that decides.
       const fallbackOracleCode = builtFallbackReceipt
-        ? defaultTerminalOracleRegistry.evaluate(builtFallbackReceipt.factLog, { kind: 'single_hop', receipt: builtFallbackReceipt.receipt, armOverrides: builtFallbackReceipt.armOverrides, ...(builtFallbackReceipt.evidenceRoleOverrides ? { evidenceRoleOverrides: builtFallbackReceipt.evidenceRoleOverrides } : {}) }, { strictHostDerivation: true, ...(builtFallbackReceipt.receipt.oracleEvents?.length ? { trustedOracleEvents: builtFallbackReceipt.receipt.oracleEvents } : {}) }).singleHop?.failureCode ?? null
+        ? latestCapture!.evaluateSingleHop(builtFallbackReceipt).singleHop?.failureCode ?? null
         : null
       typedVerdict = {
         ...verdict,
@@ -704,19 +712,11 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       ...attribution,
     }
   }
-  const oracleRes = defaultTerminalOracleRegistry.evaluate(
-    built.factLog,
-    {
-      kind: 'single_hop',
-      receipt: built.receipt,
-      armOverrides: built.armOverrides,
-      ...(built.evidenceRoleOverrides ? { evidenceRoleOverrides: built.evidenceRoleOverrides } : {}),
-    },
-    {
-      strictHostDerivation: true,
-      ...(built.receipt.oracleEvents?.length ? { trustedOracleEvents: built.receipt.oracleEvents } : {}),
-    },
-  )
+  // A2: single-hop script receipts run the SAME production envelope as composites (host signing key +
+  // grant persona policy + unified terminal-impact gate); there is no bare rule-handler shortcut, and a
+  // receipt whose 1-node envelope fails attacker provenance, replay mode, or the terminal gate is
+  // rejected exactly like a composite.
+  const oracleRes = captured.evaluateSingleHop(built)
   const verification: ReceiptVerification = oracleRes.singleHop ?? {
     confirmed: oracleRes.confirmed,
     vulnClass: built.receipt.vulnClass,

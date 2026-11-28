@@ -873,7 +873,12 @@ export class HostFactLog {
       ? resolvePersonaIdentity({ roleLabel: actor, handle: actor })
       : null
     const actorRole: RoleName | null = primaryIdentity.role ?? (!hasExplicitPrivilege ? actorIdentity?.role ?? null : null)
-    const actorTenant: string | null = primaryIdentity.tenant ?? (!hasExplicitTenant && actorHasLabelSyntax ? actorIdentity?.tenant ?? null : null)
+    // B1: a derived (capability-sealed) credential's principal is the SERVER-BOUND identity the host recorded for
+    // the minted credential (`actorTenant`), else unknown — never a tenant parsed from the minter's inherited role label.
+    const isDerivedCredentialActor = Boolean(actor?.startsWith('cap:'))
+    const actorTenant: string | null = isDerivedCredentialActor
+      ? (input.actorTenant ?? null)
+      : primaryIdentity.tenant ?? (!hasExplicitTenant && actorHasLabelSyntax ? actorIdentity?.tenant ?? null : null)
     const wireCredentialProvenance = freezeWireCredentialProvenance(input.wireCredentialProvenance)
     const credentialPlacement = deriveCredentialPlacement(requestHeaders, input.credentialPlacement, wireCredentialProvenance)
     const ambientAuth = deriveAmbientAuthFromHeaders(requestHeaders, input.ambientAuth, credentialPlacement)
