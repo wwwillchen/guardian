@@ -549,10 +549,12 @@ describe('Round-0 stage stepper, live telemetry, and collapsed traffic drawer', 
         assert.ok(metaRow?.workspace_id, 'Expected workspace_id on seeded run')
         const goalRev = metaRow.goal_revision ?? 1
 
+        // Keep the seeded run paused so the live Execution loop does not reap the
+        // synthetic running Round-0 worker as an orphan or spawn a competing recon pass.
         db.prepare(
           `UPDATE runs
              SET phase = 'threat_model',
-                 status = 'running',
+                 status = 'paused',
                  scope_revision = 1,
                  candidates = ?,
                  approved = ?,
