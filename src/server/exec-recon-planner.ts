@@ -46,7 +46,14 @@ import {
   type Grant,
   type PublicObservation,
 } from './broker.ts'
-import { CapabilityLedger, DERIVED_CAPABILITY_HANDLE_RE, computeArtifactDigest, finalizeHopCheckpointBrief, formatDerivedCapabilityHandle, sanitizeCheckpointHandleRef, sanitizeCheckpointText, type AddCapabilityInput, type CapabilityKind, type CapabilitySurface, type HopCheckpointBrief, type HopWorkflowNotebook } from './capability-ledger.ts'
+import {
+  CapabilityLedger, DERIVED_CAPABILITY_HANDLE_RE, computeArtifactDigest, finalizeHopCheckpointBrief, formatDerivedCapabilityHandle,
+  sanitizeCheckpointHandleRef, sanitizeCheckpointText, type AddCapabilityInput, type CapabilityKind, type CapabilitySurface,
+  type HopCheckpointBrief, type HopProofDraft, type HopWorkflowNotebook,
+  // R2 proof-carrying rotation handoff: parent-context resolution, repair budget & prompt context.
+  collectParentHopCheckpointBriefs, isActiveProofDraft, parseDeclaredHopsFromText, parseHopCheckpointBriefJson,
+  renderHopContinuationRepairContext, resolveContinuationParentContext, resolveHopContinuationBudget,
+} from './capability-ledger.ts'
 import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
@@ -1593,8 +1600,10 @@ function hopKindToCapabilityKind(kind: ChainHop['artifactKind']): CapabilityKind
 
 export const CHECKPOINT_CAP_SKILL_PREFIX = 'checkpoint_cap:'
 export const MAX_WORKSPACE_DIGEST_BYTES = 8 * 1024
+// Skip redundant recon, but replay the full ordered root-to-terminal hop chain in ONE verification script so
+// sealed capability handles stay valid within that script (they are not reusable across separate scripts).
 export const HOP_CONTINUATION_DIRECTIVE =
-  'Continue from the verified hop checkpoint — do not repeat verified discovery hops; advance the next boundary with sealed handles and confirm via ctx.prove_composite.'
+  'Skip redundant discovery/recon but re-execute the full ordered hop chain from root to terminal in ONE verification script (sealed handles stay valid) using ctx.prove_composite.'
 
 export function extractCheckpointCapIdFromStep(step: { skills?: readonly string[] }): string | null {
   for (const skill of step.skills ?? []) {
@@ -1825,8 +1834,12 @@ export interface EnqueueHopContinuationInput {
   recordedExchanges: readonly HopContinuationExchangeRef[]
   sealedCapHandles: readonly string[]
   maxContinuations?: number
-  trigger?: 'wall_clock_rotated' | 'sealed_handle_exit'
+  trigger?: 'wall_clock_rotated' | 'sealed_handle_exit' | 'partial_composite' | 'proof_draft_repair'
   allowNonChainWithSealedCap?: boolean
+  /** Hop count of the largest composite persisted as a confirmed finding during this assignment. */
+  confirmedCompositeHopCount?: number
+  /** Near-miss proof draft from the last rejected verification attempt (proof-carrying handoff). */
+  proofDraft?: HopProofDraft
 }
 
 export interface EnqueueHopContinuationResult {
@@ -1838,21 +1851,8 @@ export interface EnqueueHopContinuationResult {
   checkpointBytes?: number
 }
 
-function parseHopCheckpointJson(raw: unknown): HopCheckpointBrief | null {
-  if (!raw) return null
-  let obj: unknown = raw
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim()
-    if (!trimmed.startsWith('{')) return null
-    try { obj = JSON.parse(trimmed) } catch { return null }
-  }
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
-  const rec = obj as Record<string, unknown>
-  if (rec.schema !== 'v8.hop_checkpoint.v1' || typeof rec.branchKey !== 'string' || !rec.nextGoal || typeof rec.nextGoal !== 'object') {
-    return null
-  }
-  return rec as unknown as HopCheckpointBrief
-}
+// Single authoritative `v8.hop_checkpoint.v1` parser lives in capability-ledger.ts (no dual parsing path).
+const parseHopCheckpointJson = parseHopCheckpointBriefJson
 
 export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private readonly ownRunState?: RunOrchestrationStateStore
@@ -5585,6 +5585,17 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
    */
   enqueueHopContinuationOnRotation(input: EnqueueHopContinuationInput): EnqueueHopContinuationResult {
     const { run, step, assignment } = input
+    // One hoisted fact pass shared by parent-context resolution, sealed-handle dedup, and fact handoff.
+    const allLiveFacts = this.pageAll((offset, limit) => this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+    const liveFactById = new Map(allLiveFacts.map(f => [f.id, f]))
+    const liveFactIds = new Set(liveFactById.keys())
+    const parentFacts = step.dependsOnFactIds.flatMap(id => liveFactById.get(id) ?? [])
+    const structuredHops = readChainHopsFromFacts(parentFacts)
+    const parentCtx = resolveContinuationParentContext({
+      parentBriefs: collectParentHopCheckpointBriefs(parentFacts, this.persistedStepCheckpoints.get(step.id)?.checkpointJson),
+      predictedHops: structuredHops.length ? structuredHops : parseDeclaredHopsFromText([step.hypothesis, ...parentFacts.flatMap(f => [f.summary, typeof f.data?.hypothesis === 'string' ? f.data.hypothesis : undefined])]),
+      ...(input.confirmedCompositeHopCount ? { confirmedCompositeHopCount: input.confirmedCompositeHopCount } : {}), ...(input.proofDraft ? { proofDraft: input.proofDraft } : {}),
+    })
     const allowNonChainSealedExit = input.trigger === 'sealed_handle_exit'
       && Boolean(input.allowNonChainWithSealedCap)
       && input.sealedCapHandles.length > 0
@@ -5594,13 +5605,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const allowWorkflowRotation = input.trigger === 'wall_clock_rotated'
       && isPersistentWorkflowContinuationStep(step)
       && hasWorkflowConcreteProgress
-    if (!isMultiHopChainStep(step) && !allowNonChainSealedExit && !allowWorkflowRotation) {
+    if (!isMultiHopChainStep(step) && !allowNonChainSealedExit && !allowWorkflowRotation && !parentCtx.partialComposite) {
       return { enqueued: false, reason: 'not_multi_hop_chain' }
     }
-    if (input.confirmed) {
-      return { enqueued: false, reason: 'already_confirmed' }
-    }
-    const requestedMax = Math.max(0, Math.floor(input.maxContinuations ?? MAX_CHAIN_CONTINUATIONS))
+    // A confirmed composite that stopped short of the parent's declared hop chain keeps continuing.
+    if (input.confirmed && !parentCtx.partialComposite) return { enqueued: false, reason: 'already_confirmed' }
+    const requestedMax = Math.max(0, Math.floor(input.maxContinuations ?? MAX_CHAIN_CONTINUATIONS)) + parentCtx.repairBonus
     const currentDepth = extractContinuationDepth(step)
     if (currentDepth >= requestedMax) {
       return { enqueued: false, reason: 'max_continuations_reached', continuationDepth: currentDepth }
@@ -5641,9 +5651,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // chains with sealed capabilities are never prematurely cut off at 1 continuation.
     const isGenericWave1 = isGenericWave1BoundaryChainStep(step)
     const hasSealedLedgerCap = derivedLedgerHandles.length > 0
-    const maxContinuations = !hasSealedLedgerCap
-      ? Math.min(requestedMax, MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS)
-      : requestedMax
+    const maxContinuations = resolveHopContinuationBudget({
+      requestedMax: requestedMax - parentCtx.repairBonus, genericCap: MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS, hasSealedLedgerCap, repairBonus: parentCtx.repairBonus,
+    })
     if (currentDepth >= maxContinuations) {
       return { enqueued: false, reason: 'max_continuations_reached', continuationDepth: currentDepth }
     }
@@ -5651,6 +5661,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const hasProgress = input.recordedFacts.length > 0
       || input.recordedExchanges.length > 0
       || uniqueHandles.length > 0
+      || isActiveProofDraft(parentCtx.proofDraft)
     if (!hasProgress) {
       return { enqueued: false, reason: 'no_concrete_progress' }
     }
@@ -5696,8 +5707,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const inheritedHandles = new Set<string>(stepCapId ? [stepCapId] : [])
         if (step.dependsOnFactIds.length > 0) {
           const neededFactIds = new Set(step.dependsOnFactIds)
-          const allRunFacts = this.pageAll((offset, limit) =>
-            this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+          const allRunFacts = allLiveFacts
           const checkpointFactById = new Map<string, (typeof allRunFacts)[number]>()
           for (const f of allRunFacts) {
             if (neededFactIds.has(f.id) && f.data?.subkind === 'hop_checkpoint') {
@@ -5744,26 +5754,13 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       180,
     )
 
-    const lastExchange = input.recordedExchanges[input.recordedExchanges.length - 1]
-    const nextEndpoint = lastExchange ? (lastExchange.pathAndQuery.split('?')[0] || '/') : '/'
-    const nextMethod = lastExchange?.method?.toUpperCase()
+    const lastExchange = input.recordedExchanges[input.recordedExchanges.length - 1], predictedNext = parentCtx.nextHop?.endpoint ? parentCtx.nextHop : null
+    const nextEndpoint = predictedNext?.endpoint ?? (lastExchange ? (lastExchange.pathAndQuery.split('?')[0] || '/') : '/')
+    const nextMethod = predictedNext ? predictedNext.method?.toUpperCase() : lastExchange?.method?.toUpperCase()
     const branchKey = `cont:${step.id.slice(0, 12)}:d${nextDepth}`
 
-    const allLiveFacts = this.pageAll((offset, limit) =>
-      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
-    const liveFactById = new Map(allLiveFacts.map(f => [f.id, f]))
-    const liveFactIds = new Set(liveFactById.keys())
-    const parentNotebooks: HopWorkflowNotebook[] = []
-    for (const factId of step.dependsOnFactIds) {
-      const cpFact = liveFactById.get(factId)
-      if (cpFact?.data?.subkind !== 'hop_checkpoint') continue
-      const parentBrief = parseHopCheckpointJson(cpFact.data.checkpointBrief ?? cpFact.data.checkpointJson)
-      if (parentBrief?.workflowNotebook) parentNotebooks.push(parentBrief.workflowNotebook)
-    }
-    if (!parentNotebooks.length) {
-      const cachedParent = parseHopCheckpointJson(this.persistedStepCheckpoints.get(step.id)?.checkpointJson)
-      if (cachedParent?.workflowNotebook) parentNotebooks.push(cachedParent.workflowNotebook)
-    }
+    const parentNotebooks: HopWorkflowNotebook[] = parentCtx.notebooks
+    const proofDraft = parentCtx.proofDraft
     const newDiscoveredRoutes = input.recordedExchanges
       .filter(ex => ex.status > 0 && ex.status !== 404)
       .map(ex => sanitizeCheckpointText(`${ex.method.toUpperCase()} ${ex.pathAndQuery.split('?')[0] || '/'}`, 88))
@@ -5809,6 +5806,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           goal: HOP_CONTINUATION_DIRECTIVE,
         },
         ...(workflowNotebook ? { workflowNotebook } : {}),
+        ...(proofDraft ? { proofDraft } : {}),
       })
       const mergedHandles = [...new Set([...ledgerBrief.capabilityHandles, ...allSealedHandles])]
         .map((h, i) => sanitizeCheckpointHandleRef(h, `cap:redacted:${i + 1}`))
@@ -5853,6 +5851,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           goal: HOP_CONTINUATION_DIRECTIVE,
         },
         ...(workflowNotebook ? { workflowNotebook } : {}),
+        ...(proofDraft ? { proofDraft } : {}),
         doNotRediscover: true,
       }, MAX_CHECKPOINT_BRIEF_BYTES)
     }
@@ -5864,6 +5863,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const continuationTitle = `${baseTitle} [continuation #${nextDepth}]`
     const detailParts = [
       HOP_CONTINUATION_DIRECTIVE,
+      renderHopContinuationRepairContext(parentCtx),
       partialClean ? `Partial progress: ${partialClean}.` : '',
       allSealedHandles.length ? `Sealed handles: ${allSealedHandles.join(', ')}.` : '',
       observedEndpoints.length ? `Observed endpoints: ${observedEndpoints.join('; ')}.` : '',
@@ -5949,7 +5949,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           parentStepId: step.id,
           continuationStepId: created.id,
           continuationDepth: nextDepth,
-          maxContinuations,
+          maxContinuations, partialComposite: parentCtx.partialComposite, proofDraftHandoff: Boolean(proofDraft),
           ...(primaryCapId ? { checkpointCapId: primaryCapId } : {}),
           checkpointBytes: finalizedBrief.checkpointBytes,
           sealedHandleCount: allSealedHandles.length,
