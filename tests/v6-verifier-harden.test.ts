@@ -1394,16 +1394,16 @@ test('parity: executable markup still backs a markup claim', async () => {
 // ---------------------------------------------------------------------------
 
 test('audit: expectControlDenied:false cannot skip crossing an observed denial', () => {
-  const viewer = { handle: 'viewer', role: 'viewer' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
-  const admin = { handle: 'admin', role: 'admin' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const viewerA = { handle: 'viewer_a', role: 'viewer' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
+  const viewerB = { handle: 'viewer_b', role: 'viewer' as const, tenant: 'acme', auth: 'cookie' as const, sameSite: 'Lax' as const }
   const unrelated = assessBoundary({
     impactClass: 'authorization',
     boundaryClass: 'access',
-    // Model pairs a denied admin control with a 200 on an unrelated route and asks to skip the gate.
+    // Model pairs a denied control with a 200 on an unrelated route and asks to skip the gate.
     expectControlDenied: false,
     steps: [
-      { id: 'control', arm: 'control', method: 'GET', route: '/api/admin/audit', status: 403, actor: viewer },
-      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/invoices/i1', status: 200, actor: admin, json: { id: 'i1', amount_cents: 4200 } },
+      { id: 'control', arm: 'control', method: 'GET', route: '/api/admin/audit', status: 403, actor: viewerA },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/invoices/i1', status: 200, actor: viewerB, json: { id: 'i1', amount_cents: 4200 } },
     ],
   })
   assert.equal(unrelated.satisfied, false, 'an observed denial must be crossed on the same route family')
@@ -1413,8 +1413,8 @@ test('audit: expectControlDenied:false cannot skip crossing an observed denial',
     impactClass: 'authorization',
     boundaryClass: 'access',
     steps: [
-      { id: 'control', arm: 'control', method: 'GET', route: '/api/admin/audit', status: 403, actor: viewer },
-      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/admin/audit', status: 200, actor: admin, json: { rows: [{ actor: 'admin' }] } },
+      { id: 'control', arm: 'control', method: 'GET', route: '/api/admin/audit', status: 403, actor: viewerA },
+      { id: 'probe', arm: 'probe', method: 'GET', route: '/api/admin/audit', status: 200, actor: viewerB, json: { rows: [{ actor: 'admin' }] } },
     ],
   })
   assert.equal(crossed.satisfied, true, crossed.reason)

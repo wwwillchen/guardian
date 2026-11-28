@@ -1,0 +1,134 @@
+{
+  "id": "d1-disclosure-owner-as-probe-lower-role-denied-opus-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "disclosure-owner-as-probe",
+  "description": "R3-05 independent-review FP (d1-floor-tier1-migrate, reviewer claude-opus-5-5): owner-as-probe disclosure where admin_a reads its own admin-scoped integration while a lower-role same-tenant viewer_a is denied (403). Correct RBAC enforcement, not a disclosure crossing; both read-path peerDenial (oracle-invariants.ts) and floor-recipe-engine Tier-1 access_differential / planDisclosureRecipe must fail closed.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/floor-recipes.ts",
+      "src/server/oracle-invariants.ts"
+    ],
+    "classes": [
+      "info_disclosure",
+      "disclosure"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-200",
+    "category": "info_disclosure",
+    "title": "Integration configuration disclosed to unentitled caller",
+    "impact": "Reads integration configuration across a role boundary.",
+    "claimedImpact": "disclosure",
+    "claimedBoundary": "access",
+    "vulnClass": "info_disclosure"
+  },
+  "freeTextLabel": {
+    "title": "Sensitive integration data exposure on admin endpoint"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "admin_a",
+      "roleLabel": "admin (acme)",
+      "role": "admin",
+      "tenant": "acme",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-admin-a-token"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (acme)",
+      "role": "viewer",
+      "tenant": "acme",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "pbase",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "probe_baseline",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/integrations/self",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"handle\":\"admin_a\",\"role\":\"admin\"}"
+    },
+    {
+      "id": "ent",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "entitled_read",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/integrations/int_7f3a91",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"int_7f3a91\",\"name\":\"Billing export\",\"endpoint_url\":\"https://hooks.acme.test/billing\",\"notes\":\"quarterly billing export for finance\"}"
+    },
+    {
+      "id": "den",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "denied_control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/integrations/int_7f3a91",
+      "persona": "viewer_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "evidenceRole": "probe_request",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/integrations/int_7f3a91",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"int_7f3a91\",\"name\":\"Billing export\",\"endpoint_url\":\"https://hooks.acme.test/billing\",\"notes\":\"quarterly billing export for finance\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ent.status == 200 and .steps.den.status == 403), confirmed: (.steps.prb.status == 200), observed: \"probe served\", expected: \"probe denied\" }"
+  },
+  "claims": [
+    {
+      "kind": "boundary",
+      "boundaryClass": "access",
+      "controlExchangeId": "den",
+      "probeExchangeId": "prb",
+      "expectControlDenied": true
+    }
+  ]
+}

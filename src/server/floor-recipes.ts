@@ -34,9 +34,9 @@
  * | `race_burst`           | race_double_spend                         | `race_burst`         | repeated terminal transition + divergent burst outcomes |
  * | `browser_chain`        | xss_* / dom_* (navigate/fill/click)       | `browser_sink`       | browser rule: host-recorded trace with the canary in an executable sink |
  * | `browser_chain`        | protocol (postMessage/fetch/builtin)      | — (no recipe)        | claim is not expressible as a sink trace |
- * | `rce_proof`            | ssti / command_injection                  | — (no recipe)        | not expressible by the receipt impact model |
- * | `auth_protocol_proof`  | jwt / oauth / webhook_forgery             | — (no recipe)        | proof-script path stays for protocol forgery |
- * | `cache_differential`   | cache_poisoning                           | — (no recipe)        | no receipt rule |
+ * | `rce_proof`            | ssti / command_injection                  | typed runner         | Tier-1 oob_and_execution_witness (host-evaluated expression / OOB canary) |
+ * | `auth_protocol_proof`  | jwt / oauth / webhook_forgery             | typed runner         | Tier-1 wire differential (signature validity) or OOB witness; zero jq |
+ * | `cache_differential`   | cache_poisoning                           | typed runner         | Tier-1 wire_framing_and_cache_differential (cache priming) |
  * | `http_chain`           | path_traversal / open_redirect / xss_*    | — (no recipe)        | no receipt rule |
  *
  * Boolean-only SQLi confirms through the `boolean_differential` receipt rule: the recipe sends at
@@ -46,9 +46,9 @@
  *
  * Cut 3a wired `sql_boolean_diff`; Cut 3b adds the authorization families (`http_chain` +
  * object/function access) with a bogus-id/peer denial control and a pre-read + post-read mutation
- * readback. The other rows above stay on the legacy verifier and are listed in
- * `LEGACY_UNWIRED_SPECKINDS` with the measured blocking reason; `wiredRecipeForSpecKind` is the
- * single source of truth for the guard.
+ * readback. Track D Cut 1 wires the remaining rows behind Track A2 Tier-1 primitives (gate in
+ * `floor-recipe-engine.ts::executeFloorRecipeById`); `LEGACY_UNWIRED_SPECKINDS` is empty and
+ * `wiredRecipeForSpecKind` is the single source of truth for the guard.
  */
 import { createHash } from 'node:crypto'
 import { matchStrippedInjectionFingerprint } from './oracle-invariants.ts'
@@ -56,6 +56,7 @@ import type { AmbientAuth, ImpactStep, InjectionFamily, RoleName } from './oracl
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildProofReceipt, defaultHostMintedOracle, exactPathnameOf, verifyReceipt } from './proof-receipt.ts'
 import type { BooleanPairStyle, HostMintedRedirectCanary, HostStampedBooleanPair, ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
+import type { UniversalPrimitiveDecision } from './v8-oracle-families.ts'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -269,7 +270,11 @@ export interface PersistedMutationArgs extends FloorRecipeBaseArgs {
     restoreBody?: Record<string, unknown>
     /** Restore the owner's original value in `finally` (defaults to `true`). */
     restoreOriginal?: boolean
+    /** Bind the route's anti-CSRF token on the control write (CSRF differential control arm). */
+    csrfBind?: boolean
   }
+  /** Session jar for every arm, a same-origin page primed first, and probe-only headers (foreign Origin). */
+  session?: string; primePath?: string; probeHeaders?: Record<string, string>
   /**
    * Control write restoring the probe actor's own state before the proof. Self-service function
    * state (identity assumption) is a persistent session mutation, so without a reset the pre-read
@@ -350,6 +355,8 @@ export interface OobCallbackArgs extends FloorRecipeBaseArgs {
   injectTextBody?: string
   injectHeaders?: Record<string, string>
   oracleEvents?: string[]
+  /** Benign control arm (sent first) carrying its own host canary, which must never call back. */
+  controlToken?: string; controlPathAndQuery?: string; controlJsonBody?: unknown; controlTextBody?: string; controlHeaders?: Record<string, string>
 }
 
 export interface ConservedBalanceStepSpec {
@@ -604,6 +611,8 @@ export interface FloorRecipeExecution {
   result: FloorRecipeRunResult
   receipt: ProofReceipt
   failure?: FloorRecipeFailure
+  /** Track A2 Tier-1 universal primitive verdict that gated this execution (set by `executeFloorRecipeById`). */
+  primitive?: UniversalPrimitiveDecision
 }
 
 /** Hard bound: no recipe may exceed this many exchanges in one run. */
@@ -1137,48 +1146,26 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
   const readbackActor = args.readbackActor ?? args.actor
   const bodyKeys = Object.keys(args.body).slice(0, 8)
   const shouldRestoreBaselineWrite = Boolean(args.baselineWrite && args.baselineWrite.restoreOriginal !== false)
+  const jar = args.session ? { session: args.session } : {}
+  if (args.primePath) await ctx.send({ arm: 'setup', role: 'session_prime', method: 'GET', pathAndQuery: args.primePath, actor: readbackActor, ...jar })
 
   // Capture the owner's pre-test value before `baseline_write` overwrites it, so `finally`
   // restores the owner's original state rather than leaving a synthetic baseline sentinel behind.
-  let preBaselineSnapshot: FloorExchange | null = null
-  if (shouldRestoreBaselineWrite && !args.baselineWrite!.restoreBody && ctx instanceof RecipeContext) {
-    preBaselineSnapshot = await ctx.readPreBaselineSnapshot({
-      arm: 'setup',
-      role: 'pre_baseline_snapshot',
-      method: baselineMethod,
-      pathAndQuery: baselinePath,
-      actor: readbackActor,
-    })
-  }
+  const preBaselineSnapshot: FloorExchange | null =
+    shouldRestoreBaselineWrite && !args.baselineWrite!.restoreBody && ctx instanceof RecipeContext
+      ? await ctx.readPreBaselineSnapshot({ arm: 'setup', role: 'pre_baseline_snapshot', method: baselineMethod, pathAndQuery: baselinePath, actor: readbackActor })
+      : null
 
   // A self-service function state persists on the caller's own session, so a stale target value
-  // from the probe phase would make a correct mutation look like an idempotent no-op. The reset is
-  // a control write that restores the actor's own baseline before the pre-read.
+  // from the probe phase would make a correct mutation look like an idempotent no-op.
   if (args.reset) {
-    const reset = await ctx.send({
-      arm: 'control',
-      role: 'state_reset',
-      method: args.reset.method ?? args.method,
-      pathAndQuery: args.pathAndQuery,
-      actor: args.reset.actor ?? args.actor,
-      jsonBody: args.reset.body,
-      ...(args.headers ? { headers: args.headers } : {}),
-    })
+    const reset = await ctx.send({ arm: 'control', role: 'state_reset', method: args.reset.method ?? args.method, pathAndQuery: args.pathAndQuery, actor: args.reset.actor ?? args.actor, jsonBody: args.reset.body, ...(args.headers ? { headers: args.headers } : {}) })
     ctx.require(isSuccess(reset.exchange.status), 'state_reset', `The state reset was not accepted (${reset.exchange.status ?? 'no status'}).`, 'control')
   }
-  // A baseline write makes the probe body a genuine delta: the pre-read then holds a known
-  // different value, and the persistence oracle can attribute the post-read change to the probe.
+  // A baseline write makes the probe body a genuine delta so post-read changes attribute cleanly.
   let baselineWriteApplied = false
   if (args.baselineWrite) {
-    const baselineWrite = await ctx.send({
-      arm: 'control',
-      role: 'baseline_write',
-      method: args.baselineWrite.method ?? args.method,
-      pathAndQuery: args.pathAndQuery,
-      actor: args.baselineWrite.actor ?? args.actor,
-      jsonBody: args.baselineWrite.body,
-      ...(args.headers ? { headers: args.headers } : {}),
-    })
+    const baselineWrite = await ctx.send({ arm: 'control', role: 'baseline_write', method: args.baselineWrite.method ?? args.method, pathAndQuery: args.pathAndQuery, actor: args.baselineWrite.actor ?? args.actor, jsonBody: args.baselineWrite.body, ...jar, ...(args.baselineWrite.csrfBind ? { csrfBind: true } : {}), ...(args.headers ? { headers: args.headers } : {}) })
     baselineWriteApplied = isSuccess(baselineWrite.exchange.status)
     ctx.require(baselineWriteApplied, 'baseline_write', `The baseline write was not accepted (${baselineWrite.exchange.status ?? 'no status'}).`, 'control')
   }
@@ -1187,99 +1174,34 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
     if (!shouldRestoreBaselineWrite || !args.baselineWrite) return
     const restoreMethod = args.baselineWrite.method ?? args.method
     const restoreActor = args.baselineWrite.actor ?? readbackActor
-    const restoreBody = deriveBaselineRestoreBody(
-      args.baselineWrite,
-      args.body,
-      args.pathAndQuery,
-      [preBaselineSnapshot?.json, baselineJson],
-    )
+    const restoreBody = deriveBaselineRestoreBody(args.baselineWrite, args.body, args.pathAndQuery, [preBaselineSnapshot?.json, baselineJson])
     ctx.registerRestore(
-      cleanup => cleanup.sendCleanup(
-        {
-          arm: 'cleanup',
-          role: 'state_restore',
-          method: restoreMethod,
-          pathAndQuery: args.pathAndQuery,
-          actor: restoreActor,
-          jsonBody: restoreBody,
-          ...(args.headers ? { headers: args.headers } : {}),
-        },
-        { recordInTranscript: false },
-      ),
-      {
-        actor: restoreActor,
-        role: 'state_restore',
-        method: restoreMethod,
-        pathAndQuery: args.pathAndQuery,
-      },
+      cleanup => cleanup.sendCleanup({ arm: 'cleanup', role: 'state_restore', method: restoreMethod, pathAndQuery: args.pathAndQuery, actor: restoreActor, jsonBody: restoreBody, ...(args.headers ? { headers: args.headers } : {}) }, { recordInTranscript: false }),
+      { actor: restoreActor, role: 'state_restore', method: restoreMethod, pathAndQuery: args.pathAndQuery },
     )
   }
 
   let baseline: FloorRecipeStep
   try {
-    baseline = await ctx.send({
-      arm: 'control',
-      role: 'baseline_read',
-      method: baselineMethod,
-      pathAndQuery: baselinePath,
-      actor: readbackActor,
-    })
+    baseline = await ctx.send({ arm: 'control', role: 'baseline_read', method: baselineMethod, pathAndQuery: baselinePath, actor: readbackActor, ...jar })
   } catch (err) {
-    if (baselineWriteApplied) {
-      registerBaselineWriteRestore(undefined)
-    }
+    if (baselineWriteApplied) registerBaselineWriteRestore(undefined)
     throw err
   }
 
   // Register `finally`-guarded restores immediately after `baseline_read` (before `mutation_probe`)
-  // so an abort, `BrokerDenied`, or timeout during `mutation_probe` or `post_mutation_read` still
-  // restores both self-service session resets (`hyp.functionState.reset`) and non-selfState
-  // `baselineWrite` owner values via the broker's cleanup allowance.
+  // so an abort, `BrokerDenied`, or timeout still restores session resets and baseline writes.
   if (args.reset) {
-    const resetSpec = args.reset
-    const restoreMethod = resetSpec.method ?? args.method
-    const restoreActor = resetSpec.actor ?? args.actor
+    const resetSpec = args.reset, restoreMethod = resetSpec.method ?? args.method, restoreActor = resetSpec.actor ?? args.actor
     ctx.registerRestore(
-      cleanup => cleanup.sendCleanup(
-        {
-          arm: 'cleanup',
-          role: 'state_restore',
-          method: restoreMethod,
-          pathAndQuery: args.pathAndQuery,
-          actor: restoreActor,
-          jsonBody: resetSpec.body,
-          ...(args.headers ? { headers: args.headers } : {}),
-        },
-        { recordInTranscript: true },
-      ),
-      {
-        actor: restoreActor,
-        role: 'state_restore',
-        method: restoreMethod,
-        pathAndQuery: args.pathAndQuery,
-      },
+      cleanup => cleanup.sendCleanup({ arm: 'cleanup', role: 'state_restore', method: restoreMethod, pathAndQuery: args.pathAndQuery, actor: restoreActor, jsonBody: resetSpec.body, ...(args.headers ? { headers: args.headers } : {}) }, { recordInTranscript: true }),
+      { actor: restoreActor, role: 'state_restore', method: restoreMethod, pathAndQuery: args.pathAndQuery },
     )
   }
-  if (shouldRestoreBaselineWrite) {
-    registerBaselineWriteRestore(baseline.exchange.json)
-  }
+  if (shouldRestoreBaselineWrite) registerBaselineWriteRestore(baseline.exchange.json)
 
-  const probe = await ctx.send({
-    arm: 'probe',
-    role: 'mutation_probe',
-    method: args.method,
-    pathAndQuery: args.pathAndQuery,
-    actor: args.actor,
-    jsonBody: args.body,
-    ...(args.headers ? { headers: args.headers } : {}),
-  })
-  const after = await ctx.send({
-    arm: 'control',
-    role: 'post_mutation_read',
-    method: readbackMethod,
-    pathAndQuery: readbackPath,
-    actor: readbackActor,
-  })
+  const probe = await ctx.send({ arm: 'probe', role: 'mutation_probe', method: args.method, pathAndQuery: args.pathAndQuery, actor: args.actor, jsonBody: args.body, ...jar, ...(args.headers || args.probeHeaders ? { headers: { ...args.headers, ...args.probeHeaders } } : {}) })
+  const after = await ctx.send({ arm: 'control', role: 'post_mutation_read', method: readbackMethod, pathAndQuery: readbackPath, actor: readbackActor, ...jar })
 
   ctx.require(baseline.exchange.json !== undefined, 'baseline_read', 'The pre-mutation baseline read recorded no JSON body.', 'control')
   ctx.require(isSuccess(probe.exchange.status), 'mutation_probe', `The mutating probe was not accepted (${probe.exchange.status ?? 'no status'}).`, 'probe')
@@ -1516,6 +1438,9 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
  * have a delivered durable callback for that same token, after the injection.
  */
 const oobCallback = defineRecipe<OobCallbackArgs>('oob_callback', async (args, ctx) => {
+  const controlInjectedAtMs = Date.now()
+  const control = args.controlToken ? await ctx.send({ arm: 'control', role: 'benign_control', method: args.method, pathAndQuery: args.controlPathAndQuery ?? args.pathAndQuery, actor: args.actor ?? ANONYMOUS, ...(args.controlJsonBody !== undefined ? { jsonBody: args.controlJsonBody } : {}), ...(args.controlTextBody !== undefined ? { textBody: args.controlTextBody } : {}), ...((args.controlHeaders ?? args.headers) ? { headers: args.controlHeaders ?? args.headers } : {}) }) : null
+  const injectedAtMs = Date.now()
   const inject = await ctx.send({
     arm: 'probe',
     role: 'injection_exchange',
@@ -1526,15 +1451,15 @@ const oobCallback = defineRecipe<OobCallbackArgs>('oob_callback', async (args, c
     ...(args.injectTextBody !== undefined ? { textBody: args.injectTextBody } : {}),
     ...((args.injectHeaders ?? args.headers) ? { headers: args.injectHeaders ?? args.headers } : {}),
   })
-  const event = await ctx.oob({ token: args.token })
+  const event = await ctx.oob({ token: args.token, injectedAtMs })
+  const controlEvent = control && args.controlToken ? await ctx.oob({ token: args.controlToken, injectedAtMs: controlInjectedAtMs }) : null
+  ctx.require(!controlEvent?.delivered, 'benign_control', 'The benign control canary called back: the channel is not causal to the probe.', 'control')
 
   ctx.require(event !== null, 'delivered_callback', 'No durable OOB event was delivered for the injected canary token.', 'probe')
   if (event) {
     ctx.require(event.delivered, 'delivered_callback', `OOB event ${event.id} was recorded but not delivered.`, 'probe')
-    const injectedAt = event.injectedAtMs
-    if (injectedAt !== undefined) {
-      ctx.require(event.receivedAtMs >= injectedAt, 'callback_causality', `OOB event ${event.id} arrived before the canary was injected.`, 'harness')
-    }
+    const effectiveInjectedAt = event.injectedAtMs ?? injectedAtMs
+    ctx.require(event.receivedAtMs >= effectiveInjectedAt, 'callback_causality', `OOB event ${event.id} arrived before the canary was injected.`, 'harness')
   }
 
   return buildProofReceipt({
@@ -1544,7 +1469,7 @@ const oobCallback = defineRecipe<OobCallbackArgs>('oob_callback', async (args, c
     oobEventIds: event ? [event.id] : [],
     browserTraceIds: [],
     claimedDelta: `The injected canary ${args.token} was fetched out of band after the probe exchange carried it.`,
-    ...(event?.injectedAtMs !== undefined ? { injectedAtMs: event.injectedAtMs } : {}),
+    injectedAtMs: event?.injectedAtMs ?? injectedAtMs,
     ...(args.oracleEvents ? { oracleEvents: args.oracleEvents } : {}),
   })
 })
@@ -2585,9 +2510,8 @@ export function recipeForSpecKind(specKind: string, vulnClass?: string | null): 
  * `DeclarativeReplaySpec`, and `verifyReplaySpec()` hard-refuses the kind/class combination.
  *
  * This is deliberately narrower than `SPEC_KIND_RECIPES` (the target table). A row graduates here
- * only after the recipe reproduces the legacy confirmation set on the dev floor. Rows that are
- * still on the legacy path are listed in `LEGACY_UNWIRED_SPECKINDS` with the blocking reason, so
- * the gap is explicit instead of looking like an oversight.
+ * only after the recipe reproduces the legacy confirmation set on the dev floor; shapes a recipe
+ * cannot express are named plan skips (fail-closed), never a silent legacy fallback.
  */
 export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
   {
@@ -2620,29 +2544,18 @@ export const WIRED_SPECKIND_RECIPES: readonly SpecKindRecipeMapping[] = [
     recipe: 'access_boundary',
     note: 'Reads: entitled read + probe read + authenticated denial control (same-route peer, or the bogus-id variant when the route only denies nonexistent ids). Mutations: baseline write/reset + pre-mutation readback + probe mutation + separate post-read, confirmed by the shared authorization oracle (persisted delta / cross-tenant entitlement).',
   },
+  // Track D Cut 1: graduated from LEGACY_UNWIRED_SPECKINDS; confirmed by receipt + Tier-1 primitive.
+  { specKind: 'http_chain', vulnClasses: ['mass_assignment', 'workflow_bypass', 'business_logic', 'price_tampering', 'csrf'], recipe: 'persisted_mutation', note: 'Tier-1 state_delta_and_conservation: signed baseline/final readbacks bracket the probe write, and a probe-only body value must be newly persisted (control-write values may not leak).' },
+  { specKind: 'http_chain', vulnClasses: ['info_disclosure', 'secret_disclosure', 'disclosure'], recipe: 'disclosure', note: 'Tier-1 access_differential: an authenticated same-route peer is denied while the probe is served a substantive, unmasked, non-own-tenant payload.' },
+  { specKind: 'http_chain', vulnClasses: ['xxe', 'ssrf', 'webhook_forgery'], recipe: 'oob_callback', note: 'Tier-1 oob_and_execution_witness: the host canary relay observes the probe canary on an independent channel; the benign control canary must stay silent.' },
 ]
 
-/** Rows whose recipe exists but that stay on the legacy verifier for a measured reason. */
-export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId | Cut3FloorRecipeId; reason: string }[] = [
-  {
-    specKind: 'http_chain',
-    vulnClasses: ['mass_assignment', 'workflow_bypass', 'business_logic', 'price_tampering', 'csrf'],
-    recipe: 'persisted_mutation',
-    reason: 'Legacy chain binds the mutated field value and staging tag into the readback assertion; the recipe readback is a plain before/after pair, which is weaker on self-service writes.',
-  },
-  {
-    specKind: 'http_chain',
-    vulnClasses: ['info_disclosure', 'secret_disclosure', 'disclosure'],
-    recipe: 'disclosure',
-    reason: 'Credential/audit reads confirm on pre-redaction secret fingerprints; the disclosure recipe requires a probe-owned baseline read that API-key/audit routes do not expose.',
-  },
-  {
-    specKind: 'http_chain',
-    vulnClasses: ['xxe', 'ssrf', 'webhook_forgery'],
-    recipe: 'oob_callback',
-    reason: 'The legacy OOB proof mints and waits on a durable canary subscription inside the verifier; the recipe adapter needs that relay seam (canary session + late promotion) before moving.',
-  },
-]
+/**
+ * Rows whose recipe exists but that stay on the legacy verifier for a measured reason. Empty since
+ * Track D Cut 1: every active floor spec kind is wired and gated by a Track A2 Tier-1 primitive
+ * (`executeFloorRecipeById`). Kept exported (typed) so Cut 2 callers/tests stay source-compatible.
+ */
+export const LEGACY_UNWIRED_SPECKINDS: readonly { specKind: string; vulnClasses: readonly string[]; recipe: FloorRecipeId | Cut3FloorRecipeId; reason: string }[] = []
 
 /**
  * Resolve the **wired** recipe for a legacy spec kind/class pair. This is the function the verifier

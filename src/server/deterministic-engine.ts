@@ -19,15 +19,15 @@ import { declarativeReplaySpecSchema } from '../replay-spec.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import { probeDifferential, responseSimilarity } from './surface-engine.ts'
 import type { DifferentialProbeClass, DifferentialResult, ProbeDifferentialRequest, SurfaceParamLocation } from './surface-engine.ts'
-import { assertNotRecipeWiredLegacyCall, verifyReplaySpec } from './replay-verifier.ts'
-import type { ReplayVerificationResult } from './replay-verifier.ts'
+import { assertNotRecipeWiredLegacyCall } from './replay-verifier.ts'
+import type { ReplayVerificationResult, verifyReplaySpec } from './replay-verifier.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import type { Store } from './store.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 import { synthesizeEngineSpecs, vulnClassOfSpec } from './deterministic-specs.ts'
 import type { EngineEndpoint, EngineHypothesis, EngineParam, SynthesizedEngineSpec } from './deterministic-specs.ts'
-import { planFloorRecipe, recipeSpecRecord, recipeVerificationResult, runPlannedRecipe } from './floor-recipe-engine.ts'
+import { TYPED_RECIPE_ASSERTION, planFloorRecipe, recipeSpecRecord, recipeVerificationResult, runPlannedRecipe, runTypedFloorSpec } from './floor-recipe-engine.ts'
 import {
   CONSERVED_AMOUNT_FIELD_RE,
   CONSERVED_BALANCE_FIELD_RE,
@@ -5336,164 +5336,87 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
       // candidate (kind/class attribution); it is not the confirmation artifact.
       const candidateClass = candidate.vulnClass || vulnClassOfSpec(parsed.data as unknown as Record<string, unknown>)
       const recipePlan = planFloorRecipe({
-        hypothesis: hyp,
-        probe,
-        specKind: candidate.kind,
-        vulnClass: candidateClass,
-        personas: input.personas,
-        // Browser recipes replay the candidate's own step list; the synthesizer remains the source
-        // of the interaction shape while the recipe owns confirmation.
-        ...(candidate.kind === 'browser_chain' ? { candidateSpec: candidate.spec as unknown as Record<string, unknown> } : {}),
+        hypothesis: hyp, probe, specKind: candidate.kind, vulnClass: candidateClass, personas: input.personas,
+        ...(candidate.kind === 'browser_chain' || candidate.kind === 'http_chain' ? { candidateSpec: candidate.spec as unknown as Record<string, unknown> } : {}),
         ...(staging.headers ? { headers: staging.headers } : {}),
       })
       if (recipePlan) {
         if (recipePlan.skipReason) {
-          report.rejectedSpecs += 1
-          stats.rejected += 1
-          rejections.push({
-            kind: candidate.kind,
-            verdict: 'inconclusive',
-            controlPassed: false,
-            observed: `recipe ${recipePlan.recipeId} not expressible`,
-            reason: recipePlan.skipReason,
-            exchangeIds: [],
-          })
-          log('deterministic_engine.recipe_skipped', `${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recipePlan.skipReason}`, {
-            intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId,
-          })
+          report.rejectedSpecs += 1; stats.rejected += 1
+          rejections.push({ kind: candidate.kind, verdict: 'inconclusive', controlPassed: false, observed: `recipe ${recipePlan.recipeId} not expressible`, reason: recipePlan.skipReason, exchangeIds: [] })
+          log('deterministic_engine.recipe_skipped', `${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recipePlan.skipReason}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId })
           continue
         }
         let execution: Awaited<ReturnType<typeof runPlannedRecipe>>
         try {
           execution = await runPlannedRecipe({
-            plan: recipePlan,
-            hypothesis: hyp,
-            broker: input.broker,
-            grant: input.grant,
-            signal: input.signal,
-            ...(input.browser ? { browser: input.browser } : {}),
-            ...(input.runId ? { runId: input.runId } : {}),
-            ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
+            plan: recipePlan, hypothesis: hyp, broker: input.broker, grant: input.grant, signal: input.signal,
+            ...(input.browser ? { browser: input.browser } : {}), ...(input.canaryBroker ? { canaryBroker: input.canaryBroker } : {}),
+            ...(input.storage ? { storage: input.storage } : {}), ...(input.runId ? { runId: input.runId } : {}), ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
             recordExchange: trackExchange,
           })
         } catch (error) {
           const message = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200)
           report.notes.push(`recipe ${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${message}`)
-          log('deterministic_engine.recipe_error', `${recipePlan.recipeId} ${hyp.method} ${hyp.endpoint.pathTemplate}: ${message}`, {
-            intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId,
-          })
-          if (/outside the current assignment scope|run is paused|circuit is open/i.test(message)) {
-            report.stoppedReason = 'aborted'
-            break
-          }
+          log('deterministic_engine.recipe_error', `${recipePlan.recipeId} ${hyp.method} ${hyp.endpoint.pathTemplate}: ${message}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId })
+          if (/outside the current assignment scope|run is paused|circuit is open/i.test(message)) { report.stoppedReason = 'aborted'; break }
           continue
         }
         if (!execution.result.confirmed) {
           const failure = execution.failure
-          report.rejectedSpecs += 1
-          stats.rejected += 1
-          rejections.push({
-            kind: candidate.kind,
-            verdict: 'inconclusive',
-            controlPassed: failure?.code !== 'precondition_unsatisfied',
-            observed: `recipe ${execution.result.recipeId}: ${failure?.code ?? 'rejected'}`,
-            reason: failure?.message ?? execution.result.verification.reason,
-            exchangeIds: [...execution.result.exchangeIds],
-          })
-          log('deterministic_engine.recipe_rejected', `${execution.result.recipeId} ${hyp.endpoint.pathTemplate} -> ${failure?.code ?? 'rejected'}: ${(failure?.message ?? execution.result.verification.reason).slice(0, 200)}`, {
-            intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: execution.result.recipeId,
-            missingRoles: failure?.missingRoles ?? [],
-          })
+          report.rejectedSpecs += 1; stats.rejected += 1
+          rejections.push({ kind: candidate.kind, verdict: 'inconclusive', controlPassed: failure?.code !== 'precondition_unsatisfied', observed: `recipe ${execution.result.recipeId}: ${failure?.code ?? 'rejected'}`, reason: failure?.message ?? execution.result.verification.reason, exchangeIds: [...execution.result.exchangeIds] })
+          log('deterministic_engine.recipe_rejected', `${execution.result.recipeId} ${hyp.endpoint.pathTemplate} -> ${failure?.code ?? 'rejected'}: ${(failure?.message ?? execution.result.verification.reason).slice(0, 200)}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: execution.result.recipeId, missingRoles: failure?.missingRoles ?? [] })
           continue
         }
-        const record = recipeSpecRecord(recipePlan, execution)
-        const recordParsed = declarativeReplaySpecSchema.safeParse(record.spec)
+        const record = recipeSpecRecord(recipePlan, execution), recordParsed = declarativeReplaySpecSchema.safeParse(record.spec)
         if (!recordParsed.success) {
           report.notes.push(`recipe record ${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recordParsed.error.issues[0]?.message ?? 'schema mismatch'}`)
-          log('deterministic_engine.recipe_record_invalid', `${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recordParsed.error.issues[0]?.path.join('.') ?? 'schema'} ${recordParsed.error.issues[0]?.message ?? ''}`.slice(0, 300), {
-            intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId,
-          })
+          log('deterministic_engine.recipe_record_invalid', `${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${recordParsed.error.issues[0]?.path.join('.') ?? 'schema'} ${recordParsed.error.issues[0]?.message ?? ''}`.slice(0, 300), { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId })
           continue
         }
         const result = recipeVerificationResult(recipePlan, execution, [...execution.result.exchangeIds])
         let recipePersistedId: string | null = null
         try {
-          recipePersistedId = await input.onConfirmed({
-            hypothesis: hyp,
-            spec: recordParsed.data as unknown as DeclarativeReplaySpec,
-            specRecord: record,
-            vulnClass: recipePlan.vulnClass,
-            endpoint: hyp.endpoint.pathTemplate,
-            result,
-            exchangeIds: [...new Set([...probe.exchangeIds, ...execution.result.exchangeIds])],
-          })
+          recipePersistedId = await input.onConfirmed({ hypothesis: hyp, spec: recordParsed.data as unknown as DeclarativeReplaySpec, specRecord: record, vulnClass: recipePlan.vulnClass, endpoint: hyp.endpoint.pathTemplate, result, exchangeIds: [...new Set([...probe.exchangeIds, ...execution.result.exchangeIds])] })
         } catch (error) {
           report.notes.push(`persist recipe ${recipePlan.recipeId} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
           continue
         }
         confirmedThisHypothesis = true
-        log('deterministic_engine.recipe_confirmed', `${recipePlan.recipeId} ${hyp.method} ${hyp.endpoint.pathTemplate} -> ${execution.result.verification.rule}`, {
-          intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId,
-          vulnClass: recipePlan.vulnClass, exchanges: execution.result.exchangeIds.length,
-        })
+        log('deterministic_engine.recipe_confirmed', `${recipePlan.recipeId} ${hyp.method} ${hyp.endpoint.pathTemplate} -> ${execution.result.verification.rule}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, recipe: recipePlan.recipeId, vulnClass: recipePlan.vulnClass, exchanges: execution.result.exchangeIds.length })
         if (!recipePersistedId) continue
-        report.confirmed += 1
-        stats.confirmed += 1
+        report.confirmed += 1; stats.confirmed += 1
         report.confirmedPairs.push({ endpoint: hyp.endpoint.pathTemplate, vulnClass: recipePlan.vulnClass })
         break
       }
-      // Hard no-fallback assertion: a wired pair must have been planned above. If a future edit
-      // bypasses recipe planning this throws (and warns) instead of silently using the DSL.
+      // Hard no-fallback assertion: wired pairs run above; non-recipe Cut-3e kinds run zero-jq Tier-1 runners.
       assertNotRecipeWiredLegacyCall(parsed.data)
-      let replay: ReplayVerificationResult
+      const runnerCtx = { broker: input.broker, ...(input.canaryBroker ? { canaryBroker: input.canaryBroker } : {}), backend: input.backend, ...(input.reposDir ? { reposDir: input.reposDir } : {}), grant: input.grant, signal: input.signal, ...(input.storage ? { storage: input.storage } : {}), runId: input.runId, assignmentId: input.assignmentId, onExchange: trackExchange }
+      let replay: ReplayVerificationResult | null = null
       try {
-        replay = await (input.verify ?? verifyReplaySpec)({
-          spec: parsed.data,
-          broker: input.broker,
-          ...(input.browser ? { browser: input.browser } : {}),
-          ...(input.canaryBroker ? { canaryBroker: input.canaryBroker } : {}),
-          backend: input.backend,
-          ...(input.reposDir ? { reposDir: input.reposDir } : {}),
-          grant: input.grant,
-          signal: input.signal,
-          ...(input.storage ? { storage: input.storage } : {}),
-          runId: input.runId,
-          assignmentId: input.assignmentId,
-          onExchange: trackExchange,
-        })
+        replay = await runTypedFloorSpec(parsed.data, runnerCtx)
+        if (!replay && input.verify) replay = await input.verify({ ...runnerCtx, spec: parsed.data, ...(input.browser ? { browser: input.browser } : {}) })
       } catch (error) {
         report.notes.push(`verify ${candidate.kind} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
         continue
       }
+      if (!replay) {
+        report.rejectedSpecs += 1; stats.rejected += 1
+        rejections.push({ kind: candidate.kind, verdict: 'inconclusive', controlPassed: false, observed: `unplanned_floor_recipe:${candidate.kind}/${candidateClass}`, reason: 'No typed Tier-1 floor recipe exists for this candidate; legacy jq fallback is retired.', exchangeIds: [] })
+        continue
+      }
       if (replay.verdict !== 'confirmed') {
-        log('deterministic_engine.spec_rejected', `${candidate.kind} ${hyp.endpoint.pathTemplate} -> ${replay.verdict}: ${(replay.outcome.reason ?? replay.outcome.observed).slice(0, 200)}`, {
-          intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, kind: candidate.kind,
-          verdict: replay.verdict, controlPassed: replay.outcome.controlPassed,
-        })
-        report.rejectedSpecs += 1
-        stats.rejected += 1
-        rejections.push({
-          kind: candidate.kind,
-          verdict: replay.verdict,
-          controlPassed: replay.outcome.controlPassed === true,
-          observed: replay.outcome.observed,
-          reason: replay.outcome.reason ?? null,
-          exchangeIds: replay.exchangeIds,
-        })
+        log('deterministic_engine.spec_rejected', `${candidate.kind} ${hyp.endpoint.pathTemplate} -> ${replay.verdict}: ${(replay.outcome.reason ?? replay.outcome.observed).slice(0, 200)}`, { intent: hyp.intent, endpoint: hyp.endpoint.pathTemplate, kind: candidate.kind, verdict: replay.verdict, controlPassed: replay.outcome.controlPassed })
+        report.rejectedSpecs += 1; stats.rejected += 1
+        rejections.push({ kind: candidate.kind, verdict: replay.verdict, controlPassed: replay.outcome.controlPassed === true, observed: replay.outcome.observed, reason: replay.outcome.reason ?? null, exchangeIds: replay.exchangeIds })
         continue
       }
       const vulnClass = candidate.vulnClass || vulnClassOfSpec(parsed.data as unknown as Record<string, unknown>)
+      const unifiedSpec = { ...parsed.data, assertionsJq: TYPED_RECIPE_ASSERTION } as DeclarativeReplaySpec
       let persistedId: string | null = null
       try {
-        persistedId = await input.onConfirmed({
-          hypothesis: hyp,
-          spec: parsed.data,
-          specRecord: candidate,
-          vulnClass,
-          endpoint: hyp.endpoint.pathTemplate,
-          result: replay,
-          exchangeIds: [...new Set([...probe.exchangeIds, ...replay.exchangeIds])],
-        })
+        persistedId = await input.onConfirmed({ hypothesis: hyp, spec: unifiedSpec, specRecord: { ...candidate, spec: { ...candidate.spec, assertionsJq: TYPED_RECIPE_ASSERTION } }, vulnClass, endpoint: hyp.endpoint.pathTemplate, result: replay, exchangeIds: [...new Set([...probe.exchangeIds, ...replay.exchangeIds])] })
       } catch (error) {
         report.notes.push(`persist ${candidate.kind} ${hyp.endpoint.pathTemplate}: ${error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)}`)
         continue
