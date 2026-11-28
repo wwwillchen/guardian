@@ -1779,7 +1779,24 @@ export function formatMalformedToolArgsError(toolName: string, diag: MalformedTo
   return `Tool ${toolName} call arguments were ${kind}${lenSuffix}: ${diag.reason} Keep the payload/script concise or split into smaller steps and retry with valid JSON.`
 }
 
-async function formatToolOutput(
+/** Inline byte cap for sandbox (bash/node/python) tool output; overflow spills with a paging pointer. */
+export const SANDBOX_EXEC_INLINE_BYTES = 8 * 1024
+const SANDBOX_TEXT_TOOLS = new Set(['sandbox_exec', 'derive_evidence', 'run_offline_script'])
+/** True when the Docker worker sandbox explores `/repos/*` directly, retiring the host repo tools. */
+export const hasSandboxRepoExplorer = (handlers: Pick<WorkerToolHandlers, 'derive_evidence'>): boolean => typeof handlers.derive_evidence === 'function'
+
+/** Compact plain-text view of a sandbox result: one metadata header, then raw (unescaped) stdout/stderr/outputs. */
+export function renderSandboxExecText(raw: unknown): string | null {
+  const r = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : null
+  if (!r || (typeof r.stdout !== 'string' && typeof r.stderr !== 'string')) return null
+  const meta = ['exitCode', 'runtime', 'timedOut', 'durationMs', 'evidenceId'].filter(k => r[k] !== undefined && r[k] !== null && r[k] !== false)
+  const outputs = r.outputs && typeof r.outputs === 'object' && !Array.isArray(r.outputs) ? Object.entries(r.outputs as Record<string, unknown>) : []
+  const sections: Array<[string, unknown]> = [['stdout', r.stdout], ['stderr', r.stderr], ...outputs.map(([name, v]): [string, unknown] => [`/work/${name}`, v])]
+  const body = sections.filter(([, v]) => typeof v === 'string' && v.trim()).map(([label, v]) => `--- ${label} ---\n${String(v).trimEnd()}`)
+  return [`[sandbox ${meta.map(k => `${k}=${String(r[k])}`).join(' ') || 'ok'}]`, ...(body.length ? body : ['(no output)'])].join('\n')
+}
+
+export async function formatToolOutput(
   raw: unknown,
   toolName: string,
   scrub: (value: string) => string,
@@ -1788,10 +1805,11 @@ async function formatToolOutput(
   signal: AbortSignal,
   spillStore?: HostSpillStore,
 ): Promise<string> {
-  const serialized = typeof raw === 'string' ? raw : JSON.stringify(raw ?? { ok: true }, null, 2)
-  const safe = scrub(serialized)
+  const sandboxText = SANDBOX_TEXT_TOOLS.has(toolName) ? renderSandboxExecText(raw) : null
+  const cap = sandboxText === null ? inlineLimit : Math.min(inlineLimit, SANDBOX_EXEC_INLINE_BYTES)
+  const safe = scrub(sandboxText ?? (typeof raw === 'string' ? raw : JSON.stringify(raw ?? { ok: true }, null, 2)))
   const byteLen = Buffer.byteLength(safe, 'utf8')
-  if (byteLen <= inlineLimit) return safe
+  if (byteLen <= cap) return safe
 
   let spilledPath: string | null = null
   let spillId: string | null = null
@@ -1812,10 +1830,10 @@ async function formatToolOutput(
     }
   }
 
-  const notice = spilledPath && spillId
-    ? `\n\n... [truncated ${byteLen} bytes; full redacted output spilled to ${spilledPath} (artifactId="${spillId}") — inspect in parallel with read_evidence_slice({ artifactId: "${spillId}", offset: 0, limit: 8192 }) or path="${spilledPath}"; use derive_evidence only for custom jq/pipelines] ...\n\n`
-    : `\n\n... [truncated ${byteLen} bytes to ${inlineLimit}-byte inline cap] ...\n\n`
-  const available = Math.max(256, inlineLimit - Buffer.byteLength(notice, 'utf8'))
+  const notice = !spilledPath || !spillId ? `\n\n... [truncated ${byteLen} bytes to ${cap}-byte inline cap] ...\n\n`
+    : sandboxText !== null ? `\n\n... [truncated ${byteLen} bytes to ${cap}-byte sandbox inline cap; full redacted output spilled to ${spilledPath} (artifactId="${spillId}") — narrow the command or page the spill with bash (sed -n '1,120p' ${spilledPath} or rg -n <pattern> ${spilledPath})] ...\n\n`
+    : `\n\n... [truncated ${byteLen} bytes; full redacted output spilled to ${spilledPath} (artifactId="${spillId}") — inspect in parallel with read_evidence_slice({ artifactId: "${spillId}", offset: 0, limit: 8192 }) or path="${spilledPath}"; use derive_evidence only for custom jq/pipelines] ...\n\n`
+  const available = Math.max(256, cap - Buffer.byteLength(notice, 'utf8'))
   const headBytes = Math.floor(available * 0.55)
   const tailBytes = Math.max(0, available - headBytes)
   return truncateUtf8Head(safe, headBytes) + notice + (tailBytes > 0 ? truncateUtf8Tail(safe, tailBytes) : '')
@@ -2299,7 +2317,7 @@ export function buildWorkerTools(
     const fn = handlers.run_offline_script
     tools.push(defineTool({
       name: 'run_offline_script',
-      description: 'Execute a bounded offline Python 3 or Node.js script inside the air-gapped --network none worker container over read-only /repos/* and /evidence/* (for JWT/crypto auditing, AST/schema parsing, response diffing, or encoding analysis). Zero network sockets; stdout/stderr secret-masked.',
+      description: 'Execute a bounded offline Python 3 or Node.js script inside the air-gapped --network none worker container (cwd /repos; env KOVO_REPOS, KOVO_EVIDENCE) over read-only /repos/* and /evidence/* (route/AST/schema parsing, JWT/crypto auditing, response diffing). Print distilled summaries only; compact plain-text stdout/stderr capped at 8 KiB inline.',
       parameters: obj({
         runtime: oneOf(['python', 'node'] as const),
         code: str({ description: 'Offline Python or Node.js script source (<= 64 KiB).', maxLength: 65536 }),
@@ -2307,10 +2325,7 @@ export function buildWorkerTools(
       }),
       replay: 'safe',
       outputLimits,
-      execute: async (args, _api, ctx) => {
-        const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('run_offline_script', () => fn({ ...args, code: scrubExact(args.code) }, signal), signal)
-      },
+      execute: async (args, _api, ctx) => { const signal = combineSignal(ctx.abortSignal); return wrapExec('run_offline_script', () => fn({ ...args, code: scrubExact(args.code) }, signal), signal) },
     }))
   }
 
@@ -2450,12 +2465,13 @@ export function buildWorkerTools(
     }))
   }
 
-  if (handlers.read_repo_file || specSubmission?.reposDir) {
+  // Host-only /repos fallback: Docker workers (derive_evidence) explore /repos via the sandbox instead.
+  if (!hasSandboxRepoExplorer(handlers) && (handlers.read_repo_file || specSubmission?.reposDir)) {
     const customFn = handlers.read_repo_file
     const reposDir = specSubmission?.reposDir
     tools.push(defineTool({
       name: 'read_repo_file',
-      description: 'Fast parallel host-executed read-only file reader over staged /repos/<owner>/<repo> (bounded numbered line slices up to 400 lines / 16 KiB; zero shell overhead). Prefer over derive_evidence for reading source files.',
+      description: 'Host-only fallback (no worker sandbox) read-only file reader over staged /repos/<owner>/<repo> (bounded numbered line slices up to 400 lines / 16 KiB).',
       parameters: obj({
         path: str({ description: 'Repo file path (e.g. /repos/owner/repo/src/app.ts or owner/repo/src/app.ts).', minLength: 1, maxLength: 512 }),
         startLine: opt(int({ description: '1-based start line (default 1).', minimum: 1, maximum: 500000 })),
@@ -2463,23 +2479,16 @@ export function buildWorkerTools(
       }),
       replay: 'safe',
       outputLimits,
-      execute: async (args, _api, ctx) => {
-        const signal = combineSignal(ctx.abortSignal)
-        return wrapExec(
-          'read_repo_file',
-          async () => customFn ? customFn(args, signal) : readRepoFileHost(reposDir!, args),
-          signal,
-        )
-      },
+      execute: async (args, _api, ctx) => { const signal = combineSignal(ctx.abortSignal); return wrapExec('read_repo_file', async () => customFn ? customFn(args, signal) : readRepoFileHost(reposDir!, args), signal) },
     }))
   }
 
-  if (handlers.search_repo || specSubmission?.reposDir) {
+  if (!hasSandboxRepoExplorer(handlers) && (handlers.search_repo || specSubmission?.reposDir)) {
     const customFn = handlers.search_repo
     const reposDir = specSubmission?.reposDir
     tools.push(defineTool({
       name: 'search_repo',
-      description: 'Fast parallel host-executed read-only code search over staged /repos (literal substring by default; optional ReDoS-safe regex; skips .git and node_modules; zero shell overhead). Prefer over derive_evidence for code search.',
+      description: 'Host-only fallback (no worker sandbox) read-only code search over staged /repos (literal substring by default; optional ReDoS-safe regex; skips .git and node_modules).',
       parameters: obj({
         query: str({ description: 'Search pattern (literal by default; set regex=true for ReDoS-safe bounded regex).', minLength: 1, maxLength: 256 }),
         pathPrefix: opt(str({ description: 'Optional repo or directory prefix (e.g. /repos/owner/repo/src).', maxLength: 512 })),
@@ -2489,14 +2498,7 @@ export function buildWorkerTools(
       }),
       replay: 'safe',
       outputLimits,
-      execute: async (args, _api, ctx) => {
-        const signal = combineSignal(ctx.abortSignal)
-        return wrapExec(
-          'search_repo',
-          async () => customFn ? customFn(args, signal) : HOST_REPO_SEARCH_RUNNERS.worker(reposDir!, args, { signal }),
-          signal,
-        )
-      },
+      execute: async (args, _api, ctx) => { const signal = combineSignal(ctx.abortSignal); return wrapExec('search_repo', async () => customFn ? customFn(args, signal) : HOST_REPO_SEARCH_RUNNERS.worker(reposDir!, args, { signal }), signal) },
     }))
   }
 
@@ -2529,7 +2531,7 @@ export function buildWorkerTools(
     const fn = handlers.derive_evidence
     tools.push(defineTool({
       name: 'derive_evidence',
-      description: 'Run an offline just-bash command (jq, diff, sed, awk, wc, base64, find, rg) inside the air-gapped --network none intent container over read-only /evidence/*, read-only /repos/<owner>/<repo>, and writable /work/*. Prefer read_repo_file / search_repo / read_evidence_slice for source reading, search, and spill paging; use derive_evidence for custom jq/pipeline transforms.',
+      description: 'Primary /repos explorer: run an offline just-bash command (rg, grep, find, sed -n, awk, head, tail, wc, jq, diff) inside the air-gapped --network none container over read-only /repos/<owner>/<repo>, read-only /evidence/*, and writable /work/*. Map routes, middleware, auth checks, and handler spans in ONE call and print only distilled file:line summaries (never cat whole files); use run_offline_script for node/python parsing. Returns compact plain text (exit code header + raw stdout/stderr) capped at 8 KiB inline; overflow spills to /evidence/tool-output/.',
       parameters: obj({
         command: str({ maxLength: 16384 }),
         outputs: opt(arr(str({ maxLength: 64 }), { maxItems: 16 })),
@@ -2537,10 +2539,7 @@ export function buildWorkerTools(
       }),
       replay: 'safe',
       outputLimits,
-      execute: async (args, _api, ctx) => {
-        const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('derive_evidence', () => fn({ ...args, command: scrubExact(args.command) }, signal), signal)
-      },
+      execute: async (args, _api, ctx) => { const signal = combineSignal(ctx.abortSignal); return wrapExec('derive_evidence', () => fn({ ...args, command: scrubExact(args.command) }, signal), signal) },
     }))
   }
 

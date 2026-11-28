@@ -404,8 +404,12 @@ describe('M2 R5: assignment-brief & exploiter-tools persona ordering, precheck, 
     writeFileSync(join(reposDir, 'monorepo', 'services', 'beta', 'src', 'server.ts'), 'export {}\n', 'utf8')
     writeFileSync(join(reposDir, 'monorepo', 'services', 'gamma', 'src', 'routes.ts'), 'export {}\n', 'utf8')
 
+    // Host-only mode (no Docker sandbox handlers) keeps the host `repo` fallback with balanced listing.
+    const hostOnlyHandlers = makeDummyHandlers()
+    delete hostOnlyHandlers.derive_evidence
+    delete hostOnlyHandlers.run_offline_script
     const tools = buildConsolidatedExploiterToolset({
-      handlers: makeDummyHandlers(),
+      handlers: hostOnlyHandlers,
       runId: 'run-repo-bal',
       assignmentId: 'asg-repo-bal',
       publicOrigins: [API_ORIGIN],
