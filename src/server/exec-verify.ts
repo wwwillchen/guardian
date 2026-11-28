@@ -3629,11 +3629,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
 
     const { isStaticAst, finalStatus, verificationTier } = deriveReplayOutcomeStatus(parsed, replay)
     const { verificationTier: _droppedInlineTier, ...inlineFeedbackRest } = feedback
-    const normalizedFeedback: InlineVerifyFeedback = {
-      ...inlineFeedbackRest,
-      verdict: finalStatus as InlineVerifyFeedback['verdict'],
-      ...(verificationTier ? { verificationTier } : {}),
-    }
+    const normalizedFeedback: InlineVerifyFeedback = { ...inlineFeedbackRest, verdict: finalStatus as InlineVerifyFeedback['verdict'], ...(verificationTier ? { verificationTier } : {}) }
 
     const latestRun = this.host.check(params.job)
     const updatedSpec = this.storage.incrementReplaySpecAttempt(specRow.id, normalizedFeedback, {
