@@ -1,7 +1,7 @@
 // The run workspace shell: providers, rail, run line header, view outlet,
 // resizable inspector pane, global keyboard model, palette, toasts.
 import { Link, useNavigate, useRouter } from '@tanstack/react-router'
-import { Component, useCallback, useEffect, useRef, useState } from 'react'
+import { Component, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ErrorInfo, ReactNode } from 'react'
 import { BoardPane, useBoardSeen } from './coordinator.tsx'
 import { RunDataProvider, useRun } from './data.tsx'
@@ -16,7 +16,7 @@ import type { Approval, Detail, RunEvent } from './model.ts'
 import { NavProvider, selKey, useNav } from './nav.tsx'
 import type { Sel } from './nav.tsx'
 import { OverlaysProvider, useOverlays } from './overlays.tsx'
-import { FallbackInspector } from './pane.tsx'
+import { FallbackInspector, PaneLayoutProvider } from './pane.tsx'
 import { PaletteProvider, usePalette } from './palette.tsx'
 import { PanelErrorBoundary } from './panel-error-boundary.tsx'
 import { Rail, RailFallback } from './rail.tsx'
@@ -165,9 +165,65 @@ function NavWithRun({ runId, view, sel, go, switchRun, children }: {
   return <NavProvider runId={runId} view={view} sel={sel} go={go} switchRun={switchRun} hasPendingApprovals={hasPendingApprovals}>{children}</NavProvider>
 }
 
-const PANE_KEY = 'kovo-rw-pane'
-const PANE_MIN = 320
-const PANE_MAX = 640
+export const PANE_KEY = 'kovo-rw-pane'
+export const PANE_PIN_KEY = 'kovo-rw-pane-pinned'
+export const PANE_MIN = 320
+export const PANE_DEFAULT = 404
+export const PANE_MAX_CEILING = 760
+/** Magnetic snap distance (px) around each snap width while dragging the resizer. */
+export const PANE_SNAP_THRESHOLD = 4
+/** Viewport range `[MIN, MAX]` where the inspector floats as an overlay unless pinned. */
+export const PANE_OVERLAY_MIN_VP = 900
+export const PANE_OVERLAY_MAX_VP = 1439
+
+/** Widest inspector for a viewport: 58% of it, never above the 760px ceiling or below the minimum. */
+export function maxPaneWidth(viewportWidth: number): number {
+  if (!(viewportWidth > 0)) return 640
+  return Math.max(PANE_MIN, Math.min(PANE_MAX_CEILING, Math.floor(viewportWidth * 0.58)))
+}
+
+const clampPane = (w: number, viewportWidth: number) => Math.max(PANE_MIN, Math.min(maxPaneWidth(viewportWidth), w))
+
+/** Magnetic snap widths (360, 480, half the viewport), clamped to the allowed range, sorted and unique. */
+export function paneSnapPoints(viewportWidth: number): number[] {
+  const pts = [360, 480, Math.round(viewportWidth * 0.5)].map(p => clampPane(p, viewportWidth))
+  return [...new Set(pts)].sort((a, b) => a - b)
+}
+
+/** Clamp a dragged width and snap it to the nearest snap point within `PANE_SNAP_THRESHOLD`. */
+export function computeSnappedPaneWidth(rawWidth: number, viewportWidth: number): { width: number; snappedTo: number | null } {
+  const width = clampPane(rawWidth, viewportWidth)
+  let best: number | null = null
+  for (const p of paneSnapPoints(viewportWidth)) {
+    if (Math.abs(p - width) <= PANE_SNAP_THRESHOLD && (best == null || Math.abs(p - width) < Math.abs(best - width))) best = p
+  }
+  return best == null ? { width, snappedTo: null } : { width: best, snappedTo: best }
+}
+
+/** Keyboard steps for the right-anchored resizer: ←/→ ±24 (⇧ ±96), Home = min, End = max, Enter = reset. */
+export function stepPaneWidth(currentWidth: number, key: string, shiftKey: boolean, viewportWidth: number): { width: number; reset?: boolean } | null {
+  const step = shiftKey ? 96 : 24
+  switch (key) {
+    case 'ArrowLeft': return { width: clampPane(currentWidth + step, viewportWidth) }
+    case 'ArrowRight': return { width: clampPane(currentWidth - step, viewportWidth) }
+    case 'Home': return { width: PANE_MIN }
+    case 'End': return { width: maxPaneWidth(viewportWidth) }
+    case 'Enter': return { width: PANE_DEFAULT, reset: true }
+    default: return null
+  }
+}
+
+/** Overlay between 900 and 1439px, docked elsewhere; an explicit pin (true) / float (false) choice wins. */
+export function resolvePaneMode(viewportWidth: number, pinnedPref: boolean | null): 'overlay' | 'docked' {
+  if (pinnedPref === true) return 'docked'
+  if (pinnedPref === false) return 'overlay'
+  return viewportWidth >= PANE_OVERLAY_MIN_VP && viewportWidth <= PANE_OVERLAY_MAX_VP ? 'overlay' : 'docked'
+}
+
+const storeGet = (k: string) => { try { return localStorage.getItem(k) } catch { return null } }
+const storeSet = (k: string, v: string | null) => {
+  try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v) } catch { /* storage disabled */ }
+}
 
 /** Hide the right-hand Coordinator / Board pane until after scope approval. */
 export function isBoardHiddenBeforeApproval(phase: string): boolean {
@@ -179,23 +235,94 @@ function Workspace() {
   const nav = useNav()
   const overlays = useOverlays()
   const [paneW, setPaneW] = useState<number | null>(null)
+  const [pinnedPref, setPinnedPref] = useState<boolean | null>(null)
+  const [viewportW, setViewportW] = useState(1440)
+  const [widenPrev, setWidenPrev] = useState<{ w: number | null } | null>(null)
+  const [boardPeek, setBoardPeek] = useState(false)
   const [resizing, setResizing] = useState(false)
   const paneRef = useRef<HTMLElement>(null)
   const hideBoardBeforeApproval = isBoardHiddenBeforeApproval(detail.run.phase)
-  useEffect(() => {
-    const saved = Number(localStorage.getItem(PANE_KEY))
-    if (saved >= PANE_MIN && saved <= PANE_MAX) setPaneW(saved)
+  useLayoutEffect(() => {
+    const saved = Number(storeGet(PANE_KEY))
+    if (saved >= PANE_MIN && saved <= PANE_MAX_CEILING) setPaneW(saved)
+    const pin = storeGet(PANE_PIN_KEY)
+    if (pin === '1' || pin === '0') setPinnedPref(pin === '1')
+    const sync = () => setViewportW(window.innerWidth)
+    sync()
+    window.addEventListener('resize', sync)
+    return () => window.removeEventListener('resize', sync)
   }, [])
   useGlobalShortcuts(hideBoardBeforeApproval)
   useBoardSeen()
   const View = VIEW_COMPONENTS[nav.view]
-  const paneHidden = hideBoardBeforeApproval || nav.paneCollapsed
-  const cols = paneHidden
-    ? 'grid-cols-[232px_minmax(0,1fr)_0px]'
-    : 'grid-cols-[232px_minmax(0,1fr)_var(--pane-w,404px)] max-[1180px]:[--pane-w:360px]'
+  // Board-first views keep the board as a docked companion column unless the operator chose to float it.
+  const boardFirst = CHAT_FIRST_VIEWS.includes(nav.view) && !nav.sel
+  const paneMode = pinnedPref == null && boardFirst ? 'docked' : resolvePaneMode(viewportW, pinnedPref)
+  const overlay = paneMode === 'overlay'
+  const width = clampPane(paneW ?? PANE_DEFAULT, viewportW)
+  const hasContent = nav.sel != null || nav.chat
+  // An overlay sheet only floats in while there is something to show: an item, the board, or a board-first view.
+  const paneOpen = !nav.paneCollapsed && (!overlay || hasContent || boardPeek || boardFirst)
+  const paneHidden = hideBoardBeforeApproval || !paneOpen
+
+  // `]` / "Show panel" while an overlay sits idle opens the board instead of a silent collapse.
+  const prev = useRef({ collapsed: nav.paneCollapsed, content: hasContent, open: paneOpen })
+  useEffect(() => {
+    const p = prev.current
+    prev.current = { collapsed: nav.paneCollapsed, content: hasContent, open: paneOpen }
+    if (p.content && !hasContent) setBoardPeek(false)
+    if (!overlay || hideBoardBeforeApproval) return
+    if (!p.collapsed && nav.paneCollapsed && !p.open) { nav.expandPane(); setBoardPeek(true) }
+    else if (p.collapsed && !nav.paneCollapsed && !hasContent) setBoardPeek(true)
+  })
+
+  // Focus return: closing the pane while focus is inside it goes back to where the operator came from.
+  const lastOutside = useRef<HTMLElement | null>(null)
+  const focusInPane = useRef(false)
+  useEffect(() => {
+    const onFocus = (e: FocusEvent) => {
+      const t = e.target
+      if (!(t instanceof HTMLElement)) return
+      focusInPane.current = !!paneRef.current?.contains(t)
+      if (!focusInPane.current) lastOutside.current = t
+    }
+    document.addEventListener('focusin', onFocus)
+    return () => document.removeEventListener('focusin', onFocus)
+  }, [])
+  const wasOpen = useRef(paneOpen)
+  useLayoutEffect(() => {
+    if (wasOpen.current && !paneOpen && focusInPane.current) {
+      const active = document.activeElement
+      const back = lastOutside.current
+      if ((!active || active === document.body || paneRef.current?.contains(active)) && back?.isConnected) back.focus({ preventScroll: true })
+      focusInPane.current = false
+    }
+    wasOpen.current = paneOpen
+  }, [paneOpen])
+
+  const resize = useCallback((w: number) => { setWidenPrev(null); setPaneW(w) }, [])
+  const commit = useCallback((w: number) => storeSet(PANE_KEY, String(Math.round(w))), [])
+  const reset = useCallback(() => { setWidenPrev(null); setPaneW(null); storeSet(PANE_KEY, null) }, [])
+  const togglePin = useCallback(() => {
+    const next = paneMode !== 'docked'
+    setPinnedPref(next)
+    storeSet(PANE_PIN_KEY, next ? '1' : '0')
+  }, [paneMode])
+  const toggleWiden = useCallback(() => {
+    if (widenPrev) { setPaneW(widenPrev.w); setWidenPrev(null); return }
+    setWidenPrev({ w: paneW })
+    setPaneW(Math.min(maxPaneWidth(viewportW), Math.max(560, Math.round(viewportW * 0.5))))
+  }, [widenPrev, paneW, viewportW])
+  // Widening is for the evidence at hand: closing the item restores the previous width.
+  useEffect(() => { if (!nav.sel && widenPrev) { setPaneW(widenPrev.w); setWidenPrev(null) } }, [nav.sel, widenPrev])
+  const layout = useMemo(() => ({ mode: paneMode, pinned: paneMode === 'docked', width, widened: widenPrev != null, togglePin, toggleWiden }), [paneMode, width, widenPrev, togglePin, toggleWiden])
+
+  const cols = overlay
+    ? 'grid-cols-[232px_minmax(0,1fr)]'
+    : paneHidden ? 'grid-cols-[232px_minmax(0,1fr)_0px]' : 'grid-cols-[232px_minmax(0,1fr)_var(--pane-w,404px)]'
   return <div
-    className={cn('grid h-screen overflow-clip', cols, resizing && 'select-none')}
-    style={paneW && !paneHidden ? { ['--pane-w' as string]: paneW + 'px' } : undefined}
+    className={cn('relative grid h-screen overflow-clip', cols, resizing && 'select-none')}
+    style={{ ['--pane-w' as string]: width + 'px', ['--pane-inset' as string]: overlay && !paneHidden ? width + 'px' : '0px' }}
   >
     <Rail />
     <main className="relative flex min-h-0 min-w-0 flex-col overflow-clip bg-panel" aria-label="Run">
@@ -214,59 +341,119 @@ function Workspace() {
     {!hideBoardBeforeApproval && <aside
       ref={paneRef}
       className={cn(
-        'relative flex min-h-0 min-w-0 flex-col overflow-clip [overflow-clip-margin:4px] border-l border-line bg-panel transition-opacity duration-[var(--d2)] ease-kovo motion-reduce:transition-none',
-        nav.paneCollapsed && 'pointer-events-none border-l-transparent opacity-0 duration-[var(--d1)]',
+        'flex min-h-0 min-w-0 flex-col overflow-clip [overflow-clip-margin:4px] bg-panel',
+        overlay
+          ? cn(
+            'absolute inset-y-0 right-0 z-[20] w-[var(--pane-w,404px)] shadow-[-12px_0_32px_-12px_rgba(0,0,0,0.22),0_0_0_1px_var(--line)] transition-[translate,opacity] motion-reduce:translate-x-0 motion-reduce:transition-opacity motion-reduce:duration-150',
+            paneOpen
+              ? 'translate-x-0 opacity-100 duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]'
+              : 'pointer-events-none translate-x-full opacity-0 duration-[180ms] ease-[cubic-bezier(0.2,0.8,0.2,1)]',
+          )
+          : cn(
+            'relative border-l border-line transition-opacity duration-[var(--d2)] ease-kovo motion-reduce:transition-none',
+            !paneOpen && 'pointer-events-none border-l-transparent opacity-0 duration-[var(--d1)]',
+          ),
       )}
       aria-label="Inspector"
-      aria-hidden={nav.paneCollapsed || undefined}
+      aria-hidden={!paneOpen || undefined}
+      inert={!paneOpen}
+      data-pane-mode={paneMode}
+      data-pane-width={Math.round(width)}
+      data-pane-open={paneOpen ? '' : undefined}
     >
-      {!nav.paneCollapsed && <Resizer paneRef={paneRef} onResize={setPaneW} onDraggingChange={setResizing} />}
+      {paneOpen && <Resizer width={width} viewportW={viewportW} onResize={resize} onCommit={commit} onReset={reset} onDraggingChange={setResizing} />}
+      {overlay && paneOpen && nav.sel && <span data-testid="pane-overlay-edge-indicator" aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-0 z-[4] w-0.5 bg-accent" />}
       <div id="paneInner" className="flex min-h-0 flex-1 flex-col">
-        <PaneContent />
+        <PaneLayoutProvider value={layout}>
+          <PaneContent />
+        </PaneLayoutProvider>
       </div>
     </aside>}
     {overlays.scopeOpen && <ScopeOverlay />}
   </div>
 }
 
-function Resizer({ paneRef, onResize, onDraggingChange }: {
-  paneRef: React.RefObject<HTMLElement | null>
+/** Accessible, magnetic inspector resizer: drag (snaps to 360 / 480 / 50%), arrows, Home/End, Enter or double-click to reset. */
+function Resizer({ width, viewportW, onResize, onCommit, onReset, onDraggingChange }: {
+  width: number
+  viewportW: number
   onResize: (w: number) => void
+  onCommit: (w: number) => void
+  onReset: () => void
   onDraggingChange: (dragging: boolean) => void
 }) {
   const [drag, setDrag] = useState(false)
+  const [snapped, setSnapped] = useState<number | null>(null)
   const start = useRef({ x: 0, w: 0 })
+  const live = useRef(width)
+  live.current = width
   useEffect(() => {
     onDraggingChange(drag)
     if (!drag) return
-    const move = (e: PointerEvent) => onResize(Math.max(PANE_MIN, Math.min(PANE_MAX, start.current.w + (start.current.x - e.clientX))))
+    const move = (e: PointerEvent) => {
+      const r = computeSnappedPaneWidth(start.current.w + (start.current.x - e.clientX), viewportW)
+      setSnapped(r.snappedTo)
+      onResize(r.width)
+    }
     const up = () => {
       setDrag(false)
       document.body.style.cursor = ''
-      const w = paneRef.current?.getBoundingClientRect().width
-      if (w) try { localStorage.setItem(PANE_KEY, String(Math.round(w))) } catch { /* ignore */ }
+      onCommit(live.current)
     }
     document.body.style.cursor = 'col-resize'
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
     return () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up) }
-  }, [drag, onResize, onDraggingChange, paneRef])
+  }, [drag, viewportW, onResize, onCommit, onDraggingChange])
+  const w = Math.round(width)
+  const snappedTo = snapped != null && snapped === w ? snapped : null
   return <div
     className={cn(
-      'absolute -left-[3px] bottom-0 top-0 z-[5] w-1.5 cursor-col-resize hover:bg-[linear-gradient(90deg,transparent_2px,var(--accent-line)_2px,var(--accent-line)_4px,transparent_4px)]',
-      drag && 'bg-[linear-gradient(90deg,transparent_2px,var(--accent-line)_2px,var(--accent-line)_4px,transparent_4px)]',
+      'absolute -left-[3px] bottom-0 top-0 z-[5] w-1.5 cursor-col-resize outline-none hover:bg-[linear-gradient(90deg,transparent_2px,var(--accent-line)_2px,var(--accent-line)_4px,transparent_4px)] focus-visible:outline-none focus-visible:bg-[linear-gradient(90deg,transparent_2px,var(--accent)_2px,var(--accent)_4px,transparent_4px)]',
+      drag && (snappedTo != null
+        ? 'bg-[linear-gradient(90deg,transparent_1.5px,var(--accent-line)_1.5px,var(--accent-line)_4.5px,transparent_4.5px)]'
+        : 'bg-[linear-gradient(90deg,transparent_2px,var(--accent-line)_2px,var(--accent-line)_4px,transparent_4px)]'),
     )}
     role="separator"
     aria-orientation="vertical"
     aria-label="Resize inspector"
-    title="Drag to resize · double-click to reset"
+    aria-valuemin={PANE_MIN}
+    aria-valuemax={maxPaneWidth(viewportW)}
+    aria-valuenow={w}
+    aria-valuetext={`${w} pixels`}
+    tabIndex={0}
+    data-testid="pane-resizer"
+    data-snapped={snappedTo != null ? String(snappedTo) : undefined}
+    title="Drag to resize · ← → to step · double-click to reset"
     onPointerDown={e => {
+      if (e.button !== 0) return
       e.preventDefault()
-      start.current = { x: e.clientX, w: (e.currentTarget.parentElement as HTMLElement).getBoundingClientRect().width }
+      start.current = { x: e.clientX, w: width }
+      setSnapped(null)
       setDrag(true)
     }}
-    onDoubleClick={() => { onResize(404); try { localStorage.removeItem(PANE_KEY) } catch { /* ignore */ } }}
-  />
+    onKeyDown={e => {
+      const r = stepPaneWidth(width, e.key, e.shiftKey, viewportW)
+      if (!r) return
+      e.preventDefault()
+      e.stopPropagation()
+      e.nativeEvent.stopPropagation()
+      setSnapped(null)
+      if (r.reset) onReset()
+      else { onResize(r.width); onCommit(r.width) }
+    }}
+    onDoubleClick={() => { setSnapped(null); onReset() }}
+  >
+    {drag && <span
+      className={cn(
+        'pointer-events-none absolute left-2.5 top-[52px] whitespace-nowrap rounded-[5px] px-1.5 py-0.5 font-mono text-[11px] leading-4 tabular-nums shadow-popover',
+        snappedTo != null ? 'bg-accent text-accent-fg' : 'bg-fg text-panel',
+      )}
+      data-testid="pane-width-pill"
+    >
+      {w}px
+    </span>}
+  </div>
 }
 
 function PaneContent() {
