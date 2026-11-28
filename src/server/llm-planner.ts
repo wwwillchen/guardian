@@ -11,7 +11,9 @@ import { plannerResponseSchema as dispatchPlannerResponseSchema, stripJsonFences
 import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import { providerOptionsFor } from './provider-runtime-policy.ts'
 import { providerPool, type UsageCallback } from './provider.ts'
-import { serializeWorldGraph, type WorldGraphCausalEdge, type WorldGraphEndpointGroup, type WorldGraphFact, type WorldGraphSnapshot } from './world-graph.ts'
+import {
+  serializeWorldGraph, type WorldGraphCausalEdge, type WorldGraphEndpointGroup, type WorldGraphFact, type WorldGraphOpenChain, type WorldGraphSnapshot,
+} from './world-graph.ts'
 
 const DEFAULT_MAX_NEW_STEPS = 8
 const SNAPSHOT_BYTE_BUDGET = 4096
@@ -121,9 +123,22 @@ function edgeProposal(edge: WorldGraphCausalEdge): LlmPlannerStepProposal {
   }
 }
 
+function openChainProposal(chain: WorldGraphOpenChain): LlmPlannerStepProposal {
+  const target = chain.stalledEndpoint ?? chain.nextHop ?? 'next declared hop'
+  return {
+    title: clip(`World-graph open chain continuation · ${hostOf(chain.origin)} · Hop ${chain.maxVerifiedHop + 1}/${chain.declaredHops} · ${target}`, 200),
+    hypothesis: clip(`Source-predicted chain hypothesis ${chain.id} verified ${chain.maxVerifiedHop}/${chain.declaredHops} hop(s) and stalled at ${target}` +
+      `${chain.nextHop ? ` (${chain.nextHop})` : ''}. Continue from the verified hops toward the next declared hop with a control-vs-variant verification; ` +
+      'the endpoint may be source-predicted rather than runtime-observed.', 1200),
+    category: 'broken-access-control', priority: 90, origins: [chain.origin],
+    skills: ['multihop-chains', 'chain-primitives'], dependsOnFactIds: [chain.id], dependsOnStepIds: [],
+  }
+}
+
 /**
- * `$0` / `--no-llm` floor: zero provider calls. Round-robins auth-asymmetric unconfirmed groups,
- * unconfirmed leads/facts, and observed cross-origin causal edges into bounded typed proposals.
+ * `$0` / `--no-llm` floor: zero provider calls. Round-robins open chain hypotheses, auth-asymmetric
+ * unconfirmed groups, unconfirmed leads/facts, and observed cross-origin causal edges into bounded
+ * typed proposals.
  */
 export function buildDeterministicFallbackPlan(input: {
   snapshot: WorldGraphSnapshot
@@ -134,6 +149,7 @@ export function buildDeterministicFallbackPlan(input: {
   const cap = stepCap(input)
   const approved = new Set(input.approvedOrigins)
   const lanes: LlmPlannerStepProposal[][] = [
+    (input.snapshot.openChains ?? []).map(openChainProposal),
     input.snapshot.groups.filter(g => g.authAsymmetric && !g.confirmed).map(groupProposal),
     input.snapshot.facts.filter(f => !f.confirmed && (f.lead || f.route)).map(factProposal),
     input.snapshot.edges.filter(e => e.crossOrigin).map(edgeProposal),
@@ -157,8 +173,9 @@ export function buildDeterministicFallbackPlan(input: {
 function plannerMessages(input: PlanWithWorldGraphInput, snapshotJson: string, cap: number): { systemPrompt: string; user: string } {
   const systemPrompt = [
     'You are the chain planner for Kovo, a defensive web-application QA and security verification scanner running an authorized assessment.',
-    'You receive a bounded pure-fact World Graph of already-observed run state: endpoint groups with per-principal status matrices, causal edges, facts/leads, and controller routes.',
+    'You receive a bounded pure-fact World Graph of already-observed run state: endpoint groups with per-principal status matrices, causal edges (capability-ledger edges carry the endpoint each verified hop landed on), facts/leads, controller routes, and openChains (source-predicted chain hypotheses with declaredHops, maxVerifiedHop, and the stalledEndpoint/nextHop where verification stopped).',
     'Propose verification steps that target observed, unconfirmed surfaces (auth-asymmetric or mutating groups, unconfirmed leads, cross-origin edges).',
+    'Next-hop steps may target source-predicted / code-audit endpoints (openChains stalledEndpoint/nextHop, code-audit lead routes) even when no runtime exchange has observed them yet; for each open chain, prefer one step that continues from its verified hops to the next declared hop and cite the chain id in dependsOnFactIds.',
     'Describe hypotheses by verification class and route template only; never include exploit payloads, raw probe strings, or credentials.',
     'Respond with ONLY one JSON object, no prose.',
   ].join('\n')
@@ -172,7 +189,7 @@ function plannerMessages(input: PlanWithWorldGraphInput, snapshotJson: string, c
       summary: 'string',
       newSteps: `array (<= ${cap}) of {title, hypothesis, category, priority 0-100, origins (subset of approvedOrigins), skills, dependsOnFactIds (World Graph fact ids), dependsOnStepIds}`,
       cancelStepIds: 'array of step ids (usually empty)',
-      done: 'boolean: true only when no observed unconfirmed surface remains worth verifying',
+      done: 'boolean: true only when no observed unconfirmed surface remains worth verifying AND openChains is empty (an open source-predicted chain hypothesis is not done)',
     },
   })
   return { systemPrompt, user: `${header}\nWORLD_GRAPH=${snapshotJson}` }

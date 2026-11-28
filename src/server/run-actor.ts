@@ -814,18 +814,18 @@ export const SOURCE_AUDIT_MAX_WALL_CLOCK_MS = 90_000
 export const SOURCE_AUDIT_WALL_CLOCK_SHARE = 0.15
 export const SOURCE_AUDIT_SHORT_RUN_THRESHOLD_MS = 15 * 60_000
 export const SOURCE_AUDIT_SHORT_RUN_MAX_TURNS = 8
+export const SOURCE_AUDIT_LONG_RUN_MAX_WALL_CLOCK_MS = 210_000
 /** Code-audit settle prompt fires at 60% of the audit cap (54s of 90s), leaving ~36s to record. */
 export const SOURCE_AUDIT_SETTLEMENT_SHARE = 0.6
+export const SOURCE_AUDIT_LONG_RUN_SCALE_SHARE = 0.1 // past the short-run threshold: share of extra wall clock (<= 210s cap)
 export const PHASE_A_FLOOR_MIN_WALL_CLOCK_MS = 15_000
 export const PHASE_A_FLOOR_MAX_WALL_CLOCK_MS = 75_000
 export const PHASE_A_FLOOR_WALL_CLOCK_SHARE = 0.12
 
 export function resolveSourceAuditWallClockMs(maxDurationMs?: number): number {
   if (typeof maxDurationMs === 'number' && Number.isFinite(maxDurationMs) && maxDurationMs > 0) {
-    return Math.max(
-      SOURCE_AUDIT_MIN_WALL_CLOCK_MS,
-      Math.min(SOURCE_AUDIT_MAX_WALL_CLOCK_MS, Math.floor(maxDurationMs * SOURCE_AUDIT_WALL_CLOCK_SHARE)),
-    )
+    const longRunCapMs = Math.min(SOURCE_AUDIT_LONG_RUN_MAX_WALL_CLOCK_MS, SOURCE_AUDIT_MAX_WALL_CLOCK_MS + Math.floor(Math.max(0, maxDurationMs - SOURCE_AUDIT_SHORT_RUN_THRESHOLD_MS) * SOURCE_AUDIT_LONG_RUN_SCALE_SHARE))
+    return Math.max(SOURCE_AUDIT_MIN_WALL_CLOCK_MS, Math.min(longRunCapMs, Math.floor(maxDurationMs * SOURCE_AUDIT_WALL_CLOCK_SHARE)))
   }
   return SOURCE_AUDIT_DEFAULT_WALL_CLOCK_MS
 }

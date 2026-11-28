@@ -57,6 +57,7 @@ import {
   type WaveQuotaConfig,
   type WaveSelectionResult,
 } from './frontier-scheduler.ts'
+import { collectOpenChainHypotheses, evaluateOpenChainHold, parseDeclaredChainHops, rankSuspectsByPriority, type OpenChainHoldDecision } from './world-graph.ts'
 import {
   decideNext,
   extractChainHops,
@@ -363,7 +364,7 @@ export interface CoordinatorSchedulerState {
   emptyRounds?: number
   coordinatorDone?: boolean
   pendingOob?: number
-  /** True when no ready/pending high-priority (det_lead / chain) step remains. */
+  /** True when no ready/pending high-priority (det_lead / chain) step, open chain, or deferred suspect remains. */
   highPriorityQueueEmpty?: boolean
   /** Consecutive rounds with no new runtime_confirmed finding and no new chain primitive. */
   consecutiveDryRounds?: number
@@ -389,6 +390,10 @@ export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): 
     coordinatorDone: state.coordinatorDone === true,
     pendingOob: state.pendingOob ?? 0,
   })
+  // Lever 1: planner `done` never ends a run while high-priority work (incl. open chains / deferred suspects) remains.
+  if (decision.decision === 'stop' && decision.reason === 'coordinator_done' && state.highPriorityQueueEmpty === false) {
+    return { decision: 'continue', reason: 'continue', detail: 'Coordinator reported done, but high-priority work (open chain hypotheses or deferred suspects) remains.' }
+  }
   if (decision.decision === 'stop') return decision
   const pending = state.pendingOob ?? 0
   // A done coordinator with OOB subscriptions still draining keeps running (decideNext returned
@@ -4558,117 +4563,120 @@ function formatCrossServiceSiblingLeadsBlock(siblings: readonly NormalizedCodeAu
   return parts.length ? `${prefix}${parts.join(' | ')}` : ''
 }
 
-export function convertCodeAuditSuspectsToChainSteps(
-  storage: Store,
-  run: Run,
-  suspects: readonly Fact[],
-  hostTiers?: Record<string, HostTier>,
-  options: { maxSteps?: number; promoteMultiHop?: boolean } = {},
-): ChainStep[] {
+interface PlannedCodeAuditSuspect { item: NormalizedCodeAuditSuspect; title: string; priority: number; declaredHops: number; index: number }
+
+/**
+ * Recall Lever 1: priority-ranked conversion plan over every eligible audit suspect. A suspect is
+ * converted once a step cites it as its primary dependency (sibling-lead mentions do not count), so
+ * overflow suspects stay queued until promoted. Empty once the hard chain-step ceiling is reached.
+ */
+function planCodeAuditSuspectConversion(
+  storage: Store, run: Run, suspects: readonly Fact[], hostTiers?: Record<string, HostTier>,
+): { planned: PlannedCodeAuditSuspect[]; normalized: NormalizedCodeAuditSuspect[]; totalSteps: number } {
   const approvedOrigins = new Set(run.candidates.filter(c => run.approved.includes(c.id)).map(c => c.origin))
   const existingSteps = storage.listChainSteps(run.id, run.goalRevision)
   const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
-  const coveredFactIds = new Set(existingSteps.flatMap(s => s.dependsOnFactIds))
-  const created: ChainStep[] = []
-  let totalSteps = existingSteps.length
-  const maxSteps = options.maxSteps !== undefined ? Math.max(0, Math.floor(options.maxSteps)) : Number.POSITIVE_INFINITY
-  const promoteMultiHop = options.promoteMultiHop === true
+  const coveredFactIds = new Set(existingSteps.flatMap(s => s.dependsOnFactIds.slice(0, 1)))
+  const text = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim() : '')
 
   const normalized: NormalizedCodeAuditSuspect[] = []
   for (const fact of dedupePromotableCodeAuditFacts(suspects)) {
-    if (fact.tainted || !approvedOrigins.has(fact.origin)) continue
-    const asset = run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id))
+    const asset = !fact.tainted && approvedOrigins.has(fact.origin) ? run.candidates.find(c => c.origin === fact.origin && run.approved.includes(c.id)) : undefined
     if (!asset) continue
-
     const data = fact.data as Partial<CodeAuditSuspectData> & Record<string, unknown>
-    const explicitSuspect = String(fact.kind) === 'code_audit_suspect' || data.subkind === 'code_audit_suspect'
-    const routeOrAction = typeof data.routeOrAction === 'string' && data.routeOrAction.trim()
-      ? data.routeOrAction.trim()
-      : ''
-    const summaryRoutes = templatesMentionedInText(fact.summary)
-    const endpointHint = typeof data.endpoint === 'string' && data.endpoint.trim()
-      ? data.endpoint.trim()
-      : routeOrAction || summaryRoutes[0] || ''
-    const fileLoc = typeof data.file === 'string' && data.file.trim()
-      ? `${data.file.trim()}${typeof data.line === 'number' ? `:${data.line}` : ''}`
-      : ''
-    const hypothesisBody = typeof data.hypothesis === 'string' && data.hypothesis.trim()
-      ? data.hypothesis.trim()
-      : fact.summary
-    const sinkKind = typeof data.sinkKind === 'string' && data.sinkKind.trim()
-      ? data.sinkKind.trim()
-      : inferSinkKindFromFactText(`${fact.summary} ${hypothesisBody} ${endpointHint}`)
+    const routeOrAction = text(data.routeOrAction)
+    const endpointHint = text(data.endpoint) || routeOrAction || templatesMentionedInText(fact.summary)[0] || ''
+    const fileLoc = text(data.file) ? `${text(data.file)}${typeof data.line === 'number' ? `:${data.line}` : ''}` : ''
+    const hypothesisBody = text(data.hypothesis) || fact.summary
+    const sinkKind = text(data.sinkKind) || inferSinkKindFromFactText(`${fact.summary} ${hypothesisBody} ${endpointHint}`)
     const authCheck = typeof data.authCheck === 'string' ? data.authCheck : 'unknown'
     const ownershipCheck = typeof data.ownershipCheck === 'string' ? data.ownershipCheck : 'unknown'
-    const host = new URL(fact.origin).hostname
     const mapped = sinkCategoryAndSkills(sinkKind)
-    const explicitCategory = typeof data.category === 'string' && data.category.trim()
-      ? data.category.trim()
-      : mapped.category
-    const missingAuthOrOwner = /missing|none|weak|bypass|absent|unverified|no |asymmetry|leak|expos|untrusted|forged|spoof/i.test(
-      `${authCheck} ${ownershipCheck} ${fact.summary}`,
-    )
-    const isCrown = (hostTiers?.[fact.origin] ?? classifyHostTier(fact.origin)) === 'crown_jewel'
-    const serviceScope = inferServiceScopeFromSuspect(fileLoc, endpointHint, fact.origin)
-    const roles = classifyCodeAuditChainRoles({
-      sinkKind,
-      text: `${fact.summary} ${hypothesisBody} ${endpointHint} ${fileLoc}`,
-    })
-
     normalized.push({
-      fact,
-      asset,
-      explicitSuspect,
-      routeOrAction,
-      endpointHint,
-      fileLoc,
-      serviceScope,
-      hypothesisBody,
-      sinkKind,
-      authCheck,
-      ownershipCheck,
-      explicitCategory,
-      mappedSkills: mapped.skills,
-      isCrown,
-      missingAuthOrOwner,
-      host,
-      roles,
+      fact, asset, routeOrAction, endpointHint, fileLoc, hypothesisBody, sinkKind, authCheck, ownershipCheck,
+      explicitSuspect: String(fact.kind) === 'code_audit_suspect' || data.subkind === 'code_audit_suspect',
+      explicitCategory: text(data.category) || mapped.category, mappedSkills: mapped.skills, host: new URL(fact.origin).hostname,
+      isCrown: (hostTiers?.[fact.origin] ?? classifyHostTier(fact.origin)) === 'crown_jewel',
+      missingAuthOrOwner: /missing|none|weak|bypass|absent|unverified|no |asymmetry|leak|expos|untrusted|forged|spoof/i.test(`${authCheck} ${ownershipCheck} ${fact.summary}`),
+      serviceScope: inferServiceScopeFromSuspect(fileLoc, endpointHint, fact.origin),
+      roles: classifyCodeAuditChainRoles({ sinkKind, text: `${fact.summary} ${hypothesisBody} ${endpointHint} ${fileLoc}` }),
     })
   }
 
-  // Emit individual targeted steps, enriching each Wave-1 multi-hop step with a compact
-  // Cross-Service Sibling Leads block + sibling dependsOnFactIds.
+  if (existingSteps.length >= hardChainStepsCeiling) return { planned: [], normalized, totalSteps: existingSteps.length }
+  // Deterministic tie-break independent of the listing source: oldest suspect first, then fact id.
+  const recordOrder = new Map([...normalized].sort((a, b) => a.fact.createdAt - b.fact.createdAt || (a.fact.id < b.fact.id ? -1 : a.fact.id > b.fact.id ? 1 : 0))
+    .map((item, index) => [item.fact.id, index]))
+  const planned: PlannedCodeAuditSuspect[] = []
   for (const item of normalized) {
-    if (created.length >= maxSteps) break
-    if (totalSteps >= hardChainStepsCeiling) break
-    if (coveredFactIds.has(item.fact.id)) continue
+    const title = `Source audit verify · ${item.routeOrAction ? item.routeOrAction.slice(0, 90) : item.fact.summary.slice(0, 80)} (${item.host})`
+    if (coveredFactIds.has(item.fact.id) || existingTitles.has(title.toLowerCase())) continue
+    existingTitles.add(title.toLowerCase())
+    const declaredHops = parseDeclaredChainHops(`${item.fact.summary} ${item.hypothesisBody}`).reduce((max, h) => Math.max(max, h.hop), 0)
+    planned.push({ item, title, priority: item.missingAuthOrOwner ? (item.isCrown ? 96 : 92) : (item.isCrown ? 90 : 85), declaredHops, index: recordOrder.get(item.fact.id) ?? 0 })
+  }
+  return { planned: rankSuspectsByPriority(planned), normalized, totalSteps: existingSteps.length }
+}
 
-    const title = item.routeOrAction
-      ? `Source audit verify · ${item.routeOrAction.slice(0, 90)} (${item.host})`
-      : `Source audit verify · ${item.fact.summary.slice(0, 80)} (${item.host})`
-    if (existingTitles.has(title.toLowerCase())) continue
+/** Ranked eligible audit suspects not yet converted into chain steps (the deferred suspect queue). */
+export function planDeferredCodeAuditSuspects(storage: Store, run: Run, suspects: readonly Fact[], hostTiers?: Record<string, HostTier>): Fact[] {
+  return planCodeAuditSuspectConversion(storage, run, suspects, hostTiers).planned.map(p => p.item.fact)
+}
+
+/** Wave-1 overflow beyond the cap is queued in priority order (never dropped); returns the carried queue. */
+export function queueDeferredCodeAuditSuspects(storage: Store, run: Run, suspects: readonly Fact[], hostTiers: Record<string, HostTier>, assignmentId: string): Fact[] {
+  const deferred = planDeferredCodeAuditSuspects(storage, run, suspects, hostTiers)
+  if (deferred.length) storage.event(run.id, 'code_audit.suspects_deferred', `Queued ${deferred.length} overflow audit suspect(s) beyond the Wave-1 cap for priority-ordered promotion.`, { assignmentId, deferredCount: deferred.length, factIds: deferred.slice(0, 50).map(f => f.id) })
+  return deferred
+}
+
+/** Durable deferred-suspect pool: every untainted explicit audit suspect plus carried Wave-1 overflow. */
+export function deferredCodeAuditSuspectPool(storage: Store, run: Pick<Run, 'id'>, carried: readonly Fact[] = []): Fact[] {
+  const explicit = collectAllPages((offset, limit) => storage.listFacts(run.id, { includeTainted: false, kind: 'code_audit_suspect', limit, offset })).filter(isPromotableCodeAuditFact)
+  return dedupePromotableCodeAuditFacts([...explicit, ...carried.filter(f => !explicit.some(e => e.id === f.id))])
+}
+
+/** Promote priority-ordered deferred suspects into chain steps as worker slots open (<= Wave-1 cap per tick). */
+export function promoteDeferredCodeAuditSuspects(storage: Store, run: Run, input: { activeAssignments: number; carried?: readonly Fact[]; configuredConcurrency?: number }): ChainStep[] {
+  const conc = input.configuredConcurrency ?? Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
+  const freeSlots = Math.min(CODE_AUDIT_WAVE1_MAX_STEPS, conc - input.activeAssignments - storage.listChainSteps(run.id, run.goalRevision).filter(s => s.status === 'ready').length)
+  const pool = freeSlots > 0 ? deferredCodeAuditSuspectPool(storage, run, input.carried) : []
+  if (!pool.length) return []
+  const hostTiers = computeHostTiers(run.candidates.filter(c => run.approved.includes(c.id)).map(c => c.origin), storage.latestThreatModel(run.id, run.goalRevision)?.entries)
+  const promoted = convertCodeAuditSuspectsToChainSteps(storage, run, pool, hostTiers, { maxSteps: freeSlots, promoteMultiHop: true })
+  if (promoted.length) storage.event(run.id, 'code_audit.deferred_promoted', `Promoted ${promoted.length} deferred audit suspect(s) into chain steps.`, { stepIds: promoted.map(s => s.id) })
+  return promoted
+}
+
+/** Lever 1 stop hold: open chain hypotheses and (unless `carried` is null) deferred suspects, within run bounds. */
+export function openChainHoldForRun(storage: Store, run: Run, opts: { maxDurationMs: number; carried: readonly Fact[] | null }): OpenChainHoldDecision {
+  const deferred = opts.carried ? planDeferredCodeAuditSuspects(storage, run, deferredCodeAuditSuspectPool(storage, run, opts.carried)).length : 0
+  return evaluateOpenChainHold({ openChainCount: collectOpenChainHypotheses(storage, run).filter(c => c.converted && !c.exhausted).length, deferredSuspectCount: deferred,
+    elapsedMs: Date.now() - run.createdAt, maxDurationMs: opts.maxDurationMs, budgetUsdSpent: run.spentUsd, budgetUsdLimit: run.budgetUsd, requestsSpent: run.spentRequests, requestBudget: run.budgetRequests })
+}
+
+export function convertCodeAuditSuspectsToChainSteps(
+  storage: Store, run: Run, suspects: readonly Fact[], hostTiers?: Record<string, HostTier>, options: { maxSteps?: number; promoteMultiHop?: boolean } = {},
+): ChainStep[] {
+  const { planned, normalized, totalSteps: existingCount } = planCodeAuditSuspectConversion(storage, run, suspects, hostTiers)
+  const created: ChainStep[] = []
+  let totalSteps = existingCount
+  const maxSteps = options.maxSteps !== undefined ? Math.max(0, Math.floor(options.maxSteps)) : Number.POSITIVE_INFINITY
+  const promoteMultiHop = options.promoteMultiHop === true
+
+  // Emit priority-ordered targeted steps up to the cap (overflow stays in the deferred queue),
+  // enriching each multi-hop step with a compact Cross-Service Sibling Leads block + sibling deps.
+  for (const { item, title, priority } of planned) {
+    if (created.length >= maxSteps || totalSteps >= hardChainStepsCeiling) break
 
     const specialistProfile = routeStepToSpecialist({
-      title: `${item.fact.summary} ${title}`,
-      hypothesis: item.hypothesisBody,
-      category: item.explicitCategory,
-      skills: item.mappedSkills,
-      endpoint: item.endpointHint,
-      sinkKind: item.sinkKind,
+      title: `${item.fact.summary} ${title}`, hypothesis: item.hypothesisBody, category: item.explicitCategory,
+      skills: item.mappedSkills, endpoint: item.endpointHint, sinkKind: item.sinkKind,
     })
-    const stepSkills = promoteMultiHop
-      ? [...new Set([...item.mappedSkills, 'multihop-chains', 'chain-primitives'])]
-      : item.mappedSkills
-    const priority = item.missingAuthOrOwner ? (item.isCrown ? 96 : 92) : (item.isCrown ? 90 : 85)
-
-    const siblings = promoteMultiHop
-      ? selectCrossServiceSiblingLeads(item, normalized, new Set([item.fact.id]), MAX_CODE_AUDIT_SIBLING_LEADS)
-      : []
+    const stepSkills = promoteMultiHop ? [...new Set([...item.mappedSkills, 'multihop-chains', 'chain-primitives'])] : item.mappedSkills
+    const siblings = promoteMultiHop ? selectCrossServiceSiblingLeads(item, normalized, new Set([item.fact.id]), MAX_CODE_AUDIT_SIBLING_LEADS) : []
     const siblingBlock = promoteMultiHop ? formatCrossServiceSiblingLeadsBlock(siblings) : ''
-    const dependsOnFactIds = promoteMultiHop
-      ? [item.fact.id, ...siblings.map(s => s.fact.id)]
-      : [item.fact.id]
-
+    const dependsOnFactIds = promoteMultiHop ? [item.fact.id, ...siblings.map(s => s.fact.id)] : [item.fact.id]
     const hypothesisParts = [
       `Source-First Code Audit suspect${item.fileLoc ? ` at ${item.fileLoc}` : ''}${item.endpointHint ? ` targeting ${item.endpointHint}` : ''}.`,
       `Auth check: ${item.authCheck}; Ownership check: ${item.ownershipCheck}; Sink: ${item.sinkKind}.`,
@@ -4678,20 +4686,10 @@ export function convertCodeAuditSuspectsToChainSteps(
         : 'Verify live reachability via kovo_verify with a negative control + differential probe (and cross-persona BOLA check if Tier >= 2).',
     ]
     if (siblingBlock) hypothesisParts.push(siblingBlock)
-
     const step = storage.addChainStep(run, {
-      title,
-      hypothesis: hypothesisParts.join(' '),
-      category: item.explicitCategory,
-      priority,
-      targetAssetIds: [item.asset.id],
-      skills: stepSkills,
-      dependsOnFactIds,
-      sourceOrigins: [item.fact.origin],
-      specialistProfile,
+      title, hypothesis: hypothesisParts.join(' '), category: item.explicitCategory, priority, targetAssetIds: [item.asset.id],
+      skills: stepSkills, dependsOnFactIds, sourceOrigins: [item.fact.origin], specialistProfile,
     })
-    existingTitles.add(title.toLowerCase())
-    coveredFactIds.add(item.fact.id)
     created.push(step)
     totalSteps += 1
   }
@@ -4942,6 +4940,8 @@ export interface RunOrchestrationState {
   plannerDoneRound?: number
   plannerErrorState?: RunPlannerErrorState
   dryStreakObserved?: number
+  /** Wave-1 overflow audit suspects awaiting promotion (Recall Lever 1 deferred suspect queue). */
+  deferredAuditSuspects?: Fact[]
   dispatchFunnel?: DispatchFunnelCounts
   strandedReadyEvents?: number
   reinvestigationGuard?: ReinvestigationGuard
